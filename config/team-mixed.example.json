@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "default_mode": "standard",
+  "max_builder_attempts": 2,
+  "token_budgets": {
+    "fast": 6000,
+    "standard": 16000,
+    "assured": 32000
+  },
+  "lanes": {
+    "planner": {"provider": "openai", "model": "gpt-5.6-sol", "enabled": true},
+    "fast_builder": {"provider": "openai", "model": "gpt-5.6-luna", "enabled": true},
+    "deep_builder": {"provider": "anthropic", "model": "claude-sonnet-5", "enabled": true},
+    "independent_reviewer": {"provider": "anthropic", "model": "claude-opus-5", "enabled": true},
+    "release_gate": {"provider": "openai", "model": "gpt-5.6-sol", "enabled": true},
+    "optional_fable": {
+      "provider": "custom",
+      "model": "claude-fable-5",
+      "enabled": false,
+      "allowed_uses": ["prototype", "creative-ui", "second-attempt", "supplementary-review"],
+      "may_be_sole_release_gate": false
+    }
+  }
+}
