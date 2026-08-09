@@ -1,34 +1,35 @@
 # Codex adapter
 
-Use Codex as one or more configured lanes without forwarding the full task conversation.
+SERA's core stays provider-neutral. Codex/ChatGPT can act as the controller that reads SERA's machine-readable state and dispatches native coding agents.
 
-## Planner or gate
-
-Start from the generated capsule and repository map:
-
-```text
-Read .sera/tasks/<task-id>/capsule.md and .sera/cache/repo-map.md.
-Resolve remaining ambiguity without implementation. Preserve the exact ownership and verification contract.
-```
-
-## Builder
-
-Generate the packet:
+Recommended controller loop:
 
 ```bash
-sera packet build <task-id>
+sera resume --json
+sera next --json
 ```
 
-Give the native Codex worker the resulting `packet-build.md`. Instruct it to inspect source only within the owned paths unless an interface dependency requires read-only inspection elsewhere.
-
-## Reviewer
-
-Generate:
+For a new task:
 
 ```bash
-sera packet review <task-id>
+sera run "<engineering objective>" --json
 ```
 
-Use a fresh context. The reviewer must not edit files and must return `ship`, `fix-first`, or `rethink`.
+If ownership is inferred, inspect it and confirm exact editable files before dispatch:
 
-Record the verdict with `sera review`, then run `sera check`.
+```bash
+sera context --why
+sera task confirm --file path/to/file
+sera packet build
+```
+
+The controlling Codex session should then:
+
+1. dispatch only the generated builder packet;
+2. preserve unrelated work and exact ownership;
+3. run `sera verify` after implementation;
+4. generate `sera packet review` for a fresh review context when required;
+5. record the verdict and obtain the configured gate when required;
+6. run `sera seal` and `sera check --require-seal` before reporting accepted.
+
+Do not forward the entire parent ChatGPT conversation to a worker when the SERA packet is sufficient.

@@ -6,6 +6,17 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .controller import (
+    auto_task,
+    confirm_task_ownership,
+    context_report,
+    efficiency_report,
+    ensure_controller_config,
+    inbox_report,
+    next_action,
+    prepare_run,
+    resume_report,
+)
 from .core import (
     SeraError,
     budget_report,
@@ -25,25 +36,43 @@ from .core import (
     new_task,
     record_evidence,
     record_review,
-    run_verification,
     resolve_task_dir,
+    run_verification,
     task_fingerprint,
+    update_repo_map,
 )
 
 
+def _json_flag(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+
+def _auto_task_flags(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--name")
+    command.add_argument("--mode", choices=["auto", "fast", "standard", "assured"], default="auto")
+    command.add_argument("--risk", choices=["auto", "low", "medium", "high"], default="auto")
+    command.add_argument("--uncertainty", type=int, choices=[0, 1, 2, 3], default=1)
+    command.add_argument("--use-case", default="implementation")
+    command.add_argument("--file", action="append", default=[], dest="files")
+    command.add_argument("--constraint", action="append", default=[], dest="constraints")
+    command.add_argument("--verify", action="append", default=[], dest="verification")
+
+
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="sera", description="Token-efficient multi-model software delivery relay.")
+    root = argparse.ArgumentParser(prog="sera", description="Token-efficient multi-model software delivery controller.")
     root.add_argument("--version", action="version", version=f"SERA {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
 
     init_cmd = commands.add_parser("init", help="Initialize .sera policy and runtime directories.")
     init_cmd.add_argument("--force", action="store_true")
 
-    commands.add_parser("map", help="Build a compact, content-hashed repository map.")
+    map_cmd = commands.add_parser("map", help="Build a compact, content-hashed repository map.")
+    map_cmd.add_argument("--update", action="store_true", help="Reuse unchanged map entries and rescan only changed files.")
+    _json_flag(map_cmd)
 
     task = commands.add_parser("task", help="Create and inspect task capsules.")
     task_commands = task.add_subparsers(dest="task_command", required=True)
-    new = task_commands.add_parser("new", help="Create a task capsule.")
+    new = task_commands.add_parser("new", help="Create a task capsule explicitly.")
     new.add_argument("name")
     new.add_argument("--objective", required=True)
     new.add_argument("--mode", choices=["fast", "standard", "assured"], default="standard")
@@ -54,8 +83,28 @@ def parser() -> argparse.ArgumentParser:
     new.add_argument("--constraint", action="append", default=[], dest="constraints")
     new.add_argument("--verify", action="append", default=[], dest="verification")
 
+    confirm = task_commands.add_parser("confirm", help="Confirm or replace auto-selected exact file ownership.")
+    confirm.add_argument("task", nargs="?")
+    confirm.add_argument("--file", action="append", default=[], dest="files")
+
+    auto = task_commands.add_parser("auto", help="Draft a task capsule from a natural-language request.")
+    auto.add_argument("request")
+    _auto_task_flags(auto)
+    _json_flag(auto)
+
+    run = commands.add_parser("run", help="Prepare a routed task, context selection, and builder packet in one step.")
+    run.add_argument("request")
+    _auto_task_flags(run)
+    _json_flag(run)
+
     route = commands.add_parser("route", help="Choose the cheapest adequate implementation and review lanes.")
     route.add_argument("task", nargs="?")
+    _json_flag(route)
+
+    context = commands.add_parser("context", help="Explain and budget the context selected for a task.")
+    context.add_argument("task", nargs="?")
+    context.add_argument("--why", action="store_true", help="Show the reason each file earned context inclusion.")
+    _json_flag(context)
 
     packet = commands.add_parser("packet", help="Generate compact build or review handoff packets.")
     packet.add_argument("stage", choices=["build", "review"])
@@ -73,6 +122,22 @@ def parser() -> argparse.ArgumentParser:
 
     budget = commands.add_parser("budget", help="Estimate context reuse and token savings for a task.")
     budget.add_argument("task", nargs="?")
+    _json_flag(budget)
+
+    cost = commands.add_parser("cost", help="Report task context efficiency and evidence compression estimates.")
+    cost.add_argument("task", nargs="?")
+    _json_flag(cost)
+
+    next_cmd = commands.add_parser("next", help="Return the next required SERA action for the current task.")
+    next_cmd.add_argument("task", nargs="?")
+    _json_flag(next_cmd)
+
+    resume = commands.add_parser("resume", help="Reconstruct the active task from repository state, not chat history.")
+    resume.add_argument("task", nargs="?")
+    _json_flag(resume)
+
+    inbox = commands.add_parser("inbox", help="Show all local SERA tasks and their next actions.")
+    _json_flag(inbox)
 
     review = commands.add_parser("review", help="Record a review verdict bound to the exact task fingerprint.")
     review.add_argument("task", nargs="?")
@@ -89,12 +154,17 @@ def parser() -> argparse.ArgumentParser:
 
     check = commands.add_parser("check", help="Check scope, evidence, review freshness, and optional seal state.")
     check.add_argument("task", nargs="?")
-    check.add_argument("--json", action="store_true")
+    _json_flag(check)
     check.add_argument("--require-seal", action="store_true")
 
     status = commands.add_parser("status", help="Show current task route, budget, scope, and evidence state.")
     status.add_argument("task", nargs="?")
+    _json_flag(status)
     return root
+
+
+def _print_json(value: object) -> None:
+    print(json.dumps(value, indent=2, sort_keys=True))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,43 +173,139 @@ def main(argv: list[str] | None = None) -> int:
         root = find_repo_root()
         if args.command == "init":
             created = initialize(root, force=args.force)
+            ensure_controller_config(root)
             print("Initialized SERA:")
             for path in created:
                 print(f"  {path.relative_to(root)}")
+            print("Controller defaults: enabled")
             return 0
         if args.command == "map":
-            result = build_repo_map(root)
-            print(f"Mapped {result['file_count']} files; fingerprint {result['fingerprint'][:16]}")
-            print(f"Estimated full-source context: ~{result['estimated_full_source_tokens']:,} tokens")
-            print("Reusable map: .sera/cache/repo-map.md")
+            result = update_repo_map(root) if args.update else build_repo_map(root)
+            if args.json:
+                _print_json({
+                    "file_count": result["file_count"],
+                    "fingerprint": result["fingerprint"],
+                    "estimated_full_source_tokens": result["estimated_full_source_tokens"],
+                    "map": ".sera/cache/repo-map.md",
+                    "reused_files": result.get("reused_files", 0),
+                    "rescanned_files": result.get("rescanned_files", result["file_count"]),
+                })
+            else:
+                print(f"Mapped {result['file_count']} files; fingerprint {result['fingerprint'][:16]}")
+                print(f"Estimated full-source context: ~{result['estimated_full_source_tokens']:,} tokens")
+                if args.update:
+                    print(f"Reused: {result.get('reused_files', 0)} | rescanned: {result.get('rescanned_files', 0)}")
+                print("Reusable map: .sera/cache/repo-map.md")
             return 0
         if args.command == "task" and args.task_command == "new":
             task_dir = new_task(
-                root,
-                args.name,
-                args.objective,
-                args.mode,
-                args.risk,
-                args.files,
-                args.constraints,
-                args.verification,
-                args.uncertainty,
-                args.use_case,
+                root, args.name, args.objective, args.mode, args.risk, args.files,
+                args.constraints, args.verification, args.uncertainty, args.use_case,
             )
-            print(task_dir.relative_to(root))
+            print(task_dir.relative_to(root).as_posix())
             return 0
+        if args.command == "task" and args.task_command == "confirm":
+            task_dir = resolve_task_dir(root, args.task)
+            task = confirm_task_ownership(root, task_dir, args.files or None)
+            print(f"Confirmed ownership for {task['id']}: {len(task['allowed_files'])} files")
+            return 0
+        if args.command == "task" and args.task_command == "auto":
+            task_dir, report = auto_task(
+                root, args.request, name=args.name, mode=args.mode, risk=args.risk,
+                uncertainty=args.uncertainty, files=args.files, constraints=args.constraints,
+                verification=args.verification, use_case=args.use_case,
+            )
+            task = load_task(task_dir)
+            output = {
+                "task_id": task["id"],
+                "task_dir": task_dir.relative_to(root).as_posix(),
+                "mode": task["mode"],
+                "risk": task["risk"],
+                "owned_files": task["allowed_files"],
+                "context_reduction_percent": report["context_reduction_percent"],
+            }
+            if args.json:
+                _print_json(output)
+            else:
+                print(output["task_dir"])
+                print(f"mode: {task['mode']} | risk: {task['risk']}")
+                print(f"candidate ownership: {len(task['allowed_files'])} files")
+                print(f"context reduction vs full-source availability: {report['context_reduction_percent']}%")
+            return 0
+        if args.command == "run":
+            report = prepare_run(
+                root, args.request, name=args.name, mode=args.mode, risk=args.risk,
+                uncertainty=args.uncertainty, files=args.files, constraints=args.constraints,
+                verification=args.verification, use_case=args.use_case,
+            )
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"Task: {report['task_id']}")
+                print(f"Mode/risk: {report['mode']}/{report['risk']}")
+                print(f"Owned files: {len(report['owned_files'])}")
+                print(f"Context selected: ~{report['context']['selected_source_tokens']:,} tokens")
+                print(f"Context reduction vs full-source availability: {report['context']['context_reduction_percent']}%")
+                print(f"Builder: {report['route']['builder']}")
+                print(f"Reviewer: {report['route']['reviewer'] or 'not required'}")
+                print(f"Gate: {report['route']['gate'] or 'not required'}")
+                if report["builder_packet"]:
+                    print(f"Packet: {report['builder_packet']} (~{report['builder_packet_tokens']:,} tokens)")
+                else:
+                    print("Packet: not generated until exact ownership is confirmed")
+                print(f"Next: {report['next']['reason']}")
+            return 0
+
+        if args.command == "inbox":
+            report = inbox_report(root)
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"SERA inbox: {report['count']} tasks")
+                for item in report["tasks"]:
+                    print(f"{item['id']} | {item['mode']}/{item['risk']} | {item['state']} | {item['name']}")
+            return 0
+
         task_dir = resolve_task_dir(root, getattr(args, "task", None))
         task = load_task(task_dir)
         if args.command == "route":
             decision = decide_route(root, task, load_repo_map(root))
             config = load_config(root)
-            print(lane_label(config, decision.builder))
-            print(lane_label(config, decision.reviewer) or "reviewer: not required")
-            print(lane_label(config, decision.gate) or "release gate: not required")
-            print(f"reason: {decision.reason}")
-            print(f"owned-context estimate: {decision.estimated_context_tokens:,} tokens")
-            print(f"stage budget: {decision.budget_tokens:,} tokens")
-            print(f"optional Fable eligible: {'yes' if decision.fable_eligible else 'no'}")
+            output = {
+                "builder": lane_label(config, decision.builder),
+                "reviewer": lane_label(config, decision.reviewer),
+                "gate": lane_label(config, decision.gate),
+                "reason": decision.reason,
+                "owned_context_tokens": decision.estimated_context_tokens,
+                "stage_budget_tokens": decision.budget_tokens,
+                "optional_fable_eligible": decision.fable_eligible,
+            }
+            if args.json:
+                _print_json(output)
+            else:
+                print(output["builder"])
+                print(output["reviewer"] or "reviewer: not required")
+                print(output["gate"] or "release gate: not required")
+                print(f"reason: {decision.reason}")
+                print(f"owned-context estimate: {decision.estimated_context_tokens:,} tokens")
+                print(f"stage budget: {decision.budget_tokens:,} tokens")
+                print(f"optional Fable eligible: {'yes' if decision.fable_eligible else 'no'}")
+            return 0
+        if args.command == "context":
+            report = context_report(root, task_dir)
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"Repository context available: ~{report['repository_available_tokens']:,} tokens")
+                print(f"Selected source context: ~{report['selected_source_tokens']:,} tokens")
+                print(f"Capsule: ~{report['capsule_tokens']:,} tokens")
+                print(f"Estimated task context: ~{report['estimated_context_tokens']:,} tokens")
+                print(f"Reduction vs full-source availability: {report['context_reduction_percent']}%")
+                print(f"Budget: {report['stage_budget_tokens']:,} | within budget: {'yes' if report['within_budget'] else 'no'}")
+                if args.why:
+                    print("Context reasons:")
+                    for item in report["selected_files"]:
+                        print(f"  {item['path']} — {'; '.join(item['reasons'])}")
             return 0
         if args.command == "packet":
             path, text = generate_packet(root, task_dir, args.stage)
@@ -161,12 +327,51 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if all(item["exit_code"] == 0 for item in results) else 2
         if args.command == "budget":
             report = budget_report(root, task_dir)
-            print(f"Full-source orientation: ~{report['full_source_tokens']:,} tokens")
-            print(f"Map + capsule orientation: ~{report['orientation_tokens']:,} tokens")
-            print(f"Estimated orientation avoided: ~{report['estimated_orientation_tokens_avoided']:,} tokens ({report['estimated_avoidance_percent']}%)")
-            print(f"Owned context: ~{report['owned_context_tokens']:,} tokens")
-            print(f"Stage budget: {report['stage_budget_tokens']:,} tokens")
-            print(f"Within budget: {'yes' if report['within_budget'] else 'no'}")
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"Full-source orientation: ~{report['full_source_tokens']:,} tokens")
+                print(f"Map + capsule orientation: ~{report['orientation_tokens']:,} tokens")
+                print(f"Estimated orientation avoided: ~{report['estimated_orientation_tokens_avoided']:,} tokens ({report['estimated_avoidance_percent']}%)")
+                print(f"Owned context: ~{report['owned_context_tokens']:,} tokens")
+                print(f"Stage budget: {report['stage_budget_tokens']:,} tokens")
+                print(f"Within budget: {'yes' if report['within_budget'] else 'no'}")
+            return 0
+        if args.command == "cost":
+            report = efficiency_report(root, task_dir)
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"SERA efficiency score: {report['efficiency_score']}/100")
+                print(f"Repository context available: ~{report['repository_available_tokens']:,} tokens")
+                print(f"Selected orientation: ~{report['selected_orientation_tokens']:,} tokens")
+                print(f"Context reduction: ~{report['context_reduction_tokens']:,} tokens ({report['context_reduction_percent']}%)")
+                print(f"Evidence tokens avoided: ~{report['estimated_evidence_tokens_avoided']:,}")
+                print(f"Within budget: {'yes' if report['within_budget'] else 'no'}")
+                print(report["measurement_note"])
+            return 0
+        if args.command == "next":
+            report = next_action(root, task_dir)
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"Task: {report['task_id']}")
+                print(f"State: {report['state']}")
+                print(f"Next: {report['next_action']}")
+                if report["command"]:
+                    print(f"Command: {report['command']}")
+                print(f"Why: {report['reason']}")
+            return 0
+        if args.command == "resume":
+            report = resume_report(root, task["id"])
+            if args.json:
+                _print_json(report)
+            else:
+                print(f"Task: {report['task']['id']}")
+                print(f"Objective: {report['task']['objective']}")
+                print(f"Mode/risk: {report['task']['mode']}/{report['task']['risk']}")
+                print(f"Owned files: {len(report['task']['owned_files'])}")
+                print(f"Next: {report['next']['next_action']} — {report['next']['reason']}")
             return 0
         if args.command == "review":
             fingerprint = task_fingerprint(root, task_dir)
@@ -185,13 +390,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"check", "status"}:
             result = check_task(root, task_dir)
             seal_required_failure = bool(
-                args.command == "check"
-                and getattr(args, "require_seal", False)
+                args.command == "check" and getattr(args, "require_seal", False)
                 and (not result["seal"] or result["seal_stale"])
             )
-            if args.command == "check" and args.json:
-                result["seal_required_failure"] = seal_required_failure
-                print(json.dumps(result, indent=2))
+            if args.json:
+                if args.command == "check":
+                    result["seal_required_failure"] = seal_required_failure
+                _print_json(result)
             else:
                 print(f"Task: {task['id']}")
                 print(f"Status: {'ready' if result['ok'] else 'blocked'}")

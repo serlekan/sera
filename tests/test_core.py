@@ -122,6 +122,7 @@ class SeraCoreTests(unittest.TestCase):
         config = json.loads((self.root / ".sera" / "config.json").read_text())
         fable = config["lanes"]["optional_fable"]
         self.assertFalse(fable["enabled"])
+        self.assertEqual(fable["provider"], "anthropic")
         self.assertFalse(fable["may_be_sole_release_gate"])
 
     def test_disabled_required_lane_never_silently_falls_back(self) -> None:

@@ -2,7 +2,7 @@
 
 Fable 5 is supported as an optional specialist lane.
 
-It is disabled in the default configuration because availability and runtime integration differ between users. Enabling it requires an explicit configuration change.
+It is disabled in the default configuration because SERA treats it as an explicit specialist lane rather than an automatic fallback. Enabling it requires an explicit configuration change.
 
 Recommended uses:
 
@@ -25,7 +25,7 @@ Example configuration:
 {
   "lanes": {
     "optional_fable": {
-      "provider": "your-provider",
+      "provider": "anthropic",
       "model": "claude-fable-5",
       "enabled": true,
       "allowed_uses": ["prototype", "creative-ui", "second-attempt", "supplementary-review"],

@@ -1,24 +1,22 @@
 # Claude Code adapter
 
-Claude Code can use the portable task packets with native subagents.
+SERA prepares provider-neutral task and review packets. Claude Code can consume those packets as builder or reviewer context without inheriting the controller's full conversation.
 
-## Builder prompt
+For implementation, give the selected Claude builder `packet-build.md` and require it to stay inside exact ownership and avoid commits.
 
-```text
-Read the generated packet-build.md. Implement only the owned files. Do not commit. Run every verification command and return exact evidence.
-```
-
-## Reviewer prompt
+For independent review, start a fresh context and give it `packet-review.md`. The reviewer remains read-only and returns exactly one verdict:
 
 ```text
-Start a fresh read-only review. Read packet-review.md and inspect the actual diff. Do not edit. Return exactly one verdict: ship, fix-first, or rethink.
+ship
+fix-first
+rethink
 ```
 
-Use Sonnet, Opus, or another configured Claude model according to `.sera/config.json`. The protocol does not depend on a specific model alias.
-
-After the review, bind the verdict to the exact tree:
+A fresh Claude session can reconstruct repository-backed task state with:
 
 ```bash
-sera review --verdict ship --reviewer "claude-opus" --reason "..."
-sera check
+sera resume --json
+sera next --json
 ```
+
+If Claude is acting as the outer controller, it should follow SERA's returned lane rather than silently substituting a different model. Optional specialist lanes remain explicit and never become the sole release gate by default.

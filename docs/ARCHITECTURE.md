@@ -1,64 +1,50 @@
 # Architecture
 
-SERA has two layers.
+SERA 0.4 has three layers.
 
-## Portable control plane
+## 1. Repository-state core
 
-The Python CLI owns deterministic work:
+The zero-dependency Python core owns deterministic work:
 
-- repository mapping;
-- task contracts;
+- content-hashed repository maps;
+- task contracts and dirty-worktree baselines;
 - routing inputs;
-- packet generation;
 - evidence storage;
-- diff fingerprints;
-- scope and freshness checks.
+- review fingerprints;
+- scope/freshness checks;
+- SERA Seals.
 
-This layer never calls a model API. It stays local, inspectable, and provider-neutral.
+## 2. Controller layer
 
-## Runtime adapters
+The controller translates a natural-language engineering request into compact, inspectable state:
 
-Codex, Claude Code, Fable 5, and other tools consume generated packets. Adapters translate the portable contract into the runtime's native agent or command format.
+- automatic risk/mode draft;
+- relevance-ranked context selection;
+- exact ownership confirmation;
+- next-action state machine;
+- resume/inbox views;
+- context and evidence-efficiency reports.
 
-The boundary is deliberate. Provider SDK churn cannot corrupt the repository-state protocol.
+The controller is still provider-neutral. It prepares dispatch; it does not hide provider calls inside the core.
 
-## Artifacts
+## 3. Runtime adapters
 
-### Repository map
+Codex, Claude Code, or another runtime consumes SERA packets and performs actual model invocation. Provider SDK churn stays outside the repository-state protocol.
 
-A content-hashed list of text files, language, line count, size, and important symbols. The map is cached and excluded from Git by default.
+## Context selection
 
-### Task capsule
+Selection is lexical and symbol-aware in 0.4. Paths and exported symbols that match objective terms receive a score. Explicit files are always included. Inferred files remain candidate ownership until confirmed.
 
-The smallest stable representation of user intent. It contains no transcript.
+Later versions can replace the scorer with a richer dependency graph without changing the task protocol.
 
-### Evidence ledger
+## Dirty-worktree baseline
 
-Append-only JSONL. Full outputs remain outside the packet; hashes preserve identity.
+Task creation records fingerprints of pre-existing dirty paths. Scope checks compare the current worktree against that baseline. Unchanged user work is preserved; new mutations are attributed to the task.
 
-### Review fingerprint
+## Delta maps
 
-SHA-256 over:
+`sera map --update` reuses unchanged map entries and rescans changed files. It uses previous HEAD, Git dirty paths, size, and mtime to decide what must be reread.
 
-- task contract;
-- evidence ledger;
-- unstaged diff;
-- staged diff.
+## Fingerprint-bound review
 
-A verdict is valid only for the exact fingerprint it reviewed.
-
-## Routing
-
-Routing is based on task shape:
-
-- risk;
-- uncertainty;
-- number of owned files;
-- estimated owned context;
-- requested assurance mode.
-
-It is not based on model prestige. Lane names stay stable while model assignments change in configuration.
-
-## SERA Seal
-
-The seal is created only after scope, verification, and all required review stages pass for the current fingerprint. It records the fingerprint, changed files, evidence count, and completed review stages. CI or release tooling can require a current seal with `sera check --require-seal`.
+Review validity still depends on the exact task, evidence, staged diff, unstaged diff, and relevant untracked content. Any later mutation makes a required verdict stale.
