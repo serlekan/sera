@@ -2,84 +2,199 @@
 
 **Specify. Execute. Review. Accept.**
 
-A token-efficient multi-model software delivery protocol by Serlekan.
+A token-efficient, model-neutral controller for AI-assisted software delivery.
 
-SERA is not another “let several agents talk until something works” framework. It is a small local control plane that gives each model the minimum context needed for one bounded job, records machine-checkable evidence, and prevents stale reviews from approving a changed tree.
+SERA is the layer between a product request and the coding agents that implement it. It maps a repository, turns intent into a bounded task, selects the cheapest adequate lane, records reproducible evidence, requires fresh review when risk demands it, and seals only the exact reviewed tree.
 
-The core idea is **relay, not conversation**:
+Version **0.4.0** moves SERA from a relay protocol toward a repository-backed engineering controller.
 
 ```text
-SERA Map → Task Capsule → Cheapest adequate builder → Evidence Ledger
-         → Compact review packet → Fingerprint-bound verdict → SERA Seal
+You / AI controller
+        ↓
+     sera run
+        ↓
+Delta Map → Context Selection → Task Capsule → Ownership
+        ↓
+      Route
+        ↓
+Builder Packet → Implementation → Evidence Ledger
+        ↓
+Fresh Review → Optional Release Gate → SERA Seal
 ```
 
-It works with Codex, Claude Code, Fable 5, or any other model because the source of truth is the repository state and a compact task packet—not a long shared chat transcript.
+The core remains provider-neutral. SERA prepares and validates work; Codex, Claude Code, or another runtime performs provider invocation.
 
-## Why this is different
+## Why SERA
 
-Most agent workflows waste time and tokens in four places:
+AI coding gets expensive and unreliable when every agent starts from zero.
 
-1. Every model rereads the repository.
-2. Full conversation history is forwarded between agents.
-3. Reviewers receive prose claims instead of reproducible evidence.
-4. A review remains “approved” even after more edits are made.
+Common waste looks like:
 
-SERA addresses each one directly.
+- rereading thousands of repository files;
+- forwarding long chat history between models;
+- using premium reasoning for small mechanical work;
+- sending raw test/build logs into review context;
+- losing track of which files an agent was allowed to edit;
+- trusting “done” after the reviewed tree changed;
+- forcing a clean worktree before every agent task.
 
-### 1. Compact repository maps
+SERA turns those into explicit repository state.
 
-`sera map` scans text files once and stores paths, sizes, hashes, languages, and important symbols. Agents can orient from a small reusable map before opening source files.
+### Before SERA
 
-### 2. Task capsules
+```text
+request
++ old chat
++ repository summary
++ repeated source
++ builder narrative
++ raw logs
++ reviewer narrative
+→ another large prompt
+```
 
-Every task is reduced to a stable contract: objective, exact file ownership, constraints, risk, uncertainty, and verification commands. The capsule is intentionally smaller than the discussion that produced it.
+### With SERA
 
-### 3. Adaptive routing
+```text
+Task Capsule
++ justified context
++ exact ownership
++ bounded diff
++ compact evidence
+→ only the model that needs it
+```
 
-The router chooses the cheapest adequate lane from task risk, uncertainty, owned file count, context size, and assurance mode. Model names are configuration, not architecture.
+## What 0.4 adds
 
-### 4. Evidence ledgers
+### Controller state machine
 
-Verification results are stored as compact JSONL records containing the command, exit code, summary, output hash, and output size. Reviewers consume evidence instead of repeated logs.
+```bash
+sera next
+sera resume
+sera inbox
+```
 
-### 5. Fingerprint-bound review
+A fresh AI session can reconstruct the active engineering state from the repository instead of requiring the previous conversation.
 
-A review verdict is bound to a fingerprint of the task contract, evidence ledger, staged diff, and unstaged diff. Any post-review change makes the verdict stale automatically.
+### Natural-language task preparation
 
-### 6. Hard loop limits
+```bash
+sera run "fix payment reconciliation"
+```
 
-The default policy allows two builder attempts. Repeating an unchanged prompt is not a strategy; the task must be respecified, escalated, or returned to architecture.
+SERA can:
+
+- update the repository map;
+- rank relevant files/symbols;
+- infer a draft risk level;
+- escalate high-risk work to `assured`;
+- choose configured builder/reviewer/gate lanes;
+- prepare a compact builder handoff.
+
+Inferred files are **candidate ownership**, not permission to edit. Confirm them first:
+
+```bash
+sera task confirm
+```
+
+Or provide exact files up front:
+
+```bash
+sera run "fix payment reconciliation" \
+  --file src/payments/service.py \
+  --file tests/test_payments.py \
+  --verify "python -m unittest"
+```
+
+### Context that earns its place
+
+```bash
+sera context --why
+```
+
+SERA reports why each file was selected and compares selected task context with repository context available.
+
+### Delta repository maps
+
+```bash
+sera map --update
+```
+
+Unchanged files reuse their previous map metadata. Changed files are reread and reparsed.
+
+### Measurable efficiency
+
+```bash
+sera cost
+```
+
+Example shape:
+
+```text
+SERA efficiency score: 98/100
+Repository context available: ~5,562,935 tokens
+Selected orientation: ~18,400 tokens
+Context reduction: ~5,544,535 tokens (99.67%)
+Evidence tokens avoided: ~9,300
+```
+
+These are local, provider-neutral estimates—not API billing telemetry and not a claim that a non-SERA workflow would literally transmit the full repository.
+
+### Dirty-worktree safety
+
+SERA now snapshots pre-existing dirty paths when a task starts.
+
+Existing user changes are treated as baseline. If they remain unchanged, they do not become task scope. If they change again during the task, SERA detects the mutation and applies ownership rules.
+
+## Core principles
+
+1. **Repository state outranks agent narrative.**
+2. **Context is a budget, not an entitlement.**
+3. **Every context item needs a reason.**
+4. **Inferred relevance is not edit permission.**
+5. **The cheapest adequate lane wins.**
+6. **Builders do not self-approve.**
+7. **Raw logs stay local unless investigation needs them.**
+8. **Any post-review mutation invalidates acceptance.**
+9. **Completion, commit, merge, deploy, and release are separate decisions.**
+10. **SERA measures what it saves.**
 
 ## Productivity modes
 
-| Mode | Intended use | Review policy | Typical token budget |
+| Mode | Intended use | Review policy | Default budget |
 |---|---|---|---:|
-| `fast` | Low-risk, bounded edits | Review only when scope expands | 6,000 |
-| `standard` | Normal feature and bug work | Independent review | 16,000 |
-| `assured` | Security, money, migrations, public APIs, broad changes | Independent review plus release gate | 32,000 |
+| `fast` | Low-risk bounded work | Review only when scope expands | 6,000 |
+| `standard` | Normal feature/bug work | Independent review | 16,000 |
+| `assured` | Security, money, migrations, public APIs, broad changes | Independent review + release gate | 32,000 |
 
-Budgets are warnings and routing inputs, not provider billing controls.
+Auto-drafted high-risk work is escalated to `assured`.
 
-## Model-neutral lanes
+## Default lanes
 
-The default configuration demonstrates one possible setup:
+Model names are configuration, not architecture.
 
-| Lane | Default model | Responsibility |
+| Lane | Default | Responsibility |
 |---|---|---|
-| Planner | GPT-5.6 Sol | Resolve intent and architecture |
-| Fast builder | GPT-5.6 Luna | Mechanical, bounded implementation |
-| Deep builder | Claude Sonnet 5 | Substantial implementation and debugging |
-| Independent reviewer | Claude Opus 5 | Fresh-context review without edits |
-| Release gate | GPT-5.6 Sol | Final high-risk acceptance |
-| Optional specialist | Fable 5, disabled by default | Prototypes, creative UI, recovery attempts, supplementary review |
+| Planner | `openai/gpt-5.6-sol` | Intent and architecture |
+| Fast builder | `openai/gpt-5.6-luna` | Mechanical/bounded implementation |
+| Deep builder | `anthropic/claude-sonnet-5` | Substantial implementation/debugging |
+| Independent reviewer | `anthropic/claude-opus-5` | Fresh read-only review |
+| Release gate | `openai/gpt-5.6-sol` | High-risk acceptance |
+| Optional specialist | `anthropic/claude-fable-5` | Explicit specialist lane, disabled by default |
 
-Change any lane in `.sera/config.json`. A team can run Claude-only, Codex-only, Fable-assisted, local-model, or mixed-provider workflows.
-
-Fable 5 is optional. It is never a silent fallback and never the sole release gate by default.
+Change lanes in `.sera/config.json`. Required disabled lanes fail closed; SERA never silently substitutes another model.
 
 ## Install
 
-Requires Python 3.11 or newer and Git.
+Requires Python 3.11+ and Git.
+
+Install directly from GitHub:
+
+```bash
+python -m pip install --user --upgrade "git+https://github.com/serlekan/serlekan-sera.git@main"
+```
+
+From a local clone:
 
 ```bash
 python -m pip install --user --no-build-isolation .
@@ -91,225 +206,245 @@ Windows PowerShell:
 ./scripts/install.ps1
 ```
 
-macOS or Linux:
+macOS/Linux:
 
 ```bash
 ./scripts/install.sh
 ```
 
-Confirm installation:
+Confirm:
 
 ```bash
 sera --version
 ```
 
-Portable single-file build without installation:
+If the scripts directory is not on PATH:
 
 ```bash
-python scripts/build_zipapp.py
-python dist/sera.pyz --version
+python -m sera.cli --version
 ```
 
-## Five-minute workflow
-
-### 1. Initialize a repository
+## Initialize a project
 
 ```bash
 sera init
 sera map
 ```
 
-This creates:
+Creates:
 
 ```text
-.sera/config.json
-.sera/cache/repo-map.json
-.sera/cache/repo-map.md
-.sera/tasks/
+.sera/
+  config.json
+  cache/
+    repo-map.json
+    repo-map.md
+  tasks/
 ```
 
-### 2. Create a task capsule
+Commit `.sera/config.json` when it represents project policy. Runtime cache/packets are ignored by default.
+
+## Recommended 0.4 workflow
+
+### 1. Start from a normal product request
 
 ```bash
-sera task new "fix invoice status" \
-  --objective "Prevent completed status when payment authority is incomplete" \
-  --mode assured \
-  --risk high \
-  --uncertainty 1 \
-  --file src/invoices/status.ts \
-  --file tests/invoices/status.test.ts \
-  --constraint "Fail closed when required sources are unavailable" \
-  --verify "npm test -- tests/invoices/status.test.ts" \
-  --verify "npm run typecheck"
+sera run "prevent completed invoice state when payment authority is incomplete"
 ```
 
-### 3. Route it
+If SERA inferred candidate files:
 
 ```bash
-sera route
-```
-
-Example:
-
-```text
-deep_builder: anthropic/claude-sonnet-5
-independent_reviewer: anthropic/claude-opus-5
-release_gate: openai/gpt-5.6-sol
-owned-context estimate: 7,830 tokens
-stage budget: 32,000 tokens
-```
-
-### 4. Generate the builder packet
-
-```bash
+sera context --why
+sera task confirm --file src/invoices/status.py --file tests/test_invoice_status.py
 sera packet build
 ```
 
-The generated packet contains only the contract, route, owned-file metadata, constraints, and verification requirements. It does not forward the full chat history.
+If exact files were supplied to `sera run`, the builder packet is created immediately.
 
-### 5. Run and record verification automatically
+### 2. Ask what happens next
+
+```bash
+sera next
+```
+
+Typical states include:
+
+```text
+confirm_ownership
+build_packet
+dispatch_builder
+verify
+review_packet
+dispatch_review
+fix_first
+seal
+accepted
+```
+
+### 3. Verify implementation
 
 ```bash
 sera verify
 ```
 
-The CLI runs the task's commands, stores local logs, and appends compact evidence records. Manual recording remains available for commands run elsewhere.
+The evidence ledger records command, exit code, summary, output hash, and size. Full logs remain local.
 
-```bash
-sera record \
-  --command "npm test -- tests/invoices/status.test.ts" \
-  --exit-code 0 \
-  --summary "Focused invoice status tests passed: 12/12" \
-  --output-file test-output.txt
-```
-
-### 6. Generate a review packet
+### 4. Review from fresh context
 
 ```bash
 sera packet review
 ```
 
-The review packet contains a bounded diff, changed files, evidence hashes, and an exact verdict contract.
-
-### 7. Bind the verdict to the current tree
+Give that packet to the configured reviewer. Record the result:
 
 ```bash
 sera review \
   --stage independent \
   --verdict ship \
   --reviewer "claude-opus-5" \
-  --reason "Scope, tests, and fail-closed behavior match the task contract"
+  --reason "Scope and verification satisfy the contract"
+```
 
-# Assured and high-risk tasks also require the configured gate.
-sera review \
-  --stage gate \
-  --verdict ship \
-  --reviewer "gpt-5.6-sol" \
-  --reason "The independently reviewed tree satisfies the release boundary"
+Assured/high-risk work also requires the configured gate.
 
+### 5. Seal exact acceptance
+
+```bash
 sera seal
 sera check --require-seal
 ```
 
-The seal is a compact completion artifact for the exact reviewed tree. A later edit changes the fingerprint, makes the seal stale, and blocks release until verification and review run again.
+A later code change makes the verdict/seal stale.
+
+## Fresh chat? Resume, don't re-explain
+
+```bash
+sera resume
+```
+
+or for AI controllers:
+
+```bash
+sera resume --json
+```
+
+The output includes the objective, mode/risk, ownership, budget, route, fingerprint, and next required action.
+
+## Project inbox
+
+```bash
+sera inbox
+```
+
+Shows every local SERA task and its current next action.
+
+## Machine-readable controller API
+
+These commands support `--json`:
+
+```text
+sera map
+sera task auto
+sera run
+sera route
+sera context
+sera budget
+sera cost
+sera next
+sera resume
+sera inbox
+sera check
+sera status
+```
+
+This is the preferred interface for ChatGPT/Codex or another orchestrator.
+
+Example:
+
+```bash
+sera next --json
+```
+
+```json
+{
+  "next_action": "verify",
+  "command": "sera verify",
+  "reason": "Required verification evidence is missing."
+}
+```
 
 ## Commands
 
 ```text
-sera init                     Initialize local policy and state
-sera map                      Build the compact repository map
-sera task new                 Create a task capsule
-sera route                    Select the cheapest adequate lanes
-sera packet build             Generate a compact implementation handoff
-sera packet review            Generate a compact review handoff
-sera verify                   Run verification and record evidence automatically
-sera record                   Append verification evidence manually
-sera budget                   Estimate context reuse and token savings
-sera review                   Record a fingerprint-bound verdict
-sera summary                  Generate a compact PR or handoff summary
-sera seal                     Seal the exact verified and reviewed tree
-sera check                    Enforce scope, evidence, review, and seal freshness
-sera status                   Show the current task state and next action
+sera init                  Initialize project policy/state
+sera map                   Build the repository map
+sera map --update          Refresh only changed map entries
+sera task new              Create an explicit task capsule
+sera task auto             Draft task/risk/context from a request
+sera task confirm          Confirm exact edit ownership
+sera run                   Prepare a task and route in one step
+sera context --why         Show selected context and inclusion reasons
+sera route                 Select configured lanes
+sera packet build          Generate implementation handoff
+sera verify                Run verification and record evidence
+sera packet review         Generate fresh-review handoff
+sera review                Record fingerprint-bound verdict
+sera next                  Return the next state-machine action
+sera resume                Reconstruct active task from repository state
+sera inbox                 Show all local tasks
+sera budget                Show stage context budget
+sera cost                  Show token/context efficiency estimates
+sera summary               Generate PR/handoff summary
+sera seal                  Seal exact accepted tree
+sera check                 Enforce scope/evidence/reviews/seal
+sera status                Show current task state
 ```
 
-## Measure the savings
+## What SERA does not do
 
-```bash
-sera budget
-```
+SERA 0.4 intentionally does not hide model-provider calls inside the core.
 
-Example output:
+It can say:
 
 ```text
-Full-source orientation: ~84,200 tokens
-Map + capsule orientation: ~2,100 tokens
-Estimated orientation avoided: ~82,100 tokens (97.5%)
-Owned context: ~7,830 tokens
-Stage budget: 16,000 tokens
-Within budget: yes
+builder: anthropic/claude-sonnet-5
+reviewer: anthropic/claude-opus-5
+release_gate: openai/gpt-5.6-sol
 ```
 
-These are provider-neutral estimates, not billing claims. They make context growth visible before an agent session becomes expensive.
+The surrounding runtime then dispatches the generated packet.
 
-## How it saves tokens
+This keeps SERA usable with Codex, Claude Code, local agents, CI, and future providers without tying repository safety to one SDK.
 
-A normal agent handoff may resend architecture discussion, repository summaries, source files, tool logs, and previous agent messages. SERA replaces that with four reusable artifacts:
+## Documentation
 
-- repository map;
-- task capsule;
-- evidence ledger;
-- bounded diff packet.
-
-The CLI prints estimated packet size so a team can see when context is growing beyond the selected mode. See [Token efficiency](docs/TOKEN-EFFICIENCY.md).
-
-## How it saves time
-
-- Repository orientation is cached by content hash.
-- Builders receive exact ownership before they start.
-- Verification evidence is recorded once and reused.
-- Review packets and PR summaries are generated automatically.
-- Post-review changes invalidate approval and the SERA Seal immediately.
-- Two-attempt defaults prevent expensive prompt loops.
-- Risk modes remove unnecessary heavyweight review from trivial tasks.
-
-## Native model adapters
-
-SERA does not pretend Codex can spawn Claude or Claude Code can spawn GPT. The CLI generates portable packets, while each runtime handles its own native agent invocation.
-
+- [Controller](docs/CONTROLLER.md)
+- [Token efficiency](docs/TOKEN-EFFICIENCY.md)
+- [Workflow](docs/WORKFLOW.md)
+- [Architecture](docs/ARCHITECTURE.md)
 - [Codex adapter](adapters/codex/README.md)
 - [Claude Code adapter](adapters/claude/README.md)
-- [Optional Fable 5 usage](docs/FABLE-5.md)
+- [Optional Fable usage](docs/FABLE-5.md)
 
-## Repository structure
+## Development
 
-```text
-src/sera/       Zero-dependency Python CLI
-adapters/                   Runtime-specific operating instructions
-config/                     Example team configurations
-docs/                       Architecture and token-efficiency design
-examples/                   End-to-end task examples
-templates/                  Portable task and review contracts
-tests/                      CLI and safety tests
+```bash
+python -m pip install -e . --no-build-isolation
+python -m unittest discover -s tests -v
+git diff --check
+sera --version
 ```
 
-## Design principles
-
-1. Repository state outranks agent narrative.
-2. Context is pulled only when needed.
-3. Every builder owns an explicit file set.
-4. The cheapest adequate model is preferred.
-5. Evidence is hashed and reusable.
-6. Reviewers do not implement their own fixes.
-7. Every change after review invalidates the verdict and final seal.
-8. Completion, commit, merge, and deployment are separate decisions.
+The project intentionally keeps the core dependency-free.
 
 ## Status
 
-Version `0.3.0` is an alpha release. The CLI is functional and uses only the Python standard library. Provider-specific automatic invocation is intentionally outside the core; adapters can evolve without coupling the protocol to one vendor.
+Version `0.4.0` is an alpha controller release. The repository-state protocol is functional; provider-specific automatic dispatch remains adapter/controller-runtime work for later releases.
 
 ## History and attribution
 
-An early prototype explored the architect/builder/reviewer pattern used by Sol Advisor. Version 0.3.0 is a clean implementation centered on repository maps, task capsules, adaptive budgets, evidence ledgers, and fingerprint-bound review. The current core does not import or depend on Sol Advisor code.
+An early prototype explored the architect/builder/reviewer pattern used by Sol Advisor. SERA's current implementation is independently centered on repository maps, task capsules, context budgets, evidence ledgers, controller state, dirty-worktree baselines, and fingerprint-bound acceptance. It does not import or depend on Sol Advisor code.
 
 ## License
 

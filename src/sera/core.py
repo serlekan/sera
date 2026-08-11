@@ -59,7 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "independent_reviewer": {"provider": "anthropic", "model": "claude-opus-5", "enabled": True},
         "release_gate": {"provider": "openai", "model": "gpt-5.6-sol", "enabled": True},
         "optional_fable": {
-            "provider": "custom",
+            "provider": "anthropic",
             "model": "claude-fable-5",
             "enabled": False,
             "allowed_uses": ["prototype", "creative-ui", "second-attempt", "supplementary-review"],
@@ -67,6 +67,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "verification": [],
+    "controller": {
+        "context_max_files": 12,
+        "context_min_score": 2,
+        "enforce_context_budget": True,
+        "auto_risk": True,
+    },
     "rules": {
         "builders_may_commit": False,
         "review_after_every_post_review_change": True,
@@ -271,6 +277,7 @@ def build_repo_map(root: Path, config: dict[str, Any] | None = None) -> dict[str
             "bytes": len(data),
             "lines": text.count("\n") + (1 if text else 0),
             "sha256": digest,
+            "mtime_ns": path.stat().st_mtime_ns,
             "language": language,
             "symbols": extract_symbols(text, suffix),
         }
@@ -281,6 +288,7 @@ def build_repo_map(root: Path, config: dict[str, Any] | None = None) -> dict[str
         "schema_version": 1,
         "generated_at": utc_now(),
         "repo_root": root.name,
+        "head_sha": run_git(root, "rev-parse", "HEAD", check=False).strip() or None,
         "fingerprint": fingerprint,
         "file_count": len(entries),
         "total_bytes": sum(item["bytes"] for item in entries),
@@ -295,6 +303,89 @@ def build_repo_map(root: Path, config: dict[str, Any] | None = None) -> dict[str
     (cache / "repo-map.md").write_text(markdown, encoding="utf-8")
     return result
 
+
+
+def update_repo_map(root: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Refresh the repository map while reusing unchanged file metadata.
+
+    The filesystem is still walked to detect adds/deletes, but unchanged files
+    are not reread or re-parsed when their size/mtime and Git state are stable.
+    """
+    config = config or load_config(root)
+    previous_path = state_path(root) / "cache" / "repo-map.json"
+    if not previous_path.exists():
+        result = build_repo_map(root, config)
+        result["reused_files"] = 0
+        result["rescanned_files"] = result["file_count"]
+        return result
+    previous = json.loads(previous_path.read_text(encoding="utf-8"))
+    previous_index = {item["path"]: item for item in previous.get("files", [])}
+    excludes = set(config.get("exclude_dirs", [])) | DEFAULT_EXCLUDES
+    max_bytes = int(config.get("max_file_bytes", 300_000))
+    current_head = run_git(root, "rev-parse", "HEAD", check=False).strip() or None
+    previous_head = previous.get("head_sha")
+    forced: set[str] = set()
+    if previous_head and current_head and previous_head != current_head:
+        changed = run_git(root, "diff", "--name-only", previous_head, current_head, check=False)
+        forced.update(line.replace("\\", "/") for line in changed.splitlines() if line.strip())
+    forced.update(working_tree_snapshot(root))
+
+    entries: list[dict[str, Any]] = []
+    languages: dict[str, int] = {}
+    fingerprint_parts: list[str] = []
+    reused = 0
+    rescanned = 0
+    for path in iter_repo_files(root, excludes, max_bytes):
+        relative = path.relative_to(root).as_posix()
+        stat = path.stat()
+        old = previous_index.get(relative)
+        if (
+            old
+            and relative not in forced
+            and old.get("bytes") == stat.st_size
+            and old.get("mtime_ns") == stat.st_mtime_ns
+            and old.get("sha256")
+        ):
+            entry = old
+            reused += 1
+        else:
+            data = path.read_bytes()
+            digest = sha256_bytes(data)
+            text = data.decode("utf-8", errors="replace")
+            suffix = path.suffix.lower()
+            entry = {
+                "path": relative,
+                "bytes": len(data),
+                "lines": text.count("\n") + (1 if text else 0),
+                "sha256": digest,
+                "mtime_ns": stat.st_mtime_ns,
+                "language": LANGUAGE_BY_SUFFIX.get(suffix, "Text"),
+                "symbols": extract_symbols(text, suffix),
+            }
+            rescanned += 1
+        languages[entry["language"]] = languages.get(entry["language"], 0) + 1
+        entries.append(entry)
+        fingerprint_parts.append(f"{relative}\0{entry['sha256']}")
+
+    result = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "repo_root": root.name,
+        "head_sha": current_head,
+        "fingerprint": sha256_text("\n".join(fingerprint_parts)),
+        "file_count": len(entries),
+        "total_bytes": sum(item["bytes"] for item in entries),
+        "estimated_full_source_tokens": estimate_tokens(sum(item["bytes"] for item in entries)),
+        "languages": dict(sorted(languages.items(), key=lambda item: (-item[1], item[0]))),
+        "files": entries,
+        "reused_files": reused,
+        "rescanned_files": rescanned,
+    }
+    cache = state_path(root) / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "repo-map.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    (cache / "repo-map.md").write_text(render_repo_map_markdown(result), encoding="utf-8")
+    return result
 
 def render_repo_map_markdown(repo_map: dict[str, Any]) -> str:
     lines = [
@@ -364,6 +455,7 @@ def new_task(
         "verification": verification or list(config.get("verification", [])),
         "builder_attempts": 0,
         "status": "specified",
+        "baseline_changes": working_tree_snapshot(root),
     }
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     (task_dir / "ledger.jsonl").write_text("", encoding="utf-8")
@@ -472,6 +564,51 @@ def lane_label(config: dict[str, Any], lane: str | None) -> str | None:
     enabled = value.get("enabled", True)
     return f"{lane}: {provider}/{model}" + ("" if enabled else " (disabled)")
 
+
+
+def working_tree_snapshot(root: Path) -> dict[str, str]:
+    """Return a compact fingerprint per dirty path, including Git status.
+
+    This lets tasks preserve an already-dirty worktree: unchanged pre-task edits
+    do not become task scope, while later mutations to those paths do.
+    """
+    output = run_git(root, "status", "--porcelain=v1", "-z")
+    items = output.split("\0")
+    snapshot: dict[str, str] = {}
+    skip_next_rename_source = False
+    for item in items:
+        if not item:
+            continue
+        if skip_next_rename_source:
+            skip_next_rename_source = False
+            continue
+        status = item[:2]
+        raw = item[3:] if len(item) >= 4 else item
+        if status.startswith("R") or status.endswith("R") or status.startswith("C") or status.endswith("C"):
+            skip_next_rename_source = True
+        normalized = raw.replace("\\", "/")
+        if normalized == STATE_DIR or normalized.startswith(f"{STATE_DIR}/"):
+            continue
+        path = root / raw
+        if path.is_file():
+            try:
+                content_hash = sha256_bytes(path.read_bytes())
+            except OSError:
+                content_hash = "unreadable"
+        elif path.exists():
+            content_hash = "non-file"
+        else:
+            content_hash = "deleted"
+        snapshot[normalized] = sha256_text(f"{status}\0{content_hash}")
+    return snapshot
+
+
+def task_changed_files(root: Path, task: dict[str, Any]) -> list[str]:
+    baseline = task.get("baseline_changes", {})
+    current = working_tree_snapshot(root)
+    if not isinstance(baseline, dict):
+        return sorted(current)
+    return sorted(path for path in set(baseline) | set(current) if baseline.get(path) != current.get(path))
 
 def changed_files(root: Path) -> list[str]:
     output = run_git(root, "status", "--porcelain=v1", "-z")
@@ -607,7 +744,7 @@ def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
             "",
             "## Changed files",
             "",
-            *([f"- `{item}`" for item in changed_files(root)] or ["- No working-tree changes detected."]),
+            *([f"- `{item}`" for item in task_changed_files(root, task)] or ["- No task-relative working-tree changes detected."]),
             "",
             "## Compact diff",
             "",
@@ -778,7 +915,7 @@ def create_seal(root: Path, task_dir: Path) -> dict[str, Any]:
 
 def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
     task = load_task(task_dir)
-    changed = changed_files(root)
+    changed = task_changed_files(root, task)
     allowed = set(task["allowed_files"])
     out_of_scope = [path for path in changed if path not in allowed]
     ledger = read_ledger(task_dir)
