@@ -8,6 +8,19 @@
     "enforce_context_budget": true,
     "auto_risk": true
   },
+  "risk_policy": {
+    "high_risk_terms": [
+      "payment",
+      "authentication",
+      "migration",
+      "production deployment"
+    ],
+    "high_risk_paths": [
+      "src/auth/**",
+      "src/payments/**",
+      "migrations/**"
+    ]
+  },
   "token_budgets": {
     "fast": 6000,
     "standard": 16000,

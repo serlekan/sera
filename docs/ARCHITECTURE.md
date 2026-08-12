@@ -8,13 +8,21 @@ The zero-dependency Python core owns deterministic work:
 
 - content-hashed repository maps;
 - task contracts and dirty-worktree baselines;
+- mode precedence and risk composition;
 - routing inputs;
 - evidence storage;
 - review fingerprints;
 - scope/freshness checks;
-- SERA Seals.
+- SERA Seals and exact-head identity.
 
-## 2. Controller layer
+## 2. Context-selection layer
+
+`sera.context` sits between the core and the controller. It depends on the core
+and nothing above it, so selection stays a pure function of repository state:
+stage-aware ranking, budget-bounded selection, and the inclusion/exclusion reason
+taxonomy.
+
+## 3. Controller layer
 
 The controller translates a natural-language engineering request into compact, inspectable state:
 
@@ -27,13 +35,36 @@ The controller translates a natural-language engineering request into compact, i
 
 The controller is still provider-neutral. It prepares dispatch; it does not hide provider calls inside the core.
 
-## 3. Runtime adapters
+## 4. Runtime adapters
 
 Codex, Claude Code, or another runtime consumes SERA packets and performs actual model invocation. Provider SDK churn stays outside the repository-state protocol.
 
+## Ownership versus context
+
+0.4.1 separates two things 0.4.0 conflated:
+
+- **ownership** — the files a task may modify; an authorization surface;
+- **selected context** — the files one stage reads; a token budget.
+
+Both are sized and reported independently. The mode budget constrains selected
+context only, so a large owned set never blocks a task whose stage context fits.
+A file removed from context keeps its ownership.
+
 ## Context selection
 
-Selection is lexical and symbol-aware in 0.4. Paths and exported symbols that match objective terms receive a score. Explicit files are always included. Inferred files remain candidate ownership until confirmed.
+Selection is lexical and symbol-aware. Paths and exported symbols that match
+objective terms receive a score; ownership, changed status, and explicit pinning
+add priority above that. Selection is deterministic: candidates are ordered by
+score, then size, then path, and filled greedily against the file cap and the
+stage token allowance. The highest-priority candidate is always included so a
+stage is never handed empty context.
+
+Review selection is diff-aware. Changed files rank above unchanged owned files,
+and files imported by changed files are pulled in as dependencies using a bounded,
+language-agnostic scan of import-like lines in the changed files only. Every
+changed file remains represented through the bounded diff regardless of selection.
+
+Inferred files remain candidate ownership until confirmed.
 
 Later versions can replace the scorer with a richer dependency graph without changing the task protocol.
 
@@ -48,3 +79,11 @@ Task creation records fingerprints of pre-existing dirty paths. Scope checks com
 ## Fingerprint-bound review
 
 Review validity still depends on the exact task, evidence, staged diff, unstaged diff, and relevant untracked content. Any later mutation makes a required verdict stale.
+
+## Exact-head acceptance
+
+Seals additionally bind the exact `HEAD` commit and `HEAD` tree. Review
+fingerprints deliberately remain HEAD-independent so a reviewer's verdict is not
+invalidated by unrelated commit activity; acceptance is the step that must name a
+single commit. Seals are versioned, and a 0.4.0 seal without repository identity
+fails closed rather than being read as an exact-head acceptance.

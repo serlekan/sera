@@ -6,7 +6,7 @@ A token-efficient, model-neutral controller for AI-assisted software delivery.
 
 SERA is the layer between a product request and the coding agents that implement it. It maps a repository, turns intent into a bounded task, selects the cheapest adequate lane, records reproducible evidence, requires fresh review when risk demands it, and seals only the exact reviewed tree.
 
-Version **0.4.0** moves SERA from a relay protocol toward a repository-backed engineering controller.
+Version **0.4.1** hardens the 0.4 controller for high-assurance repositories: project-defined risk policy, honored mode defaults, ownership separated from stage context, and acceptance bound to the exact Git commit.
 
 ```text
 You / AI controller
@@ -86,7 +86,7 @@ SERA can:
 
 - update the repository map;
 - rank relevant files/symbols;
-- infer a draft risk level;
+- compose a risk level from built-in and project-defined policy;
 - escalate high-risk work to `assured`;
 - choose configured builder/reviewer/gate lanes;
 - prepare a compact builder handoff.
@@ -106,13 +106,62 @@ sera run "fix payment reconciliation" \
   --verify "python -m unittest"
 ```
 
+### Project-defined risk policy
+
+Built-in risk terminology is generic on purpose. Declare what *your* repository
+treats as dangerous in `.sera/config.json`:
+
+```json
+{
+  "risk_policy": {
+    "high_risk_terms": ["payment", "authentication", "production deployment"],
+    "high_risk_paths": ["src/auth/**", "src/payments/**", "migrations/**"]
+  }
+}
+```
+
+Terms match case-insensitively as whole tokens or phrases, so `order` matches
+`cancel the order` but never `reorder`. Paths use `**` / `*` / `?` glob syntax.
+Effective risk is the maximum of the built-in classifier, your terms, your paths,
+and any explicit `--risk`; an explicit level can raise risk but never silently
+lowers a detected one. Every escalation is explained:
+
+```json
+{
+  "risk": "high",
+  "risk_reasons": [
+    {"type": "project_term", "value": "execution"},
+    {"type": "project_path", "value": "trading/risk/**", "matched": "trading/risk/limits.py"}
+  ]
+}
+```
+
+### Ownership is not context
+
+Ownership is what a task may **change**. Context is what a stage must **read**.
+They are budgeted separately, so a task owning 36 files can still hand a builder a
+12-file packet and a reviewer a different one:
+
+```json
+{
+  "ownership": {"file_count": 36, "estimated_tokens": 227307},
+  "selected_context": {"file_count": 10, "estimated_tokens": 28140}
+}
+```
+
+A file excluded from context keeps its ownership, and a large owned set never on
+its own triggers `reduce_context`.
+
 ### Context that earns its place
 
 ```bash
 sera context --why
 ```
 
-SERA reports why each file was selected and compares selected task context with repository context available.
+SERA reports why each file earned or lost its place — `selected_owned`,
+`selected_changed_file`, `selected_dependency`, `owned_not_selected`,
+`excluded_by_budget`, `not_in_repository_map` — and compares selected stage
+context with repository context available.
 
 ### Delta repository maps
 
@@ -167,7 +216,10 @@ Existing user changes are treated as baseline. If they remain unchanged, they do
 | `standard` | Normal feature/bug work | Independent review | 16,000 |
 | `assured` | Security, money, migrations, public APIs, broad changes | Independent review + release gate | 32,000 |
 
-Auto-drafted high-risk work is escalated to `assured`.
+The mode comes from your project's `default_mode` unless an explicit `--mode` is
+given. Precedence is `explicit CLI mode > default_mode > standard`, and invalid
+values fail closed. High-risk work is escalated to `assured` regardless of the
+requested mode. Budgets apply to selected stage context, not to total ownership.
 
 ## Default lanes
 
@@ -315,7 +367,18 @@ sera seal
 sera check --require-seal
 ```
 
-A later code change makes the verdict/seal stale.
+A seal binds the task, evidence, reviews, working-tree delta, relevant untracked
+state, **and the exact `HEAD` commit and tree**. A later code change makes the
+verdict and seal stale — and so does moving HEAD at all:
+
+```bash
+git commit -m "anything"
+sera check --require-seal   # exit 2: seal_head_mismatch
+```
+
+That holds for a new commit, a reset, a branch checkout, and a different commit
+carrying an identical tree. Seals written by 0.4.0 carry no repository identity;
+they report `legacy_unbound` and fail closed until re-sealed.
 
 ## Fresh chat? Resume, don't re-explain
 
@@ -384,7 +447,7 @@ sera task new              Create an explicit task capsule
 sera task auto             Draft task/risk/context from a request
 sera task confirm          Confirm exact edit ownership
 sera run                   Prepare a task and route in one step
-sera context --why         Show selected context and inclusion reasons
+sera context --why         Show selected context and inclusion/exclusion reasons
 sera route                 Select configured lanes
 sera packet build          Generate implementation handoff
 sera verify                Run verification and record evidence
@@ -440,7 +503,7 @@ The project intentionally keeps the core dependency-free.
 
 ## Status
 
-Version `0.4.0` is an alpha controller release. The repository-state protocol is functional; provider-specific automatic dispatch remains adapter/controller-runtime work for later releases.
+Version `0.4.1` is an alpha controller release. The repository-state protocol is functional; provider-specific automatic dispatch remains adapter/controller-runtime work for later releases.
 
 ## History and attribution
 
