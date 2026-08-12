@@ -15,6 +15,7 @@ from .core import (
     HIGH_RISK_TERMS,
     MEDIUM_RISK_TERMS,
     SeraError,
+    apply_task_policy,
     assess_risk,
     budget_report,
     check_task,
@@ -26,6 +27,7 @@ from .core import (
     load_config,
     load_task,
     new_task,
+    normalize_repo_path,
     resolve_task_dir,
     state_path,
     utc_now,
@@ -171,14 +173,25 @@ def auto_task(
 
 
 def confirm_task_ownership(root: Path, task_dir: Path, files: list[str] | None = None) -> dict[str, Any]:
+    """Confirm exact ownership and re-derive policy from the new contract.
+
+    Confirming ownership changes what the task is authorized to touch, so it
+    must re-run the same risk and mode resolution used at creation. Skipping it
+    would let a task confirmed onto a high-risk path keep a fast, review-free
+    route.
+    """
     task = load_task(task_dir)
     if files:
-        task["allowed_files"] = sorted({path.replace("\\", "/") for path in files})
+        task["allowed_files"] = sorted({normalize_repo_path(path) for path in files})
     if not task.get("allowed_files"):
         raise SeraError("Cannot confirm empty ownership; provide --file at least once.")
+    config = load_config(root)
+    apply_task_policy(config, task)
     controller = task.setdefault("controller", {})
     controller["ownership_confirmed"] = True
     controller["ownership_confirmed_at"] = utc_now()
+    controller["mode_source"] = task.get("mode_source")
+    controller["risk_reasons"] = task.get("risk_reasons", [])
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     return task
 
