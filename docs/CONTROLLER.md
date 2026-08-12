@@ -216,6 +216,26 @@ Budget allocation runs in two phases:
    so unused headroom flows to the files that need it. The result depends only
    on the change set, never on input order.
 
+#### The budget is exact, not estimated
+
+When `review_diff_coverage` reports success, this holds exactly:
+
+```text
+len(rendered_text) <= max_chars
+```
+
+There is no estimate, tolerance, or unmodelled overhead. A single canonical
+renderer produces each file block, and budgeting measures that renderer's real
+output — headers, blob identity, patch hashes, `shown`/`total` counters, omission
+markers, and separators all included. The minimum representation for every
+changed file is rendered and measured first; if that measured minimum exceeds
+`max_chars`, generation fails immediately. Remaining budget is then distributed,
+the result re-rendered and re-measured, and shrunk deterministically until the
+measured length fits.
+
+`max_chars` counts **Python string characters (Unicode code points)**, matching
+`len(text)`. It is not a UTF-8 byte count.
+
 When even the guaranteed minimum does not fit, `sera packet review` fails with
 `review_diff_budget_insufficient` and `sera next` returns that as its state.
 Raise `max_packet_chars` or split the task.
@@ -237,6 +257,59 @@ Raise `max_packet_chars` or split the task.
 
 `not_in_repository_map` is reported only when a path really is absent from the
 map. In 0.4.0 any owned file outside the context cap was mislabelled this way.
+
+## Artifact freshness
+
+A generated artifact is never current merely because its file exists. Every task
+carries a **task-contract fingerprint** — a hash of objective, requested and
+derived policy, risk reasons, confirmed ownership, constraints, verification,
+uncertainty, and use case. It deliberately excludes generated artifacts,
+timestamps, evidence, and worktree state, so the binding can never be circular.
+
+Each generated packet is written alongside machine-readable provenance in
+`packet-<stage>.provenance.json`:
+
+```json
+{
+  "schema_version": 1,
+  "packet_type": "build",
+  "task_id": "20260812T091006Z-low-risk-task",
+  "task_contract_fingerprint": "…",
+  "state_fingerprint": null,
+  "route": {"builder": "deep_builder", "reviewer": "independent_reviewer", "gate": "release_gate"}
+}
+```
+
+A packet is current only when its provenance parses, its schema version and
+type match, its task ID matches, and its contract fingerprint equals the task's
+current one. A review packet additionally binds the task/evidence/delta
+`state_fingerprint`, because it embeds the diff and evidence; a build packet does
+not.
+
+Anything else fails closed:
+
+| Reason | Meaning |
+| --- | --- |
+| `packet_missing` | no packet has been generated |
+| `packet_unbound` | provenance absent, unparseable, or for a different task/stage |
+| `packet_stale_contract` | the task contract changed after generation |
+| `packet_stale_state` | review packet's embedded diff/evidence state moved on |
+
+So a semantic task mutation — ownership confirmation being the common one —
+invalidates the previous build packet, the previous review packet, and rewrites
+`capsule.md` immediately. `sera next` then requests regeneration instead of
+returning `dispatch_builder`, and the regenerated packet carries the current
+route rather than the superseded one.
+
+An unbound packet from an older SERA is never dispatchable as current.
+
+### Evidence follows the same rule
+
+Verification evidence records the contract fingerprint they were produced under.
+Records remain in the ledger for audit, but evidence collected under a superseded
+contract no longer satisfies the current one — it must be re-run. Reviews are
+already invalidated by the task fingerprint, which changes whenever the contract
+does.
 
 ## `sera next`
 
@@ -263,6 +336,16 @@ assured budget:           32k tokens
 
 It still blocks when a stage genuinely cannot fit — for example when one owned
 file alone is larger than the whole budget. Split the task in that case.
+
+`dispatch_builder` and `dispatch_review` are returned only when the corresponding
+packet is *current* for the task contract. A packet that exists but is stale,
+unbound, or built for a superseded contract yields `build_packet` or
+`review_packet` instead, and `sera next --json` reports the packet state:
+
+```json
+{"state": "build_packet",
+ "build_packet": {"exists": true, "current": false, "reason": "packet_stale_contract"}}
+```
 
 Use `--json` when another AI controller is consuming the result.
 

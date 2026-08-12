@@ -102,6 +102,11 @@ low-risk and then confirmed onto `critical/**` is escalated to `assured` and
 rerouted to independent review plus the release gate — ownership changes cannot
 bypass policy.
 
+Handoff artifacts are freshness-bound to the task contract, so a packet built for
+the old contract is never dispatched. `sera next` asks you to regenerate, and the
+new packet carries the current route and ownership. Packet existence alone never
+means packet freshness.
+
 Or provide exact files up front:
 
 ```bash
@@ -165,7 +170,10 @@ sera context --why
 
 Every changed file reaches the reviewer with its own bounded patch — SERA never
 truncates one combined diff at its ends, which used to drop the files in between.
-If the budget cannot cover every changed file, packet generation fails with
+Reported success means the rendered diff is **exactly** within budget
+(`len(text) <= max_chars`, counting Unicode code points), because budgeting
+measures the real rendered output rather than estimating it. If the budget cannot
+cover every changed file, packet generation fails with
 `review_diff_budget_insufficient` rather than implying complete coverage.
 
 SERA reports why each file earned or lost its place — `selected_owned`,

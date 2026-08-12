@@ -5,6 +5,36 @@
 High-assurance controller hardening. Corrections found by integrating 0.4.0 into a
 real high-assurance repository, fixed generically rather than downstream.
 
+### Second correction pass (independent review of the corrected candidate)
+
+A second exact-head independent review confirmed the five earlier blockers were
+fixed and reproduced two further defects. Both are corrected here.
+
+- **Handoff packets are freshness-bound to the task contract.** `sera next`
+  treated packet existence as packet freshness, so after `sera task confirm`
+  moved a task from `fast`/`low` onto a high-risk path it still returned
+  `dispatch_builder` for a packet carrying the old `fast_builder` route and the
+  old ownership — a fail-open orchestration defect. Tasks now carry a
+  `task_contract_fingerprint` over their semantic contract only, packets are
+  written with adjacent machine-readable provenance, and a packet is dispatchable
+  only when that provenance parses and matches. Review packets additionally bind
+  the task/evidence/delta state they embed. `capsule.md` is rewritten on
+  contract mutation so it never remains stale documentation, and verification
+  evidence records the contract it was gathered under — retained for audit, but
+  no longer satisfying a superseded contract. Missing or malformed provenance
+  fails closed, so an unbound packet is never dispatchable as current.
+- **The review-diff character budget is now exact.** With 50 changed files,
+  `review_diff_coverage` reported success at a 25,700-character budget while the
+  rendered text ran 28,598 characters — 2,898 over — because allocation modelled
+  raw patch bodies while the renderer also emitted headers, blob identity, patch
+  hashes, `shown`/`total` counters, and omission markers. A single canonical
+  per-file renderer now produces every block, and budgeting measures that
+  renderer's real output: the guaranteed minimum for every changed file is
+  rendered and measured before success is possible, the remainder is allocated,
+  and the result is re-rendered and shrunk deterministically until the measured
+  length fits. Reported success now guarantees `len(text) <= max_chars` exactly.
+  `max_chars` is documented as Python string characters (Unicode code points).
+
 ### Correction pass (independent review of the first 0.4.1 candidate)
 
 An exact-head independent review reproduced five defects in the first 0.4.1

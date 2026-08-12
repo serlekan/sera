@@ -61,10 +61,14 @@ stage token allowance. The highest-priority candidate is always included so a
 stage is never handed empty context.
 
 Change evidence is assembled per file, not as one combined patch trimmed at its
-ends, so no changed file can be lost between the first and last. Budget is
-allocated in two phases — a guaranteed minimum for every changed file, then
-water-filled relevance for the remainder — and generation fails closed when even
-the minimum does not fit.
+ends, so no changed file can be lost between the first and last. One canonical
+renderer produces each block and the budget algorithm measures that renderer's
+actual output, so header width, counter digits, and omission markers cannot drift
+from what a reviewer receives. Budget is allocated in two phases — a measured
+guaranteed minimum for every changed file, then water-filled relevance for the
+remainder — followed by a final rendered-length guard. Reported success therefore
+means `len(text) <= max_chars` exactly, in Unicode code points; otherwise
+generation fails closed.
 
 Review selection is diff-aware. Changed files rank above unchanged owned files,
 and files imported by changed files are pulled in as dependencies using a bounded,
@@ -86,6 +90,19 @@ Task creation records fingerprints of pre-existing dirty paths. Scope checks com
 ## Fingerprint-bound review
 
 Review validity still depends on the exact task, evidence, staged diff, unstaged diff, and relevant untracked content. Any later mutation makes a required verdict stale.
+
+## Derived-artifact freshness
+
+Handoff artifacts are bound to a task-contract fingerprint covering only the
+semantic contract — objective, requested and derived policy, ownership,
+constraints, verification. Generated content is excluded, so an artifact can be
+compared against the contract that produced it without circularity.
+
+Packet provenance is stored adjacent to each packet rather than parsed back out
+of markdown. Existence never implies freshness: missing, malformed, or mismatched
+provenance fails closed and forces regeneration. Verification evidence carries
+the same binding, so evidence gathered under a superseded contract stops
+satisfying it while remaining in the ledger for audit.
 
 ## Acceptance composition
 

@@ -20,7 +20,9 @@ sera task confirm --file src/example.py
 
 Confirming ownership re-runs risk policy against the new file set, so a task
 confirmed onto a high-risk path is escalated and rerouted rather than keeping its
-original low-risk lane.
+original low-risk lane. It also refreshes `capsule.md` and invalidates any
+previously generated handoff packet: `sera next` will ask you to regenerate
+rather than dispatch a packet built for the old contract.
 
 The task's mode comes from your project's `default_mode` unless you pass an
 explicit `--mode`. High-risk work — from built-in terminology or from your own
