@@ -39,11 +39,13 @@ REVIEW_DIFF_BUDGET_INSUFFICIENT = "review_diff_budget_insufficient"
 MIN_FILE_DIFF_CHARS = 320
 BLOCK_SEPARATOR = "\n\n"
 
-PACKET_SCHEMA_VERSION = 1
+PACKET_SCHEMA_VERSION = 2
 PACKET_MISSING = "packet_missing"
 PACKET_UNBOUND = "packet_unbound"
 PACKET_STALE_CONTRACT = "packet_stale_contract"
 PACKET_STALE_STATE = "packet_stale_state"
+PACKET_STALE_ROUTE = "packet_stale_route"
+PACKET_CONTENT_MISMATCH = "packet_content_mismatch"
 # Semantic task-contract fields. Generated artifacts are bound to a hash of
 # these, never to their own contents, so the binding cannot become circular.
 TASK_CONTRACT_FIELDS = (
@@ -906,6 +908,31 @@ def task_contract_fingerprint(task: dict[str, Any]) -> str:
     return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
+def _lane_identity(config: dict[str, Any], lane: str | None) -> dict[str, Any] | None:
+    if lane is None:
+        return None
+    value = config.get("lanes", {}).get(lane, {})
+    return {"lane": lane, "provider": value.get("provider"), "model": value.get("model")}
+
+
+def resolved_route_identity(config: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
+    """The lane, provider, and model actually selected for each required stage.
+
+    Only stages this task genuinely requires are bound, so changing an unrelated
+    or unused lane never invalidates a packet.
+    """
+    return {
+        "builder": _lane_identity(config, decision.builder),
+        "reviewer": _lane_identity(config, decision.reviewer),
+        "gate": _lane_identity(config, decision.gate),
+    }
+
+
+def route_fingerprint(config: dict[str, Any], decision: RouteDecision) -> str:
+    identity = resolved_route_identity(config, decision)
+    return sha256_text(json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
 def packet_provenance_path(task_dir: Path, stage: str) -> Path:
     return task_dir / f"packet-{stage}.provenance.json"
 
@@ -916,6 +943,8 @@ def write_packet_provenance(
     task: dict[str, Any],
     route: dict[str, Any] | None = None,
     state_fingerprint: str | None = None,
+    route_identity_fingerprint: str | None = None,
+    content_sha256: str | None = None,
 ) -> dict[str, Any]:
     provenance = {
         "schema_version": PACKET_SCHEMA_VERSION,
@@ -923,6 +952,10 @@ def write_packet_provenance(
         "task_id": task["id"],
         "task_contract_fingerprint": task_contract_fingerprint(task),
         "state_fingerprint": state_fingerprint,
+        "route_fingerprint": route_identity_fingerprint,
+        "content_sha256": content_sha256,
+        # Diagnostics only. Freshness never trusts this object; the route is
+        # independently re-resolved and re-fingerprinted at validation time.
         "route": route or {},
         "generated_at": utc_now(),
     }
@@ -944,16 +977,23 @@ def read_packet_provenance(task_dir: Path, stage: str) -> dict[str, Any] | None:
 
 
 def packet_state(
+    root: Path,
     task_dir: Path,
     stage: str,
     task: dict[str, Any],
     state_fingerprint: str | None = None,
+    repo_map: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Decide whether a generated packet is current for the task contract.
+    """Decide whether a generated packet may still be dispatched.
 
-    Existence is never sufficient. A packet with missing, malformed, or
-    mismatched provenance fails closed and must be regenerated, so an unbound
-    artifact from an older SERA can never be dispatched as current.
+    Existence is never sufficient, and recorded metadata is never trusted on its
+    own. The task contract, the resolved route, and the packet's own bytes are
+    all recomputed from current state and compared, so editing the stored route
+    strings, the embedded Markdown checksum, or the packet body cannot make a
+    stale packet look current. Validation is ordered and every failure is a
+    closed one:
+
+        missing -> unbound -> contract -> state -> route -> content -> current
     """
     packet = task_dir / f"packet-{stage}.md"
     if not packet.exists():
@@ -965,12 +1005,29 @@ def packet_state(
         or provenance.get("packet_type") != stage
         or provenance.get("task_id") != task.get("id")
         or not provenance.get("task_contract_fingerprint")
+        or not provenance.get("route_fingerprint")
+        or not provenance.get("content_sha256")
     ):
         return {"exists": True, "current": False, "reason": PACKET_UNBOUND}
     if provenance["task_contract_fingerprint"] != task_contract_fingerprint(task):
         return {"exists": True, "current": False, "reason": PACKET_STALE_CONTRACT}
     if state_fingerprint is not None and provenance.get("state_fingerprint") != state_fingerprint:
         return {"exists": True, "current": False, "reason": PACKET_STALE_STATE}
+    try:
+        decision = decide_route(root, task, repo_map)
+        current_route = route_fingerprint(load_config(root), decision)
+    except SeraError:
+        # The route cannot be resolved at all now, so nothing built from the
+        # previous one may be dispatched.
+        return {"exists": True, "current": False, "reason": PACKET_STALE_ROUTE}
+    if provenance["route_fingerprint"] != current_route:
+        return {"exists": True, "current": False, "reason": PACKET_STALE_ROUTE}
+    try:
+        content = packet.read_bytes()
+    except OSError:
+        return {"exists": True, "current": False, "reason": PACKET_CONTENT_MISMATCH}
+    if provenance["content_sha256"] != sha256_bytes(content):
+        return {"exists": True, "current": False, "reason": PACKET_CONTENT_MISMATCH}
     return {"exists": True, "current": True, "reason": None}
 
 
@@ -1622,18 +1679,19 @@ def generate_packet(
     text = text.replace("Packet generated:", f"Packet checksum: `{checksum}`\nPacket generated:", 1)
     path = task_dir / f"packet-{stage}.md"
     path.write_text(text, encoding="utf-8")
+    # Hash what actually landed on disk, not the in-memory string, so the
+    # provenance envelope binds the exact bytes a runtime will read.
+    content_sha256 = sha256_bytes(path.read_bytes())
     write_packet_provenance(
         task_dir,
         stage,
         task,
-        route={
-            "builder": decision.builder,
-            "reviewer": decision.reviewer,
-            "gate": decision.gate,
-        },
+        route=resolved_route_identity(config, decision),
         # A review packet embeds the diff and evidence, so it is additionally
         # bound to that state; a build packet is not.
         state_fingerprint=task_fingerprint(root, task_dir) if stage == "review" else None,
+        route_identity_fingerprint=route_fingerprint(config, decision),
+        content_sha256=content_sha256,
     )
     return path, text
 

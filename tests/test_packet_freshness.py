@@ -79,7 +79,7 @@ class PacketFreshnessTests(unittest.TestCase):
         self.assertEqual(task["risk"], "high")
         self.assertEqual(task["mode"], "assured")
 
-        state = packet_state(task_dir, "build", task)
+        state = packet_state(self.root, task_dir, "build", task)
         self.assertTrue(state["exists"])
         self.assertFalse(state["current"])
         self.assertEqual(state["reason"], PACKET_STALE_CONTRACT)
@@ -115,13 +115,13 @@ class PacketFreshnessTests(unittest.TestCase):
         task_dir = self.low_risk_task()
         confirm_task_ownership(self.root, task_dir, ["critical/secret.py"])
         build_packet(self.root, task_dir, "build")
-        self.assertTrue(packet_state(task_dir, "build", load_task(task_dir))["current"])
+        self.assertTrue(packet_state(self.root, task_dir, "build", load_task(task_dir))["current"])
 
         confirm_task_ownership(self.root, task_dir, ["docs/note.py"])
         task = load_task(task_dir)
         self.assertEqual(task["risk"], "low")
         self.assertEqual(task["mode"], "fast")
-        self.assertFalse(packet_state(task_dir, "build", task)["current"])
+        self.assertFalse(packet_state(self.root, task_dir, "build", task)["current"])
         self.assertEqual(next_action(self.root, task_dir)["state"], "build_packet")
 
         _, text = build_packet(self.root, task_dir, "build")
@@ -138,7 +138,7 @@ class PacketFreshnessTests(unittest.TestCase):
         confirm_task_ownership(self.root, task_dir, ["docs/note.py"])
         task = load_task(task_dir)
         self.assertEqual(task_contract_fingerprint(task), before)
-        self.assertTrue(packet_state(task_dir, "build", task)["current"])
+        self.assertTrue(packet_state(self.root, task_dir, "build", task)["current"])
         self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_builder")
 
     # --- Test E: verification requirements are contract state ---------------
@@ -146,11 +146,11 @@ class PacketFreshnessTests(unittest.TestCase):
         task_dir = self.low_risk_task()
         build_packet(self.root, task_dir, "build")
         task = load_task(task_dir)
-        self.assertTrue(packet_state(task_dir, "build", task)["current"])
+        self.assertTrue(packet_state(self.root, task_dir, "build", task)["current"])
 
         task["verification"] = ["python -m unittest"]
         save_task(task_dir, task)
-        self.assertFalse(packet_state(task_dir, "build", load_task(task_dir))["current"])
+        self.assertFalse(packet_state(self.root, task_dir, "build", load_task(task_dir))["current"])
 
     def test_evidence_from_an_older_contract_does_not_satisfy_the_new_one(self) -> None:
         task_dir = new_task(
@@ -176,7 +176,7 @@ class PacketFreshnessTests(unittest.TestCase):
         provenance["task_contract_fingerprint"] = "0" * 64
         path.write_text(json.dumps(provenance), encoding="utf-8")
         self.assertEqual(
-            packet_state(task_dir, "build", load_task(task_dir))["reason"], PACKET_STALE_CONTRACT
+            packet_state(self.root, task_dir, "build", load_task(task_dir))["reason"], PACKET_STALE_CONTRACT
         )
         self.assertEqual(next_action(self.root, task_dir)["state"], "build_packet")
 
@@ -184,7 +184,7 @@ class PacketFreshnessTests(unittest.TestCase):
         task_dir = self.low_risk_task()
         build_packet(self.root, task_dir, "build")
         packet_provenance_path(task_dir, "build").unlink()
-        state = packet_state(task_dir, "build", load_task(task_dir))
+        state = packet_state(self.root, task_dir, "build", load_task(task_dir))
         self.assertTrue(state["exists"])
         self.assertFalse(state["current"])
         self.assertEqual(state["reason"], PACKET_UNBOUND)
@@ -195,12 +195,12 @@ class PacketFreshnessTests(unittest.TestCase):
         build_packet(self.root, task_dir, "build")
         packet_provenance_path(task_dir, "build").write_text("{not json", encoding="utf-8")
         self.assertEqual(
-            packet_state(task_dir, "build", load_task(task_dir))["reason"], PACKET_UNBOUND
+            packet_state(self.root, task_dir, "build", load_task(task_dir))["reason"], PACKET_UNBOUND
         )
 
     def test_missing_packet_reports_missing(self) -> None:
         task_dir = self.low_risk_task()
-        self.assertEqual(packet_state(task_dir, "build", load_task(task_dir))["reason"], PACKET_MISSING)
+        self.assertEqual(packet_state(self.root, task_dir, "build", load_task(task_dir))["reason"], PACKET_MISSING)
 
     # --- Test G: review packet freshness ------------------------------------
     def test_review_packet_goes_stale_on_contract_and_state_change(self) -> None:
@@ -213,13 +213,13 @@ class PacketFreshnessTests(unittest.TestCase):
         build_packet(self.root, task_dir, "review")
         task = load_task(task_dir)
         self.assertTrue(
-            packet_state(task_dir, "review", task, task_fingerprint(self.root, task_dir))["current"]
+            packet_state(self.root, task_dir, "review", task, task_fingerprint(self.root, task_dir))["current"]
         )
         self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_review")
 
         # Working-tree state moves on: the embedded diff is no longer accurate.
         (self.root / "docs" / "note.py").write_text("NOTE = 3\n", encoding="utf-8")
-        state = packet_state(task_dir, "review", task, task_fingerprint(self.root, task_dir))
+        state = packet_state(self.root, task_dir, "review", task, task_fingerprint(self.root, task_dir))
         self.assertFalse(state["current"])
         self.assertEqual(state["reason"], PACKET_STALE_STATE)
         self.assertEqual(next_action(self.root, task_dir)["state"], "review_packet")
@@ -231,7 +231,7 @@ class PacketFreshnessTests(unittest.TestCase):
         confirm_task_ownership(self.root, task_dir, ["docs/note.py", "critical/secret.py"])
         self.assertFalse(
             packet_state(
-                task_dir, "review", load_task(task_dir), task_fingerprint(self.root, task_dir)
+                self.root, task_dir, "review", load_task(task_dir), task_fingerprint(self.root, task_dir)
             )["current"]
         )
 
@@ -239,14 +239,16 @@ class PacketFreshnessTests(unittest.TestCase):
         task_dir = self.low_risk_task()
         build_packet(self.root, task_dir, "build")
         provenance = json.loads(packet_provenance_path(task_dir, "build").read_text(encoding="utf-8"))
-        self.assertEqual(provenance["route"]["builder"], "fast_builder")
+        self.assertEqual(provenance["route"]["builder"]["lane"], "fast_builder")
+        self.assertEqual(provenance["route"]["builder"]["provider"], "openai")
+        self.assertIsNone(provenance["route"]["reviewer"])
 
         confirm_task_ownership(self.root, task_dir, ["critical/secret.py"])
         build_packet(self.root, task_dir, "build")
         provenance = json.loads(packet_provenance_path(task_dir, "build").read_text(encoding="utf-8"))
-        self.assertEqual(provenance["route"]["builder"], "deep_builder")
-        self.assertEqual(provenance["route"]["reviewer"], "independent_reviewer")
-        self.assertEqual(provenance["route"]["gate"], "release_gate")
+        self.assertEqual(provenance["route"]["builder"]["lane"], "deep_builder")
+        self.assertEqual(provenance["route"]["reviewer"]["lane"], "independent_reviewer")
+        self.assertEqual(provenance["route"]["gate"]["lane"], "release_gate")
 
     def test_contract_fingerprint_excludes_generated_and_volatile_state(self) -> None:
         task_dir = self.low_risk_task()

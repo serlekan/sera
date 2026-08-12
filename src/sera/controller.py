@@ -205,8 +205,8 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     config = load_config(root)
     decision = decide_route(root, task)
     result = check_task(root, task_dir)
-    build_packet_state = packet_state(task_dir, "build", task)
-    review_packet_state = packet_state(task_dir, "review", task, result["fingerprint"])
+    build_packet_state = packet_state(root, task_dir, "build", task)
+    review_packet_state = packet_state(root, task_dir, "review", task, result["fingerprint"])
     stage = required_stage(result)
     stage_context = context_report(root, task_dir, stage=stage, record=False)
 
