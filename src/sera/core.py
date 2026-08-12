@@ -37,6 +37,28 @@ REVIEW_DIFF_BUDGET_INSUFFICIENT = "review_diff_budget_insufficient"
 # Every changed file is guaranteed at least this many characters of real patch
 # body before any remaining review-diff budget is distributed by relevance.
 MIN_FILE_DIFF_CHARS = 320
+BLOCK_SEPARATOR = "\n\n"
+
+PACKET_SCHEMA_VERSION = 1
+PACKET_MISSING = "packet_missing"
+PACKET_UNBOUND = "packet_unbound"
+PACKET_STALE_CONTRACT = "packet_stale_contract"
+PACKET_STALE_STATE = "packet_stale_state"
+# Semantic task-contract fields. Generated artifacts are bound to a hash of
+# these, never to their own contents, so the binding cannot become circular.
+TASK_CONTRACT_FIELDS = (
+    "objective",
+    "requested_mode",
+    "requested_risk",
+    "mode",
+    "risk",
+    "risk_reasons",
+    "allowed_files",
+    "constraints",
+    "verification",
+    "uncertainty",
+    "use_case",
+)
 
 HIGH_RISK_TERMS = {
     "auth", "authentication", "authorization", "balance", "cryptography", "deploy", "deployment",
@@ -576,7 +598,7 @@ def initialize(root: Path, force: bool = False) -> list[Path]:
 
 def ensure_gitignore(root: Path) -> None:
     path = root / ".gitignore"
-    marker = "# SERA runtime\n.sera/cache/\n.sera/tasks/*/packet-*.md\n"
+    marker = "# SERA runtime\n.sera/cache/\n.sera/tasks/*/packet-*\n"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     if ".sera/cache/" not in existing:
         with path.open("a", encoding="utf-8") as handle:
@@ -867,9 +889,96 @@ def new_task(
     }
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     (task_dir / "ledger.jsonl").write_text("", encoding="utf-8")
-    (task_dir / "capsule.md").write_text(render_task_capsule(task), encoding="utf-8")
+    write_task_capsule(task_dir, task)
     (state_path(root) / "latest-task").write_text(task_id + "\n", encoding="utf-8")
     return task_dir
+
+
+def task_contract_fingerprint(task: dict[str, Any]) -> str:
+    """Deterministic identity of a task's semantic contract.
+
+    Covers only what a handoff artifact is derived from — objective, requested
+    and derived policy, confirmed ownership, constraints, verification. It
+    deliberately excludes generated artifacts, timestamps, evidence, and
+    worktree state, so binding an artifact to it can never be circular.
+    """
+    payload = {field: task.get(field) for field in TASK_CONTRACT_FIELDS}
+    return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def packet_provenance_path(task_dir: Path, stage: str) -> Path:
+    return task_dir / f"packet-{stage}.provenance.json"
+
+
+def write_packet_provenance(
+    task_dir: Path,
+    stage: str,
+    task: dict[str, Any],
+    route: dict[str, Any] | None = None,
+    state_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    provenance = {
+        "schema_version": PACKET_SCHEMA_VERSION,
+        "packet_type": stage,
+        "task_id": task["id"],
+        "task_contract_fingerprint": task_contract_fingerprint(task),
+        "state_fingerprint": state_fingerprint,
+        "route": route or {},
+        "generated_at": utc_now(),
+    }
+    packet_provenance_path(task_dir, stage).write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return provenance
+
+
+def read_packet_provenance(task_dir: Path, stage: str) -> dict[str, Any] | None:
+    path = packet_provenance_path(task_dir, stage)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def packet_state(
+    task_dir: Path,
+    stage: str,
+    task: dict[str, Any],
+    state_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Decide whether a generated packet is current for the task contract.
+
+    Existence is never sufficient. A packet with missing, malformed, or
+    mismatched provenance fails closed and must be regenerated, so an unbound
+    artifact from an older SERA can never be dispatched as current.
+    """
+    packet = task_dir / f"packet-{stage}.md"
+    if not packet.exists():
+        return {"exists": False, "current": False, "reason": PACKET_MISSING}
+    provenance = read_packet_provenance(task_dir, stage)
+    if (
+        not provenance
+        or provenance.get("schema_version") != PACKET_SCHEMA_VERSION
+        or provenance.get("packet_type") != stage
+        or provenance.get("task_id") != task.get("id")
+        or not provenance.get("task_contract_fingerprint")
+    ):
+        return {"exists": True, "current": False, "reason": PACKET_UNBOUND}
+    if provenance["task_contract_fingerprint"] != task_contract_fingerprint(task):
+        return {"exists": True, "current": False, "reason": PACKET_STALE_CONTRACT}
+    if state_fingerprint is not None and provenance.get("state_fingerprint") != state_fingerprint:
+        return {"exists": True, "current": False, "reason": PACKET_STALE_STATE}
+    return {"exists": True, "current": True, "reason": None}
+
+
+def write_task_capsule(task_dir: Path, task: dict[str, Any]) -> Path:
+    """(Re)write the capsule so it always describes the current contract."""
+    path = task_dir / "capsule.md"
+    path.write_text(render_task_capsule(task), encoding="utf-8")
+    return path
 
 
 def render_task_capsule(task: dict[str, Any]) -> str:
@@ -1182,7 +1291,44 @@ def _collect_changed_files(root: Path, allowed_files: list[str]) -> list[dict[st
     return [changes[key] for key in sorted(changes)]
 
 
-def _render_change_header(entry: dict[str, Any], shown: int, total: int) -> str:
+def _bound_patch(patch: str, allowance: int) -> str:
+    """Trim a patch to at most `allowance` characters, marker included.
+
+    The returned string never exceeds the allowance, so block length is
+    monotonic in the allowance and the budget algorithm can reason about it.
+    """
+    if len(patch) <= allowance:
+        return patch
+    if allowance <= 0:
+        return ""
+    # The marker states how much was dropped, but its own width depends on that
+    # number; two or three passes reach a fixed point.
+    room = allowance
+    marker = ""
+    for _ in range(4):
+        candidate = f"\n... {len(patch) - room:,} characters omitted from this file by review budget ...\n"
+        new_room = allowance - len(candidate)
+        marker = candidate
+        if new_room == room or new_room <= 0:
+            room = new_room
+            break
+        room = new_room
+    if room <= 0:
+        return patch[:allowance]
+    head = patch[: (room * 3) // 5]
+    tail_length = room - len(head)
+    tail = patch[len(patch) - tail_length :] if tail_length > 0 else ""
+    return (head + marker + tail)[:allowance]
+
+
+def _render_change_block(entry: dict[str, Any], body_allowance: int) -> str:
+    """The single canonical renderer for one changed file.
+
+    Budgeting measures the output of this function directly rather than
+    estimating it, so header width, counter digits, and omission markers can
+    never drift away from what a reviewer actually receives.
+    """
+    body = _bound_patch(entry["patch"], body_allowance)
     status = _STATUS_LABELS.get(entry["status"][:1], entry["status"])
     where = "+".join(part for part, flag in (("staged", entry["staged"]), ("unstaged", entry["unstaged"])) if flag)
     lines = [
@@ -1192,47 +1338,29 @@ def _render_change_header(entry: dict[str, Any], shown: int, total: int) -> str:
         f"- blobs: `{entry['old_sha']}`..`{entry['new_sha']}`",
         f"- content: {'binary/non-text' if entry['binary'] else 'text'}",
         f"- patch sha256: `{sha256_text(entry['patch'])[:16]}`",
-        f"- shown: {shown:,} of {total:,} patch characters",
+        f"- shown: {len(body):,} of {len(entry['patch']):,} patch characters",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n```diff\n" + body + "\n```"
 
 
-def _allocate_diff_budget(needs: list[int], budget: int, floor: int) -> list[int]:
-    """Water-fill allocation: guarantee each file its floor, then spread the rest.
-
-    Files are filled smallest-need first so unused headroom flows to the files
-    that actually need it, and the result depends only on the needs, never on
-    input order.
-    """
-    allocation = [0] * len(needs)
-    remaining = budget
-    left = len(needs)
-    for index in sorted(range(len(needs)), key=lambda i: (needs[i], i)):
-        guaranteed = min(needs[index], floor)
-        share = max(guaranteed, remaining // left) if left else guaranteed
-        take = min(needs[index], share)
-        allocation[index] = take
-        remaining -= take
-        left -= 1
-    return allocation
-
-
-def _bound_patch(patch: str, allowance: int) -> str:
-    if len(patch) <= allowance:
-        return patch
-    head = patch[: max(1, (allowance * 3) // 5)]
-    tail = patch[-max(1, allowance - len(head)) :]
-    omitted = len(patch) - len(head) - len(tail)
-    return f"{head}\n... {omitted:,} characters omitted from this file by review budget ...\n{tail}"
+def _render_change_blocks(entries: list[dict[str, Any]], allocations: list[int]) -> str:
+    return BLOCK_SEPARATOR.join(
+        _render_change_block(entry, allowance) for entry, allowance in zip(entries, allocations)
+    )
 
 
 def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -> dict[str, Any]:
     """Render a per-file review diff in which no changed file can be omitted.
 
-    Budgeting runs in two phases: every changed file is first guaranteed a
-    minimum of real patch body, and only the remainder is distributed by
-    relevance. When even the guaranteed minimum does not fit, this reports
-    failure instead of emitting a packet that looks complete.
+    `max_chars` counts Python string characters (Unicode code points), matching
+    `len(text)`; it is not a UTF-8 byte count.
+
+    Budgeting runs in two phases against *measured* output. Every changed file
+    is first guaranteed a minimum of real patch body, and the exact rendered
+    length of that minimum is what decides whether the budget can be honored at
+    all. Only the remainder is distributed by relevance. When success is
+    reported, `len(text) <= max_chars` holds exactly — there is no estimate and
+    no tolerance.
     """
     entries = _collect_changed_files(root, allowed_files)
     if not entries:
@@ -1240,36 +1368,84 @@ def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -
             "ok": True,
             "text": "No task-relative changes to review.",
             "files": [],
+            "covered": [],
             "required_chars": 0,
+            "rendered_chars": 0,
             "reason": None,
         }
 
-    headers = [_render_change_header(entry, 0, len(entry["patch"])) for entry in entries]
-    overhead = sum(len(header) + 24 for header in headers)
     needs = [len(entry["patch"]) for entry in entries]
-    required = overhead + sum(min(need, MIN_FILE_DIFF_CHARS) for need in needs)
-    if max_chars < required:
+    minimums = [min(need, MIN_FILE_DIFF_CHARS) for need in needs]
+    minimum_text = _render_change_blocks(entries, minimums)
+    required = len(minimum_text)
+    if required > max_chars:
         return {
             "ok": False,
             "text": "",
             "files": [entry["path"] for entry in entries],
+            "covered": [],
             "required_chars": required,
+            "rendered_chars": 0,
             "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
         }
 
-    allocation = _allocate_diff_budget(needs, max(0, max_chars - overhead), MIN_FILE_DIFF_CHARS)
-    blocks: list[str] = []
-    covered: list[dict[str, Any]] = []
-    for entry, allowance, need in zip(entries, allocation, needs):
-        body = _bound_patch(entry["patch"], allowance)
-        blocks.append(_render_change_header(entry, min(allowance, need), need) + "\n\n```diff\n" + body + "\n```")
-        covered.append({"path": entry["path"], "shown_chars": min(allowance, need), "total_chars": need})
+    allocations = list(minimums)
+    spare = max_chars - required
+    order = sorted(range(len(entries)), key=lambda index: (needs[index], index))
+    slots = len(order)
+    for index in order:
+        want = needs[index] - allocations[index]
+        if spare > 0 and want > 0:
+            take = min(want, max(1, spare // slots))
+            allocations[index] += take
+            spare -= take
+        slots -= 1
+
+    text = _render_change_blocks(entries, allocations)
+    # Rendering can add characters the allocation did not model — a wider
+    # `shown` counter, an omission marker appearing at a new truncation point.
+    # Measured output is the authority, so shrink until it actually fits.
+    for _ in range(512):
+        if len(text) <= max_chars:
+            break
+        overflow = len(text) - max_chars
+        index = max(
+            range(len(entries)),
+            key=lambda position: (allocations[position] - minimums[position], -position),
+        )
+        headroom = allocations[index] - minimums[index]
+        if headroom <= 0:
+            break
+        allocations[index] -= min(headroom, max(1, overflow))
+        text = _render_change_blocks(entries, allocations)
+    if len(text) > max_chars:
+        allocations, text = list(minimums), minimum_text
+    if len(text) > max_chars:  # unreachable: the minimum was measured to fit
+        return {
+            "ok": False,
+            "text": "",
+            "files": [entry["path"] for entry in entries],
+            "covered": [],
+            "required_chars": required,
+            "rendered_chars": len(text),
+            "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
+        }
+
+    covered = [
+        {
+            "path": entry["path"],
+            "shown_chars": len(_bound_patch(entry["patch"], allowance)),
+            "total_chars": need,
+        }
+        for entry, allowance, need in zip(entries, allocations, needs)
+    ]
     return {
         "ok": True,
-        "text": "\n\n".join(blocks),
+        "text": text,
         "files": [entry["path"] for entry in entries],
         "covered": covered,
         "required_chars": required,
+        "rendered_chars": len(text),
         "reason": None,
     }
 
@@ -1298,6 +1474,15 @@ def read_ledger(task_dir: Path) -> list[dict[str, Any]]:
 
 
 def record_evidence(task_dir: Path, command: str, exit_code: int, summary: str, output: str = "") -> dict[str, Any]:
+    """Append verification evidence bound to the contract that required it.
+
+    Records stay in the ledger for audit, but evidence collected under an older
+    contract no longer satisfies the current one.
+    """
+    try:
+        contract = task_contract_fingerprint(load_task(task_dir))
+    except (OSError, json.JSONDecodeError, KeyError):
+        contract = None
     record = {
         "timestamp": utc_now(),
         "command": command,
@@ -1305,6 +1490,7 @@ def record_evidence(task_dir: Path, command: str, exit_code: int, summary: str, 
         "summary": summary.strip(),
         "output_sha256": sha256_text(output),
         "output_chars": len(output),
+        "task_contract_fingerprint": contract,
     }
     with (task_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -1372,6 +1558,7 @@ def generate_packet(
         "",
         f"Packet generated: `{utc_now()}`",
         f"Task ID: `{task['id']}`",
+        f"Task contract: `{task_contract_fingerprint(task)}`",
         f"Repository fingerprint: `{repo_map['fingerprint']}`",
         "",
         "## Objective",
@@ -1435,6 +1622,19 @@ def generate_packet(
     text = text.replace("Packet generated:", f"Packet checksum: `{checksum}`\nPacket generated:", 1)
     path = task_dir / f"packet-{stage}.md"
     path.write_text(text, encoding="utf-8")
+    write_packet_provenance(
+        task_dir,
+        stage,
+        task,
+        route={
+            "builder": decision.builder,
+            "reviewer": decision.reviewer,
+            "gate": decision.gate,
+        },
+        # A review packet embeds the diff and evidence, so it is additionally
+        # bound to that state; a build packet is not.
+        state_fingerprint=task_fingerprint(root, task_dir) if stage == "review" else None,
+    )
     return path, text
 
 
@@ -1684,7 +1884,12 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
     allowed = set(task["allowed_files"])
     out_of_scope = [path for path in changed if path not in allowed]
     ledger = read_ledger(task_dir)
-    successful = {item["command"] for item in ledger if item["exit_code"] == 0}
+    contract = task_contract_fingerprint(task)
+    successful = {
+        item["command"]
+        for item in ledger
+        if item["exit_code"] == 0 and item.get("task_contract_fingerprint") == contract
+    }
     missing_verification = [command for command in task["verification"] if command not in successful]
     fingerprint = task_fingerprint(root, task_dir)
     decision = decide_route(root, task)
