@@ -11,7 +11,68 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import __version__
+
 STATE_DIR = ".sera"
+VALID_MODES = ("fast", "standard", "assured")
+MODE_RANK = {"fast": 1, "standard": 2, "assured": 3}
+BUILTIN_DEFAULT_MODE = "standard"
+RISK_LEVELS = ("low", "medium", "high")
+RISK_RANK = {"low": 1, "medium": 2, "high": 3}
+
+SEAL_SCHEMA_VERSION = 2
+SEAL_LEGACY_SCHEMA_VERSION = 1
+SEAL_FINGERPRINT_MISMATCH = "seal_fingerprint_mismatch"
+SEAL_HEAD_MISMATCH = "seal_head_mismatch"
+SEAL_HEAD_TREE_MISMATCH = "seal_head_tree_mismatch"
+SEAL_MISSING_HEAD_IDENTITY = "seal_missing_head_identity"
+SEAL_REVIEW_MISMATCH = "seal_review_mismatch"
+SEAL_SCHEMA_UNSUPPORTED = "seal_schema_unsupported"
+SEAL_SCHEMA_INCONSISTENT = "seal_schema_inconsistent"
+SEAL_V2_REQUIRED_FIELDS = ("task_id", "sealed_at", "fingerprint", "repository_identity", "review_ledger_fingerprint")
+SEAL_V2_ONLY_FIELDS = ("repository_identity", "review_ledger_fingerprint")
+UNBORN_HEAD = "unborn"
+
+REVIEW_DIFF_BUDGET_INSUFFICIENT = "review_diff_budget_insufficient"
+# Every changed file is guaranteed at least this many characters of real patch
+# body before any remaining review-diff budget is distributed by relevance.
+MIN_FILE_DIFF_CHARS = 320
+BLOCK_SEPARATOR = "\n\n"
+
+PACKET_SCHEMA_VERSION = 2
+PACKET_MISSING = "packet_missing"
+PACKET_UNBOUND = "packet_unbound"
+PACKET_STALE_CONTRACT = "packet_stale_contract"
+PACKET_STALE_STATE = "packet_stale_state"
+PACKET_STALE_ROUTE = "packet_stale_route"
+PACKET_CONTENT_MISMATCH = "packet_content_mismatch"
+# Semantic task-contract fields. Generated artifacts are bound to a hash of
+# these, never to their own contents, so the binding cannot become circular.
+TASK_CONTRACT_FIELDS = (
+    "objective",
+    "requested_mode",
+    "requested_risk",
+    "mode",
+    "risk",
+    "risk_reasons",
+    "allowed_files",
+    "constraints",
+    "verification",
+    "uncertainty",
+    "use_case",
+)
+
+HIGH_RISK_TERMS = {
+    "auth", "authentication", "authorization", "balance", "cryptography", "deploy", "deployment",
+    "ledger", "migration", "money", "password", "payment", "payout", "permission", "production",
+    "secret", "session", "settlement", "transaction", "treasury", "wallet",
+}
+
+MEDIUM_RISK_TERMS = {
+    "api", "concurrency", "database", "idempotency", "idempotent", "integration", "schema", "state",
+    "webhook",
+}
+
 DEFAULT_EXCLUDES = {
     ".git",
     ".sera",
@@ -73,6 +134,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enforce_context_budget": True,
         "auto_risk": True,
     },
+    "risk_policy": {
+        "high_risk_terms": [],
+        "high_risk_paths": [],
+    },
     "rules": {
         "builders_may_commit": False,
         "review_after_every_post_review_change": True,
@@ -95,6 +160,8 @@ class RouteDecision:
     estimated_context_tokens: int
     budget_tokens: int
     fable_eligible: bool
+    ownership_file_count: int = 0
+    ownership_tokens: int = 0
 
 
 def utc_now() -> str:
@@ -117,6 +184,254 @@ def sha256_bytes(data: bytes) -> str:
 
 def sha256_text(text: str) -> str:
     return sha256_bytes(text.encode("utf-8"))
+
+
+def normalize_repo_path(value: str) -> str:
+    """Normalize a repository-relative path to POSIX form without a leading `./`."""
+    normalized = value.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def text_tokens(value: str) -> list[str]:
+    """Split text into ordered lowercase alphanumeric tokens.
+
+    Order is preserved so multi-word phrases can be matched as contiguous runs.
+    """
+    return re.findall(r"[a-z0-9]+", value.lower())
+
+
+def phrase_matches(phrase: str, text: str) -> bool:
+    """Return True when `phrase` appears in `text` as a contiguous token run.
+
+    Matching is case-insensitive and token-aware, never a raw substring search:
+    the term `order` matches `place order` and `order.py` but not `reorder`.
+    No stemming is applied, so `payment` does not match `payments`.
+    """
+    needle = text_tokens(phrase)
+    if not needle:
+        return False
+    haystack = text_tokens(text)
+    span = len(needle)
+    return any(haystack[index : index + span] == needle for index in range(len(haystack) - span + 1))
+
+
+_PATH_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _translate_path_pattern(pattern: str) -> str:
+    parts = ["\\A"]
+    index = 0
+    length = len(pattern)
+    while index < length:
+        char = pattern[index]
+        if char == "*":
+            run = index
+            while run < length and pattern[run] == "*":
+                run += 1
+            if run - index >= 2:
+                if run < length and pattern[run] == "/":
+                    parts.append("(?:.*/)?")
+                    index = run + 1
+                else:
+                    parts.append(".*")
+                    index = run
+            else:
+                parts.append("[^/]*")
+                index = run
+        elif char == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(char))
+            index += 1
+    parts.append("\\Z")
+    return "".join(parts)
+
+
+def path_matches(path: str, pattern: str) -> bool:
+    """Match a repository-relative path against a documented glob pattern.
+
+    Syntax: `**` matches across directory separators, `*` matches within one
+    path segment, `?` matches a single character within one segment. Everything
+    else is literal. `src/payments/**` matches `src/payments/gateway.py` and
+    `src/payments/eu/sepa.py`, but not `src/payments_legacy.py`.
+    """
+    compiled = _PATH_PATTERN_CACHE.get(pattern)
+    if compiled is None:
+        compiled = re.compile(_translate_path_pattern(normalize_repo_path(pattern)))
+        _PATH_PATTERN_CACHE[pattern] = compiled
+    return bool(compiled.match(normalize_repo_path(path)))
+
+
+def resolve_mode(config: dict[str, Any] | None, explicit_mode: str | None = None) -> tuple[str, str]:
+    """Resolve the effective mode. This is the single canonical precedence resolver.
+
+    Precedence: explicit CLI mode > configured `default_mode` > built-in fallback.
+    `None` and `"auto"` both mean "no explicit override". Returns
+    `(mode, source)` where source is `explicit`, `config`, or `builtin`.
+    Invalid values fail closed rather than degrading to a fallback.
+    """
+    if explicit_mode is not None and explicit_mode != "auto":
+        if explicit_mode not in VALID_MODES:
+            raise SeraError(f"Invalid mode {explicit_mode!r}. Valid modes: {', '.join(VALID_MODES)}.")
+        return explicit_mode, "explicit"
+    configured = (config or {}).get("default_mode")
+    if configured is None:
+        return BUILTIN_DEFAULT_MODE, "builtin"
+    if not isinstance(configured, str) or configured not in VALID_MODES:
+        raise SeraError(
+            f"Configured default_mode {configured!r} is invalid. Valid modes: {', '.join(VALID_MODES)}."
+        )
+    return configured, "config"
+
+
+def max_risk(first: str, second: str) -> str:
+    return first if RISK_RANK[first] >= RISK_RANK[second] else second
+
+
+def escalate_mode_for_risk(mode: str, risk: str) -> str:
+    """High risk never routes below `assured`."""
+    if risk == "high" and MODE_RANK[mode] < MODE_RANK["assured"]:
+        return "assured"
+    return mode
+
+
+def classify_builtin_risk(objective: str, files: list[str] | None = None) -> tuple[str, list[dict[str, str]]]:
+    """SERA's built-in, project-neutral risk vocabulary."""
+    haystack = " ".join([objective, *(files or [])])
+    words = set(text_tokens(haystack))
+    high = sorted(term for term in HIGH_RISK_TERMS if term in words)
+    if high:
+        return "high", [{"type": "builtin_term", "value": term, "level": "high"} for term in high]
+    medium = sorted(term for term in MEDIUM_RISK_TERMS if term in words)
+    if medium:
+        return "medium", [{"type": "builtin_term", "value": term, "level": "medium"} for term in medium]
+    return "low", []
+
+
+def risk_policy_terms(config: dict[str, Any] | None) -> list[str]:
+    policy = (config or {}).get("risk_policy") or {}
+    return [term for term in policy.get("high_risk_terms", []) if isinstance(term, str) and term.strip()]
+
+
+def risk_policy_paths(config: dict[str, Any] | None) -> list[str]:
+    policy = (config or {}).get("risk_policy") or {}
+    return [item for item in policy.get("high_risk_paths", []) if isinstance(item, str) and item.strip()]
+
+
+def assess_risk(
+    config: dict[str, Any] | None,
+    objective: str,
+    files: list[str] | None = None,
+    explicit_risk: str | None = None,
+) -> dict[str, Any]:
+    """Compose effective risk and explain every escalation.
+
+    Effective risk is the maximum severity implied by the built-in classifier,
+    project-defined high-risk terms, project-defined high-risk paths, and any
+    explicit user risk. Explicit input can raise the level but never silently
+    lowers an automatically detected one; a rejected downgrade is recorded as
+    an auditable `explicit_risk_not_applied` reason.
+    """
+    config = config or {}
+    controller = config.get("controller", {}) if isinstance(config.get("controller"), dict) else {}
+    paths = [normalize_repo_path(item) for item in (files or [])]
+    reasons: list[dict[str, str]] = []
+    level = "low"
+
+    if controller.get("auto_risk", True):
+        builtin_level, builtin_reasons = classify_builtin_risk(objective, paths)
+        level = max_risk(level, builtin_level)
+        reasons.extend(builtin_reasons)
+    elif explicit_risk in (None, "auto"):
+        level = max_risk(level, "medium")
+        reasons.append({"type": "auto_risk_disabled", "value": "medium"})
+
+    for term in risk_policy_terms(config):
+        if phrase_matches(term, objective) or any(phrase_matches(term, path) for path in paths):
+            level = "high"
+            reasons.append({"type": "project_term", "value": term})
+
+    for pattern in risk_policy_paths(config):
+        matched = [path for path in paths if path_matches(path, pattern)]
+        if matched:
+            level = "high"
+            reasons.append({"type": "project_path", "value": pattern, "matched": matched[0]})
+
+    if explicit_risk not in (None, "auto"):
+        if explicit_risk not in RISK_LEVELS:
+            raise SeraError(f"Risk must be {', '.join(RISK_LEVELS)}.")
+        if RISK_RANK[explicit_risk] < RISK_RANK[level]:
+            reasons.append({"type": "explicit_risk_not_applied", "value": explicit_risk})
+        else:
+            level = explicit_risk
+            reasons.append({"type": "explicit_risk", "value": explicit_risk})
+
+    if not reasons:
+        reasons.append({"type": "no_signal", "value": "no high- or medium-risk signal detected"})
+    return {"risk": level, "reasons": reasons}
+
+
+def resolve_task_policy(config: dict[str, Any] | None, task: dict[str, Any]) -> dict[str, Any]:
+    """Derive effective mode and risk from a task's *current* contract.
+
+    This is the single policy evaluation shared by task creation and ownership
+    confirmation, so changing confirmed ownership cannot bypass risk policy.
+
+    Derivation always starts from the task's persisted *requested* inputs —
+    `requested_mode` and `requested_risk` — never from a previously derived
+    value. That keeps a transiently confirmed high-risk path from making risk
+    permanently sticky, while an explicit `requested_risk` remains a floor that
+    survives any later ownership change.
+    """
+    requested_mode = task.get("requested_mode")
+    requested_risk = task.get("requested_risk")
+    resolved_mode, mode_source = resolve_mode(config, requested_mode)
+    assessment = assess_risk(
+        config,
+        task.get("objective", ""),
+        list(task.get("allowed_files", [])),
+        explicit_risk=requested_risk,
+    )
+    risk = assessment["risk"]
+    mode = escalate_mode_for_risk(resolved_mode, risk)
+    reasons = list(assessment["reasons"])
+    if mode != resolved_mode:
+        reasons.append({"type": "mode_escalation", "value": mode})
+    return {"mode": mode, "mode_source": mode_source, "risk": risk, "risk_reasons": reasons}
+
+
+def apply_task_policy(config: dict[str, Any] | None, task: dict[str, Any]) -> dict[str, Any]:
+    """Recompute and write effective policy onto a task contract in place."""
+    policy = resolve_task_policy(config, task)
+    task["mode"] = policy["mode"]
+    task["mode_source"] = policy["mode_source"]
+    task["risk"] = policy["risk"]
+    task["risk_reasons"] = policy["risk_reasons"]
+    return policy
+
+
+def format_risk_reason(reason: dict[str, str]) -> str:
+    kind = reason.get("type", "")
+    value = reason.get("value", "")
+    if kind == "builtin_term":
+        return f"{reason.get('level', 'high')}-risk term: {value}"
+    if kind == "project_term":
+        return f"project high-risk term: {value}"
+    if kind == "project_path":
+        matched = reason.get("matched")
+        return f"project high-risk path: {value}" + (f" (matched {matched})" if matched else "")
+    if kind == "explicit_risk":
+        return f"explicit risk: {value}"
+    if kind == "explicit_risk_not_applied":
+        return f"explicit risk {value} rejected; automatic assessment is more severe"
+    if kind == "auto_risk_disabled":
+        return f"automatic risk classification disabled; baseline {value}"
+    if kind == "mode_escalation":
+        return f"mode escalated to {value} by high risk"
+    return f"{kind}: {value}"
 
 
 def run_git(root: Path, *args: str, check: bool = True) -> str:
@@ -144,6 +459,18 @@ def find_repo_root(start: Path | None = None) -> Path:
         current = current.parent
 
 
+def git_head_identity(root: Path) -> dict[str, str]:
+    """Return the exact commit and tree identity acceptance is bound to.
+
+    A repository with no commits yet reports the sentinel `unborn` for both
+    fields so seal comparison stays total and never compares `None` to `None`
+    as if it were a real match.
+    """
+    head = run_git(root, "rev-parse", "HEAD", check=False).strip()
+    tree = run_git(root, "rev-parse", "HEAD^{tree}", check=False).strip()
+    return {"head_sha": head or UNBORN_HEAD, "head_tree_sha": tree or UNBORN_HEAD}
+
+
 def state_path(root: Path) -> Path:
     return root / STATE_DIR
 
@@ -160,7 +487,84 @@ def load_config(root: Path) -> dict[str, Any]:
         loaded = json.load(handle)
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     _deep_update(merged, loaded)
+    validate_config(merged)
     return merged
+
+
+def _require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SeraError(f"{label} must be an object, got {type(value).__name__}.")
+    return value
+
+
+def _require_int(container: dict[str, Any], key: str, label: str, minimum: int = 1) -> None:
+    if key not in container:
+        return
+    value = container[key]
+    # bool is a subclass of int; a flag is never a valid numeric setting.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SeraError(f"{label} must be an integer, got {type(value).__name__}.")
+    if value < minimum:
+        raise SeraError(f"{label} must be >= {minimum}, got {value}.")
+
+
+def _require_bool(container: dict[str, Any], key: str, label: str) -> None:
+    if key in container and not isinstance(container[key], bool):
+        raise SeraError(f"{label} must be true or false, got {type(container[key]).__name__}.")
+
+
+def _require_string_list(container: dict[str, Any], key: str, label: str) -> None:
+    value = container.get(key, [])
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise SeraError(f"{label} must be a list of strings.")
+
+
+def validate_config(config: dict[str, Any]) -> None:
+    """Fail closed on configuration SERA cannot honor deterministically.
+
+    Every expected mistake must surface as a `SeraError` on the normal CLI error
+    path. An explicit `null` is a malformed value, not an omission: omit a key
+    entirely to accept its default.
+    """
+    _require_mapping(config, "configuration")
+    resolve_mode(config)
+    _require_int(config, "schema_version", "schema_version", minimum=1)
+    _require_int(config, "max_builder_attempts", "max_builder_attempts", minimum=1)
+    _require_int(config, "max_file_bytes", "max_file_bytes", minimum=1)
+    _require_int(config, "max_packet_chars", "max_packet_chars", minimum=1)
+    _require_string_list(config, "exclude_dirs", "exclude_dirs")
+    _require_string_list(config, "verification", "verification")
+
+    controller = _require_mapping(config.get("controller", {}), "controller")
+    _require_int(controller, "context_max_files", "controller.context_max_files", minimum=1)
+    _require_int(controller, "context_min_score", "controller.context_min_score", minimum=0)
+    _require_bool(controller, "enforce_context_budget", "controller.enforce_context_budget")
+    _require_bool(controller, "auto_risk", "controller.auto_risk")
+
+    policy = _require_mapping(config.get("risk_policy", {}), "risk_policy")
+    _require_string_list(policy, "high_risk_terms", "risk_policy.high_risk_terms")
+    _require_string_list(policy, "high_risk_paths", "risk_policy.high_risk_paths")
+
+    budgets = _require_mapping(config.get("token_budgets", {}), "token_budgets")
+    for mode in VALID_MODES:
+        if mode not in budgets:
+            raise SeraError(f"token_budgets is missing the {mode!r} mode budget.")
+        _require_int(budgets, mode, f"token_budgets.{mode}", minimum=1)
+
+    lanes = _require_mapping(config.get("lanes", {}), "lanes")
+    for name, lane in lanes.items():
+        _require_mapping(lane, f"lanes.{name}")
+        _require_bool(lane, "enabled", f"lanes.{name}.enabled")
+        _require_bool(lane, "may_be_sole_release_gate", f"lanes.{name}.may_be_sole_release_gate")
+        for field in ("provider", "model"):
+            if field in lane and not isinstance(lane[field], str):
+                raise SeraError(f"lanes.{name}.{field} must be a string.")
+        _require_string_list(lane, "allowed_uses", f"lanes.{name}.allowed_uses")
+
+    rules = _require_mapping(config.get("rules", {}), "rules")
+    for name, value in rules.items():
+        if not isinstance(value, bool):
+            raise SeraError(f"rules.{name} must be true or false.")
 
 
 def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -196,7 +600,7 @@ def initialize(root: Path, force: bool = False) -> list[Path]:
 
 def ensure_gitignore(root: Path) -> None:
     path = root / ".gitignore"
-    marker = "# SERA runtime\n.sera/cache/\n.sera/tasks/*/packet-*.md\n"
+    marker = "# SERA runtime\n.sera/cache/\n.sera/tasks/*/packet-*\n"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     if ".sera/cache/" not in existing:
         with path.open("a", encoding="utf-8") as handle:
@@ -421,37 +825,65 @@ def new_task(
     root: Path,
     name: str,
     objective: str,
-    mode: str,
-    risk: str,
-    allowed_files: list[str],
-    constraints: list[str],
-    verification: list[str],
+    mode: str | None = None,
+    risk: str | None = None,
+    allowed_files: list[str] | None = None,
+    constraints: list[str] | None = None,
+    verification: list[str] | None = None,
     uncertainty: int = 1,
     use_case: str = "implementation",
 ) -> Path:
-    if mode not in {"fast", "standard", "assured"}:
-        raise SeraError("Mode must be fast, standard, or assured.")
-    if risk not in {"low", "medium", "high"}:
-        raise SeraError("Risk must be low, medium, or high.")
+    """Create a task capsule with resolved mode and composed risk.
+
+    Mode and risk are resolved here so every creation path — `sera task new`,
+    `sera task auto`, and `sera run` — shares one precedence and one escalation
+    rule instead of duplicating them per entry point.
+    """
     if not objective.strip():
         raise SeraError("Objective cannot be empty.")
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    task_id = f"{timestamp}-{slugify(name)}"
-    task_dir = state_path(root) / "tasks" / task_id
-    task_dir.mkdir(parents=True, exist_ok=False)
     config = load_config(root)
+    owned = sorted({normalize_repo_path(path) for path in (allowed_files or [])})
+    requested_mode = None if mode in (None, "auto") else mode
+    requested_risk = None if risk in (None, "auto") else risk
+    # Validate explicit inputs eagerly so a bad flag fails at creation.
+    resolve_mode(config, requested_mode)
+    if requested_risk is not None and requested_risk not in RISK_LEVELS:
+        raise SeraError(f"Risk must be {', '.join(RISK_LEVELS)}.")
+    draft = {
+        "objective": objective.strip(),
+        "allowed_files": owned,
+        "requested_mode": requested_mode,
+        "requested_risk": requested_risk,
+    }
+    policy = resolve_task_policy(config, draft)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tasks_root = state_path(root) / "tasks"
+    base_id = f"{timestamp}-{slugify(name)}"
+    # Task IDs carry second resolution, so two tasks drafted in the same second
+    # with the same name would otherwise collide.
+    task_id = base_id
+    suffix = 2
+    while (tasks_root / task_id).exists():
+        task_id = f"{base_id}-{suffix}"
+        suffix += 1
+    task_dir = tasks_root / task_id
+    task_dir.mkdir(parents=True, exist_ok=False)
     task = {
         "schema_version": 1,
         "id": task_id,
         "name": name,
         "created_at": utc_now(),
-        "mode": mode,
-        "risk": risk,
+        "mode": policy["mode"],
+        "mode_source": policy["mode_source"],
+        "requested_mode": requested_mode,
+        "risk": policy["risk"],
+        "requested_risk": requested_risk,
+        "risk_reasons": policy["risk_reasons"],
         "uncertainty": max(0, min(3, int(uncertainty))),
         "use_case": use_case,
         "objective": objective.strip(),
-        "allowed_files": sorted(set(allowed_files)),
-        "constraints": constraints,
+        "allowed_files": owned,
+        "constraints": constraints or [],
         "verification": verification or list(config.get("verification", [])),
         "builder_attempts": 0,
         "status": "specified",
@@ -459,9 +891,151 @@ def new_task(
     }
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     (task_dir / "ledger.jsonl").write_text("", encoding="utf-8")
-    (task_dir / "capsule.md").write_text(render_task_capsule(task), encoding="utf-8")
+    write_task_capsule(task_dir, task)
     (state_path(root) / "latest-task").write_text(task_id + "\n", encoding="utf-8")
     return task_dir
+
+
+def task_contract_fingerprint(task: dict[str, Any]) -> str:
+    """Deterministic identity of a task's semantic contract.
+
+    Covers only what a handoff artifact is derived from — objective, requested
+    and derived policy, confirmed ownership, constraints, verification. It
+    deliberately excludes generated artifacts, timestamps, evidence, and
+    worktree state, so binding an artifact to it can never be circular.
+    """
+    payload = {field: task.get(field) for field in TASK_CONTRACT_FIELDS}
+    return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def _lane_identity(config: dict[str, Any], lane: str | None) -> dict[str, Any] | None:
+    if lane is None:
+        return None
+    value = config.get("lanes", {}).get(lane, {})
+    return {"lane": lane, "provider": value.get("provider"), "model": value.get("model")}
+
+
+def resolved_route_identity(config: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
+    """The lane, provider, and model actually selected for each required stage.
+
+    Only stages this task genuinely requires are bound, so changing an unrelated
+    or unused lane never invalidates a packet.
+    """
+    return {
+        "builder": _lane_identity(config, decision.builder),
+        "reviewer": _lane_identity(config, decision.reviewer),
+        "gate": _lane_identity(config, decision.gate),
+    }
+
+
+def route_fingerprint(config: dict[str, Any], decision: RouteDecision) -> str:
+    identity = resolved_route_identity(config, decision)
+    return sha256_text(json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def packet_provenance_path(task_dir: Path, stage: str) -> Path:
+    return task_dir / f"packet-{stage}.provenance.json"
+
+
+def write_packet_provenance(
+    task_dir: Path,
+    stage: str,
+    task: dict[str, Any],
+    route: dict[str, Any] | None = None,
+    state_fingerprint: str | None = None,
+    route_identity_fingerprint: str | None = None,
+    content_sha256: str | None = None,
+) -> dict[str, Any]:
+    provenance = {
+        "schema_version": PACKET_SCHEMA_VERSION,
+        "packet_type": stage,
+        "task_id": task["id"],
+        "task_contract_fingerprint": task_contract_fingerprint(task),
+        "state_fingerprint": state_fingerprint,
+        "route_fingerprint": route_identity_fingerprint,
+        "content_sha256": content_sha256,
+        # Diagnostics only. Freshness never trusts this object; the route is
+        # independently re-resolved and re-fingerprinted at validation time.
+        "route": route or {},
+        "generated_at": utc_now(),
+    }
+    packet_provenance_path(task_dir, stage).write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return provenance
+
+
+def read_packet_provenance(task_dir: Path, stage: str) -> dict[str, Any] | None:
+    path = packet_provenance_path(task_dir, stage)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def packet_state(
+    root: Path,
+    task_dir: Path,
+    stage: str,
+    task: dict[str, Any],
+    state_fingerprint: str | None = None,
+    repo_map: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Decide whether a generated packet may still be dispatched.
+
+    Existence is never sufficient, and recorded metadata is never trusted on its
+    own. The task contract, the resolved route, and the packet's own bytes are
+    all recomputed from current state and compared, so editing the stored route
+    strings, the embedded Markdown checksum, or the packet body cannot make a
+    stale packet look current. Validation is ordered and every failure is a
+    closed one:
+
+        missing -> unbound -> contract -> state -> route -> content -> current
+    """
+    packet = task_dir / f"packet-{stage}.md"
+    if not packet.exists():
+        return {"exists": False, "current": False, "reason": PACKET_MISSING}
+    provenance = read_packet_provenance(task_dir, stage)
+    if (
+        not provenance
+        or provenance.get("schema_version") != PACKET_SCHEMA_VERSION
+        or provenance.get("packet_type") != stage
+        or provenance.get("task_id") != task.get("id")
+        or not provenance.get("task_contract_fingerprint")
+        or not provenance.get("route_fingerprint")
+        or not provenance.get("content_sha256")
+    ):
+        return {"exists": True, "current": False, "reason": PACKET_UNBOUND}
+    if provenance["task_contract_fingerprint"] != task_contract_fingerprint(task):
+        return {"exists": True, "current": False, "reason": PACKET_STALE_CONTRACT}
+    if state_fingerprint is not None and provenance.get("state_fingerprint") != state_fingerprint:
+        return {"exists": True, "current": False, "reason": PACKET_STALE_STATE}
+    try:
+        decision = decide_route(root, task, repo_map)
+        current_route = route_fingerprint(load_config(root), decision)
+    except SeraError:
+        # The route cannot be resolved at all now, so nothing built from the
+        # previous one may be dispatched.
+        return {"exists": True, "current": False, "reason": PACKET_STALE_ROUTE}
+    if provenance["route_fingerprint"] != current_route:
+        return {"exists": True, "current": False, "reason": PACKET_STALE_ROUTE}
+    try:
+        content = packet.read_bytes()
+    except OSError:
+        return {"exists": True, "current": False, "reason": PACKET_CONTENT_MISMATCH}
+    if provenance["content_sha256"] != sha256_bytes(content):
+        return {"exists": True, "current": False, "reason": PACKET_CONTENT_MISMATCH}
+    return {"exists": True, "current": True, "reason": None}
+
+
+def write_task_capsule(task_dir: Path, task: dict[str, Any]) -> Path:
+    """(Re)write the capsule so it always describes the current contract."""
+    path = task_dir / "capsule.md"
+    path.write_text(render_task_capsule(task), encoding="utf-8")
+    return path
 
 
 def render_task_capsule(task: dict[str, Any]) -> str:
@@ -523,14 +1097,34 @@ def save_task(task_dir: Path, task: dict[str, Any]) -> None:
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
 
 
+def ownership_summary(task: dict[str, Any], repo_map: dict[str, Any]) -> dict[str, Any]:
+    """Size the files a task owns.
+
+    Ownership is the authorization surface, not the context a stage reads. It
+    is reported separately so a large owned set never masquerades as an
+    oversized packet.
+    """
+    file_index = {item["path"]: item for item in repo_map.get("files", [])}
+    owned = list(task.get("allowed_files", []))
+    total_bytes = sum(file_index.get(path, {}).get("bytes", 8_000) for path in owned)
+    return {
+        "file_count": len(owned),
+        "estimated_tokens": estimate_tokens(total_bytes) if owned else 0,
+        "unmapped_files": [path for path in owned if path not in file_index],
+    }
+
+
 def decide_route(root: Path, task: dict[str, Any], repo_map: dict[str, Any] | None = None) -> RouteDecision:
     config = load_config(root)
     repo_map = repo_map or load_repo_map(root)
-    file_index = {item["path"]: item for item in repo_map["files"]}
-    context_bytes = sum(file_index.get(path, {}).get("bytes", 8_000) for path in task["allowed_files"])
-    context_tokens = estimate_tokens(context_bytes)
-    file_count = len(task["allowed_files"])
-    risk_score = {"low": 1, "medium": 2, "high": 3}[task["risk"]]
+    if task["mode"] not in VALID_MODES:
+        raise SeraError(f"Task mode {task['mode']!r} is invalid. Valid modes: {', '.join(VALID_MODES)}.")
+    if task["risk"] not in RISK_LEVELS:
+        raise SeraError(f"Task risk {task['risk']!r} is invalid. Valid levels: {', '.join(RISK_LEVELS)}.")
+    ownership = ownership_summary(task, repo_map)
+    context_tokens = ownership["estimated_tokens"]
+    file_count = ownership["file_count"]
+    risk_score = RISK_RANK[task["risk"]]
     uncertainty = int(task.get("uncertainty", 1))
     complexity = risk_score * 2 + uncertainty + min(file_count, 10) / 2 + min(context_tokens, 30_000) / 10_000
     if task["mode"] == "fast" and risk_score == 1 and complexity < 5.5:
@@ -552,7 +1146,17 @@ def decide_route(root: Path, task: dict[str, Any], repo_map: dict[str, Any] | No
     fable = config["lanes"].get("optional_fable", {})
     fable_eligible = bool(fable.get("enabled")) and task.get("use_case") in set(fable.get("allowed_uses", []))
     budget = int(config["token_budgets"][task["mode"]])
-    return RouteDecision(builder, reviewer, gate, reason, context_tokens, budget, fable_eligible)
+    return RouteDecision(
+        builder,
+        reviewer,
+        gate,
+        reason,
+        context_tokens,
+        budget,
+        fable_eligible,
+        ownership_file_count=file_count,
+        ownership_tokens=context_tokens,
+    )
 
 
 def lane_label(config: dict[str, Any], lane: str | None) -> str | None:
@@ -632,30 +1236,287 @@ def changed_files(root: Path) -> list[str]:
     return sorted(set(paths))
 
 
-def compact_diff(root: Path, allowed_files: list[str], max_chars: int) -> str:
-    args = ["diff", "--no-ext-diff", "--unified=3", "--"]
-    args.extend(allowed_files)
-    diff = run_git(root, *args, check=False)
-    staged_args = ["diff", "--cached", "--no-ext-diff", "--unified=3", "--"]
-    staged_args.extend(allowed_files)
-    staged = run_git(root, *staged_args, check=False)
-    if staged:
-        diff += "\n# STAGED CHANGES\n" + staged
+_STATUS_LABELS = {"M": "modified", "A": "added", "D": "deleted", "R": "renamed", "C": "copied", "T": "type-changed"}
+
+
+def _parse_raw_z(output: str) -> list[dict[str, Any]]:
+    """Parse `git diff --raw -z` records into path/status/blob identity."""
+    items = output.split("\0")
+    records: list[dict[str, Any]] = []
+    index = 0
+    while index < len(items):
+        meta = items[index]
+        index += 1
+        if not meta.startswith(":"):
+            continue
+        fields = meta[1:].split()
+        if len(fields) < 5:
+            continue
+        status = fields[4]
+        source = items[index] if index < len(items) else ""
+        index += 1
+        destination = ""
+        if status[:1] in {"R", "C"}:
+            destination = items[index] if index < len(items) else ""
+            index += 1
+        records.append(
+            {
+                "status": status,
+                "old_sha": fields[2],
+                "new_sha": fields[3],
+                "path": normalize_repo_path(destination or source),
+                "old_path": normalize_repo_path(source) if destination else None,
+            }
+        )
+    return records
+
+
+def _collect_changed_files(root: Path, allowed_files: list[str]) -> list[dict[str, Any]]:
+    """Build one change record per changed owned file, staged and unstaged.
+
+    Records are keyed and returned by path so no file can be lost between the
+    beginning and end of a combined patch.
+    """
+    if not allowed_files:
+        return []
+    changes: dict[str, dict[str, Any]] = {}
+    for cached in (False, True):
+        args = ["diff", "--no-ext-diff", "--raw", "-M", "-z"]
+        if cached:
+            args.insert(1, "--cached")
+        raw = run_git(root, *args, "--", *allowed_files, check=False)
+        for record in _parse_raw_z(raw):
+            entry = changes.setdefault(
+                record["path"],
+                {
+                    "path": record["path"],
+                    "status": record["status"],
+                    "old_path": record["old_path"],
+                    "old_sha": record["old_sha"],
+                    "new_sha": record["new_sha"],
+                    "staged": False,
+                    "unstaged": False,
+                    "patch": "",
+                    "binary": False,
+                },
+            )
+            entry["staged" if cached else "unstaged"] = True
+            if record["old_path"]:
+                entry["old_path"] = record["old_path"]
+                entry["status"] = record["status"]
+
+    for path, entry in changes.items():
+        sections: list[str] = []
+        for cached in (False, True):
+            if not entry["staged" if cached else "unstaged"]:
+                continue
+            args = ["diff", "--no-ext-diff", "--unified=3", "-M"]
+            if cached:
+                args.insert(1, "--cached")
+            patch = run_git(root, *args, "--", path, check=False)
+            if patch.strip():
+                label = "staged" if cached else "unstaged"
+                sections.append(f"# {label}\n{patch}")
+        entry["patch"] = "\n".join(sections)
+        entry["binary"] = "Binary files" in entry["patch"] or "GIT binary patch" in entry["patch"]
+
     tracked = set(run_git(root, "ls-files").splitlines())
     for relative in allowed_files:
         path = root / relative
-        if relative not in tracked and path.is_file():
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            diff += f"\n# UNTRACKED FILE: {relative}\n" + content + "\n"
-    if len(diff) <= max_chars:
-        return diff
-    head = diff[: max_chars // 2]
-    tail = diff[-max_chars // 2 :]
-    omitted = len(diff) - len(head) - len(tail)
-    return head + f"\n\n... {omitted} characters omitted by packet budget ...\n\n" + tail
+        if relative in changes or relative in tracked or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        binary = b"\x00" in data[:2048]
+        if binary:
+            body = f"Binary untracked file, {len(data)} bytes, sha256 {sha256_bytes(data)[:16]}"
+        else:
+            body = data.decode("utf-8", errors="replace")
+        changes[relative] = {
+            "path": relative,
+            "status": "A",
+            "old_path": None,
+            "old_sha": "0" * 7,
+            "new_sha": sha256_bytes(data)[:7],
+            "staged": False,
+            "unstaged": True,
+            "patch": f"# untracked\n{body}",
+            "binary": binary,
+        }
+    return [changes[key] for key in sorted(changes)]
+
+
+def _bound_patch(patch: str, allowance: int) -> str:
+    """Trim a patch to at most `allowance` characters, marker included.
+
+    The returned string never exceeds the allowance, so block length is
+    monotonic in the allowance and the budget algorithm can reason about it.
+    """
+    if len(patch) <= allowance:
+        return patch
+    if allowance <= 0:
+        return ""
+    # The marker states how much was dropped, but its own width depends on that
+    # number; two or three passes reach a fixed point.
+    room = allowance
+    marker = ""
+    for _ in range(4):
+        candidate = f"\n... {len(patch) - room:,} characters omitted from this file by review budget ...\n"
+        new_room = allowance - len(candidate)
+        marker = candidate
+        if new_room == room or new_room <= 0:
+            room = new_room
+            break
+        room = new_room
+    if room <= 0:
+        return patch[:allowance]
+    head = patch[: (room * 3) // 5]
+    tail_length = room - len(head)
+    tail = patch[len(patch) - tail_length :] if tail_length > 0 else ""
+    return (head + marker + tail)[:allowance]
+
+
+def _render_change_block(entry: dict[str, Any], body_allowance: int) -> str:
+    """The single canonical renderer for one changed file.
+
+    Budgeting measures the output of this function directly rather than
+    estimating it, so header width, counter digits, and omission markers can
+    never drift away from what a reviewer actually receives.
+    """
+    body = _bound_patch(entry["patch"], body_allowance)
+    status = _STATUS_LABELS.get(entry["status"][:1], entry["status"])
+    where = "+".join(part for part, flag in (("staged", entry["staged"]), ("unstaged", entry["unstaged"])) if flag)
+    lines = [
+        f"### `{entry['path']}`",
+        f"- status: {status}" + (f" (from `{entry['old_path']}`)" if entry.get("old_path") else ""),
+        f"- location: {where or 'none'}",
+        f"- blobs: `{entry['old_sha']}`..`{entry['new_sha']}`",
+        f"- content: {'binary/non-text' if entry['binary'] else 'text'}",
+        f"- patch sha256: `{sha256_text(entry['patch'])[:16]}`",
+        f"- shown: {len(body):,} of {len(entry['patch']):,} patch characters",
+    ]
+    return "\n".join(lines) + "\n\n```diff\n" + body + "\n```"
+
+
+def _render_change_blocks(entries: list[dict[str, Any]], allocations: list[int]) -> str:
+    return BLOCK_SEPARATOR.join(
+        _render_change_block(entry, allowance) for entry, allowance in zip(entries, allocations)
+    )
+
+
+def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -> dict[str, Any]:
+    """Render a per-file review diff in which no changed file can be omitted.
+
+    `max_chars` counts Python string characters (Unicode code points), matching
+    `len(text)`; it is not a UTF-8 byte count.
+
+    Budgeting runs in two phases against *measured* output. Every changed file
+    is first guaranteed a minimum of real patch body, and the exact rendered
+    length of that minimum is what decides whether the budget can be honored at
+    all. Only the remainder is distributed by relevance. When success is
+    reported, `len(text) <= max_chars` holds exactly — there is no estimate and
+    no tolerance.
+    """
+    entries = _collect_changed_files(root, allowed_files)
+    if not entries:
+        return {
+            "ok": True,
+            "text": "No task-relative changes to review.",
+            "files": [],
+            "covered": [],
+            "required_chars": 0,
+            "rendered_chars": 0,
+            "reason": None,
+        }
+
+    needs = [len(entry["patch"]) for entry in entries]
+    minimums = [min(need, MIN_FILE_DIFF_CHARS) for need in needs]
+    minimum_text = _render_change_blocks(entries, minimums)
+    required = len(minimum_text)
+    if required > max_chars:
+        return {
+            "ok": False,
+            "text": "",
+            "files": [entry["path"] for entry in entries],
+            "covered": [],
+            "required_chars": required,
+            "rendered_chars": 0,
+            "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
+        }
+
+    allocations = list(minimums)
+    spare = max_chars - required
+    order = sorted(range(len(entries)), key=lambda index: (needs[index], index))
+    slots = len(order)
+    for index in order:
+        want = needs[index] - allocations[index]
+        if spare > 0 and want > 0:
+            take = min(want, max(1, spare // slots))
+            allocations[index] += take
+            spare -= take
+        slots -= 1
+
+    text = _render_change_blocks(entries, allocations)
+    # Rendering can add characters the allocation did not model — a wider
+    # `shown` counter, an omission marker appearing at a new truncation point.
+    # Measured output is the authority, so shrink until it actually fits.
+    for _ in range(512):
+        if len(text) <= max_chars:
+            break
+        overflow = len(text) - max_chars
+        index = max(
+            range(len(entries)),
+            key=lambda position: (allocations[position] - minimums[position], -position),
+        )
+        headroom = allocations[index] - minimums[index]
+        if headroom <= 0:
+            break
+        allocations[index] -= min(headroom, max(1, overflow))
+        text = _render_change_blocks(entries, allocations)
+    if len(text) > max_chars:
+        allocations, text = list(minimums), minimum_text
+    if len(text) > max_chars:  # unreachable: the minimum was measured to fit
+        return {
+            "ok": False,
+            "text": "",
+            "files": [entry["path"] for entry in entries],
+            "covered": [],
+            "required_chars": required,
+            "rendered_chars": len(text),
+            "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
+        }
+
+    covered = [
+        {
+            "path": entry["path"],
+            "shown_chars": len(_bound_patch(entry["patch"], allowance)),
+            "total_chars": need,
+        }
+        for entry, allowance, need in zip(entries, allocations, needs)
+    ]
+    return {
+        "ok": True,
+        "text": text,
+        "files": [entry["path"] for entry in entries],
+        "covered": covered,
+        "required_chars": required,
+        "rendered_chars": len(text),
+        "reason": None,
+    }
+
+
+def compact_diff(root: Path, allowed_files: list[str], max_chars: int) -> str:
+    """Per-file review diff, or a controlled failure when coverage cannot fit."""
+    coverage = review_diff_coverage(root, allowed_files, max_chars)
+    if not coverage["ok"]:
+        raise SeraError(
+            f"{coverage['reason']}: reviewing {len(coverage['files'])} changed files needs at least "
+            f"{coverage['required_chars']:,} characters but max_packet_chars is {max_chars:,}. "
+            "Raise max_packet_chars or split the task; SERA will not emit a review packet that hides changes."
+        )
+    return coverage["text"]
 
 
 def read_ledger(task_dir: Path) -> list[dict[str, Any]]:
@@ -670,6 +1531,15 @@ def read_ledger(task_dir: Path) -> list[dict[str, Any]]:
 
 
 def record_evidence(task_dir: Path, command: str, exit_code: int, summary: str, output: str = "") -> dict[str, Any]:
+    """Append verification evidence bound to the contract that required it.
+
+    Records stay in the ledger for audit, but evidence collected under an older
+    contract no longer satisfies the current one.
+    """
+    try:
+        contract = task_contract_fingerprint(load_task(task_dir))
+    except (OSError, json.JSONDecodeError, KeyError):
+        contract = None
     record = {
         "timestamp": utc_now(),
         "command": command,
@@ -677,13 +1547,26 @@ def record_evidence(task_dir: Path, command: str, exit_code: int, summary: str, 
         "summary": summary.strip(),
         "output_sha256": sha256_text(output),
         "output_chars": len(output),
+        "task_contract_fingerprint": contract,
     }
     with (task_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
     return record
 
 
-def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
+def generate_packet(
+    root: Path,
+    task_dir: Path,
+    stage: str,
+    selected_context: dict[str, Any] | None = None,
+) -> tuple[Path, str]:
+    """Render a stage handoff packet.
+
+    `selected_context` is supplied by the controller layer so the packet carries
+    stage-selected reading material rather than every owned file. When it is
+    omitted the packet still lists full ownership, which stays correct but is
+    not budget-aware.
+    """
     task = load_task(task_dir)
     config = load_config(root)
     repo_map = build_repo_map(root)
@@ -694,15 +1577,34 @@ def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
     for item in owned_meta:
         symbols = ", ".join(item["symbols"]) if item["symbols"] else "—"
         owned_lines.append(f"- `{item['path']}` · {item['lines']} lines · `{item['sha256'][:12]}` · symbols: {symbols}")
+    for path in task["allowed_files"]:
+        if path not in file_index:
+            owned_lines.append(f"- `{path}` · not yet indexed in the repository map")
     route_lines = [
         f"- Builder: {lane_label(config, decision.builder)}",
         f"- Reviewer: {lane_label(config, decision.reviewer) or 'not required by current mode'}",
         f"- Release gate: {lane_label(config, decision.gate) or 'not required by current mode'}",
         f"- Reason: {decision.reason}",
-        f"- Estimated owned-context tokens: {decision.estimated_context_tokens:,}",
+        f"- Owned files: {decision.ownership_file_count} · ~{decision.ownership_tokens:,} tokens",
         f"- Stage token budget: {decision.budget_tokens:,}",
         f"- Optional Fable eligible: {'yes' if decision.fable_eligible else 'no'}",
     ]
+    context_lines: list[str] = []
+    if selected_context:
+        chosen = selected_context.get("selected_files", [])
+        route_lines.insert(
+            5,
+            f"- Selected {stage} context: {len(chosen)} files · "
+            f"~{selected_context.get('selected_source_tokens', 0):,} tokens",
+        )
+        for item in chosen:
+            context_lines.append(f"- `{item['path']}` · {item['reason']} · ~{item['tokens']:,} tokens")
+        withheld = selected_context.get("excluded_files", [])
+        if withheld:
+            context_lines.append(
+                f"- {len(withheld)} owned file(s) retain ownership but are outside this stage's context; "
+                "read them only if the objective requires it."
+            )
     ledger = read_ledger(task_dir)
     evidence_lines = [
         f"- `{item['command']}` → exit {item['exit_code']} · {item['summary']} · output `{item['output_sha256'][:12]}`"
@@ -713,6 +1615,7 @@ def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
         "",
         f"Packet generated: `{utc_now()}`",
         f"Task ID: `{task['id']}`",
+        f"Task contract: `{task_contract_fingerprint(task)}`",
         f"Repository fingerprint: `{repo_map['fingerprint']}`",
         "",
         "## Objective",
@@ -726,6 +1629,10 @@ def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
         "## Exact ownership",
         "",
         *(owned_lines or ["- Ownership is unresolved. Stop before implementation."]),
+        "",
+        "## Selected context",
+        "",
+        *(context_lines or ["- Context selection was not supplied; ownership above is the reading list."]),
         "",
         "## Constraints",
         "",
@@ -744,13 +1651,17 @@ def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
             "",
             "## Changed files",
             "",
+            "Every changed file is represented below and in the bounded diff, whether or not",
+            "its full contents were selected into review context.",
+            "",
             *([f"- `{item}`" for item in task_changed_files(root, task)] or ["- No task-relative working-tree changes detected."]),
             "",
-            "## Compact diff",
+            "## Per-file change evidence",
             "",
-            "```diff",
+            "Each changed file below carries bounded patch material of its own. If the budget",
+            "could not cover every changed file, this packet would have failed instead.",
+            "",
             compact_diff(root, task["allowed_files"], int(config["max_packet_chars"])),
-            "```",
             "",
             "## Required verdict",
             "",
@@ -768,6 +1679,20 @@ def generate_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
     text = text.replace("Packet generated:", f"Packet checksum: `{checksum}`\nPacket generated:", 1)
     path = task_dir / f"packet-{stage}.md"
     path.write_text(text, encoding="utf-8")
+    # Hash what actually landed on disk, not the in-memory string, so the
+    # provenance envelope binds the exact bytes a runtime will read.
+    content_sha256 = sha256_bytes(path.read_bytes())
+    write_packet_provenance(
+        task_dir,
+        stage,
+        task,
+        route=resolved_route_identity(config, decision),
+        # A review packet embeds the diff and evidence, so it is additionally
+        # bound to that state; a build packet is not.
+        state_fingerprint=task_fingerprint(root, task_dir) if stage == "review" else None,
+        route_identity_fingerprint=route_fingerprint(config, decision),
+        content_sha256=content_sha256,
+    )
     return path, text
 
 
@@ -827,6 +1752,7 @@ def budget_report(root: Path, task_dir: Path) -> dict[str, Any]:
     full_tokens = int(repo_map["estimated_full_source_tokens"])
     orientation_tokens = map_tokens + capsule_tokens
     avoided = max(0, full_tokens - orientation_tokens)
+    ownership = ownership_summary(task, repo_map)
     return {
         "full_source_tokens": full_tokens,
         "repo_map_tokens": map_tokens,
@@ -834,9 +1760,16 @@ def budget_report(root: Path, task_dir: Path) -> dict[str, Any]:
         "orientation_tokens": orientation_tokens,
         "estimated_orientation_tokens_avoided": avoided,
         "estimated_avoidance_percent": round((avoided / full_tokens * 100), 1) if full_tokens else 0.0,
+        "ownership": {
+            "file_count": ownership["file_count"],
+            "estimated_tokens": ownership["estimated_tokens"],
+        },
         "owned_context_tokens": decision.estimated_context_tokens,
         "stage_budget_tokens": decision.budget_tokens,
-        "within_budget": decision.estimated_context_tokens + orientation_tokens <= decision.budget_tokens,
+        "ownership_note": (
+            "Ownership size is an authorization measure, not a packet size. "
+            "Stage budget compliance is reported by `sera context`."
+        ),
     }
 
 
@@ -845,6 +1778,22 @@ def read_reviews(task_dir: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+def review_ledger_fingerprint(task_dir: Path) -> str:
+    """Canonical fingerprint of the full review ledger for a task.
+
+    Binds every persisted field of every review record — stage, verdict,
+    reviewer, rationale, reviewed fingerprint, timestamp — in ledger order,
+    not merely the stage names. Serialization is canonical JSON so the value is
+    stable across runs.
+
+    This deliberately lives outside `task_fingerprint`: reviews record the task
+    fingerprint they judged, so folding reviews back into that fingerprint would
+    be circular. Acceptance composes the two instead.
+    """
+    records = read_reviews(task_dir)
+    return sha256_text(json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
 
 def generate_summary(root: Path, task_dir: Path) -> tuple[Path, str]:
     task = load_task(task_dir)
@@ -886,7 +1835,8 @@ def generate_summary(root: Path, task_dir: Path) -> tuple[Path, str]:
         "## SERA status",
         "",
         f"- Contract check: `{'pass' if result['ok'] else 'blocked'}`",
-        f"- Seal: `{'stale' if result['seal_stale'] else 'current' if result['seal'] else 'none'}`",
+        f"- Seal: `{result['seal_status']}`",
+        f"- Accepted HEAD: `{result['head_identity']['head_sha']}`",
         f"- Next action: {result['next_action']}",
     ]
     output = "\n".join(lines) + "\n"
@@ -895,16 +1845,89 @@ def generate_summary(root: Path, task_dir: Path) -> tuple[Path, str]:
     return path, output
 
 
+def evaluate_seal(
+    seal: dict[str, Any] | None,
+    fingerprint: str,
+    head_identity: dict[str, str],
+    review_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Decide whether a seal still describes the exact reviewed repository state.
+
+    The declared schema version is interpreted *before* anything else, so a
+    tampered or unknown version can never be validated as if it were current.
+
+    - `schema_version: 2` must carry every required v2 field, and then binds the
+      task/evidence/delta fingerprint, the review ledger, and the exact HEAD
+      commit and tree.
+    - `schema_version: 1` is a genuine 0.4.0 seal only when it carries no
+      v2-only fields; it reports `legacy_unbound` and fails closed.
+    - A v1 record carrying v2-only fields, a v2 record missing required fields,
+      a missing version, and any unknown version all fail closed.
+    """
+    if not seal:
+        return {"status": "none", "stale": False, "reasons": []}
+
+    version = seal.get("schema_version")
+    present_v2_only = [field for field in SEAL_V2_ONLY_FIELDS if field in seal]
+
+    if version == SEAL_LEGACY_SCHEMA_VERSION:
+        if present_v2_only:
+            return {
+                "status": "schema_inconsistent",
+                "stale": True,
+                "reasons": [SEAL_SCHEMA_INCONSISTENT],
+            }
+        return {
+            "status": "legacy_unbound",
+            "stale": True,
+            "reasons": [SEAL_MISSING_HEAD_IDENTITY],
+        }
+
+    if version != SEAL_SCHEMA_VERSION:
+        return {"status": "schema_unsupported", "stale": True, "reasons": [SEAL_SCHEMA_UNSUPPORTED]}
+
+    missing = [field for field in SEAL_V2_REQUIRED_FIELDS if seal.get(field) in (None, "")]
+    identity = seal.get("repository_identity")
+    if not isinstance(identity, dict) or not identity.get("head_sha") or not identity.get("head_tree_sha"):
+        if "repository_identity" not in missing:
+            missing.append("repository_identity")
+    if missing:
+        return {"status": "schema_inconsistent", "stale": True, "reasons": [SEAL_SCHEMA_INCONSISTENT]}
+
+    reasons: list[str] = []
+    if seal.get("fingerprint") != fingerprint:
+        reasons.append(SEAL_FINGERPRINT_MISMATCH)
+    if review_fingerprint is not None and seal.get("review_ledger_fingerprint") != review_fingerprint:
+        reasons.append(SEAL_REVIEW_MISMATCH)
+    if identity.get("head_sha") != head_identity.get("head_sha"):
+        reasons.append(SEAL_HEAD_MISMATCH)
+    elif identity.get("head_tree_sha") != head_identity.get("head_tree_sha"):
+        reasons.append(SEAL_HEAD_TREE_MISMATCH)
+
+    if not reasons:
+        status = "current"
+    elif SEAL_HEAD_MISMATCH in reasons or SEAL_HEAD_TREE_MISMATCH in reasons:
+        status = "head_mismatch"
+    elif SEAL_REVIEW_MISMATCH in reasons:
+        status = "review_mismatch"
+    else:
+        status = "stale_fingerprint"
+    return {"status": status, "stale": bool(reasons), "reasons": reasons}
+
+
 def create_seal(root: Path, task_dir: Path) -> dict[str, Any]:
     result = check_task(root, task_dir)
     if not result["ok"]:
         raise SeraError(f"Task cannot be sealed: {result['next_action']}")
     task = load_task(task_dir)
     seal = {
-        "schema_version": 1,
+        "schema_version": SEAL_SCHEMA_VERSION,
+        "sera_version": __version__,
         "task_id": task["id"],
         "sealed_at": utc_now(),
         "fingerprint": result["fingerprint"],
+        "repository_identity": result["head_identity"],
+        "review_ledger_fingerprint": result["review_ledger_fingerprint"],
         "evidence_records": len(read_ledger(task_dir)),
         "review_stages": sorted(result["reviews"].keys()),
         "changed_files": result["changed_files"],
@@ -919,7 +1942,12 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
     allowed = set(task["allowed_files"])
     out_of_scope = [path for path in changed if path not in allowed]
     ledger = read_ledger(task_dir)
-    successful = {item["command"] for item in ledger if item["exit_code"] == 0}
+    contract = task_contract_fingerprint(task)
+    successful = {
+        item["command"]
+        for item in ledger
+        if item["exit_code"] == 0 and item.get("task_contract_fingerprint") == contract
+    }
     missing_verification = [command for command in task["verification"] if command not in successful]
     fingerprint = task_fingerprint(root, task_dir)
     decision = decide_route(root, task)
@@ -960,9 +1988,33 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         next_action = "The current tree satisfies the task contract; proceed to the separate commit decision."
     seal_path = task_dir / "seal.json"
     seal = json.loads(seal_path.read_text(encoding="utf-8")) if seal_path.exists() else None
-    seal_stale = bool(seal and seal.get("fingerprint") != fingerprint)
+    head_identity = git_head_identity(root)
+    review_fingerprint = review_ledger_fingerprint(task_dir)
+    seal_state = evaluate_seal(seal, fingerprint, head_identity, review_fingerprint)
+    seal_stale = seal_state["stale"]
     if ok and seal_stale:
-        next_action = "Create a new SERA Seal for the current fingerprint."
+        if seal_state["status"] == "review_mismatch":
+            next_action = (
+                "The review ledger changed after acceptance; this seal no longer binds the reviews "
+                "that justified it. Re-review and seal the current records."
+            )
+        elif seal_state["status"] in {"schema_unsupported", "schema_inconsistent"}:
+            next_action = (
+                "This seal's schema version is unsupported or inconsistent with its contents. "
+                "Create a new SERA Seal."
+            )
+        elif seal_state["status"] == "head_mismatch":
+            next_action = (
+                "HEAD moved after acceptance; this seal no longer describes the current commit. "
+                "Re-review and seal the exact current repository identity."
+            )
+        elif seal_state["status"] == "legacy_unbound":
+            next_action = (
+                "This seal predates exact-HEAD binding (0.4.0 format) and cannot satisfy "
+                "exact-head acceptance. Create a 0.4.1 seal."
+            )
+        else:
+            next_action = "Create a new SERA Seal for the current fingerprint."
     elif ok and seal is None:
         next_action = "Create the SERA Seal, then proceed to the separate commit decision."
     return {
@@ -971,6 +2023,8 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         "out_of_scope": out_of_scope,
         "missing_verification": missing_verification,
         "fingerprint": fingerprint,
+        "head_identity": head_identity,
+        "review_ledger_fingerprint": review_fingerprint,
         "required_review_stages": required_review_stages,
         "reviews": latest_by_stage,
         "missing_reviews": missing_reviews,
@@ -978,6 +2032,8 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         "failed_reviews": failed_reviews,
         "seal": seal,
         "seal_stale": seal_stale,
+        "seal_status": seal_state["status"],
+        "seal_stale_reasons": seal_state["reasons"],
         "next_action": next_action,
     }
 

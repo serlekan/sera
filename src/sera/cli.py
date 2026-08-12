@@ -8,6 +8,8 @@ from pathlib import Path
 from . import __version__
 from .controller import (
     auto_task,
+    budget_view,
+    build_packet,
     confirm_task_ownership,
     context_report,
     efficiency_report,
@@ -19,14 +21,13 @@ from .controller import (
 )
 from .core import (
     SeraError,
-    budget_report,
     build_repo_map,
     check_task,
     create_seal,
     decide_route,
     estimate_tokens,
     find_repo_root,
-    generate_packet,
+    format_risk_reason,
     generate_summary,
     initialize,
     lane_label,
@@ -75,8 +76,18 @@ def parser() -> argparse.ArgumentParser:
     new = task_commands.add_parser("new", help="Create a task capsule explicitly.")
     new.add_argument("name")
     new.add_argument("--objective", required=True)
-    new.add_argument("--mode", choices=["fast", "standard", "assured"], default="standard")
-    new.add_argument("--risk", choices=["low", "medium", "high"], default="medium")
+    new.add_argument(
+        "--mode",
+        choices=["fast", "standard", "assured"],
+        default=None,
+        help="Override the configured default_mode for this task.",
+    )
+    new.add_argument(
+        "--risk",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Explicit risk floor; automatic assessment still applies and may raise it.",
+    )
     new.add_argument("--uncertainty", type=int, choices=[0, 1, 2, 3], default=1)
     new.add_argument("--use-case", default="implementation")
     new.add_argument("--file", action="append", default=[], dest="files")
@@ -103,7 +114,13 @@ def parser() -> argparse.ArgumentParser:
 
     context = commands.add_parser("context", help="Explain and budget the context selected for a task.")
     context.add_argument("task", nargs="?")
-    context.add_argument("--why", action="store_true", help="Show the reason each file earned context inclusion.")
+    context.add_argument("--why", action="store_true", help="Show the reason each file earned or lost context inclusion.")
+    context.add_argument(
+        "--stage",
+        choices=["build", "review"],
+        default=None,
+        help="Budget a specific stage instead of the required next stage.",
+    )
     _json_flag(context)
 
     packet = commands.add_parser("packet", help="Generate compact build or review handoff packets.")
@@ -220,7 +237,9 @@ def main(argv: list[str] | None = None) -> int:
                 "task_id": task["id"],
                 "task_dir": task_dir.relative_to(root).as_posix(),
                 "mode": task["mode"],
+                "mode_source": task.get("mode_source"),
                 "risk": task["risk"],
+                "risk_reasons": task.get("risk_reasons", []),
                 "owned_files": task["allowed_files"],
                 "context_reduction_percent": report["context_reduction_percent"],
             }
@@ -228,7 +247,9 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(output)
             else:
                 print(output["task_dir"])
-                print(f"mode: {task['mode']} | risk: {task['risk']}")
+                print(f"mode: {task['mode']} ({task.get('mode_source', 'builtin')}) | risk: {task['risk']}")
+                for reason in task.get("risk_reasons", []):
+                    print(f"  risk: {format_risk_reason(reason)}")
                 print(f"candidate ownership: {len(task['allowed_files'])} files")
                 print(f"context reduction vs full-source availability: {report['context_reduction_percent']}%")
             return 0
@@ -242,9 +263,18 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(report)
             else:
                 print(f"Task: {report['task_id']}")
-                print(f"Mode/risk: {report['mode']}/{report['risk']}")
-                print(f"Owned files: {len(report['owned_files'])}")
-                print(f"Context selected: ~{report['context']['selected_source_tokens']:,} tokens")
+                print(f"Mode/risk: {report['mode']} ({report.get('mode_source', 'builtin')})/{report['risk']}")
+                for reason in report.get("risk_reasons", []):
+                    print(f"  risk: {format_risk_reason(reason)}")
+                print(
+                    f"Ownership: {report['ownership']['file_count']} files "
+                    f"(~{report['ownership']['estimated_tokens']:,} tokens)"
+                )
+                print(
+                    f"Selected context: {report['selected_context']['file_count']} files "
+                    f"(~{report['selected_context']['estimated_tokens']:,} tokens) "
+                    f"of a {report['context']['stage_budget_tokens']:,} budget"
+                )
                 print(f"Context reduction vs full-source availability: {report['context']['context_reduction_percent']}%")
                 print(f"Builder: {report['route']['builder']}")
                 print(f"Reviewer: {report['route']['reviewer'] or 'not required'}")
@@ -276,6 +306,10 @@ def main(argv: list[str] | None = None) -> int:
                 "reviewer": lane_label(config, decision.reviewer),
                 "gate": lane_label(config, decision.gate),
                 "reason": decision.reason,
+                "risk": task["risk"],
+                "risk_reasons": task.get("risk_reasons", []),
+                "ownership_file_count": decision.ownership_file_count,
+                "ownership_tokens": decision.ownership_tokens,
                 "owned_context_tokens": decision.estimated_context_tokens,
                 "stage_budget_tokens": decision.budget_tokens,
                 "optional_fable_eligible": decision.fable_eligible,
@@ -287,28 +321,48 @@ def main(argv: list[str] | None = None) -> int:
                 print(output["reviewer"] or "reviewer: not required")
                 print(output["gate"] or "release gate: not required")
                 print(f"reason: {decision.reason}")
-                print(f"owned-context estimate: {decision.estimated_context_tokens:,} tokens")
+                print(f"risk: {task['risk']}")
+                for reason in task.get("risk_reasons", []):
+                    print(f"  {format_risk_reason(reason)}")
+                print(
+                    f"ownership: {decision.ownership_file_count} files "
+                    f"(~{decision.ownership_tokens:,} tokens, authorization only)"
+                )
                 print(f"stage budget: {decision.budget_tokens:,} tokens")
                 print(f"optional Fable eligible: {'yes' if decision.fable_eligible else 'no'}")
             return 0
         if args.command == "context":
-            report = context_report(root, task_dir)
+            report = context_report(root, task_dir, stage=args.stage)
             if args.json:
                 _print_json(report)
             else:
+                print(f"Stage: {report['stage']}")
                 print(f"Repository context available: ~{report['repository_available_tokens']:,} tokens")
-                print(f"Selected source context: ~{report['selected_source_tokens']:,} tokens")
+                print(
+                    f"Ownership: {report['ownership']['file_count']} files "
+                    f"(~{report['ownership']['estimated_tokens']:,} tokens) — authorization, not context"
+                )
+                print(
+                    f"Selected context: {report['selected_context']['file_count']} files "
+                    f"(~{report['selected_context']['estimated_tokens']:,} tokens)"
+                )
                 print(f"Capsule: ~{report['capsule_tokens']:,} tokens")
-                print(f"Estimated task context: ~{report['estimated_context_tokens']:,} tokens")
+                if report["stage"] == "review":
+                    print(f"Diff: ~{report['diff_tokens']:,} tokens | evidence: ~{report['evidence_tokens']:,} tokens")
+                print(f"Estimated stage context: ~{report['estimated_context_tokens']:,} tokens")
                 print(f"Reduction vs full-source availability: {report['context_reduction_percent']}%")
                 print(f"Budget: {report['stage_budget_tokens']:,} | within budget: {'yes' if report['within_budget'] else 'no'}")
                 if args.why:
-                    print("Context reasons:")
+                    print("Selected:")
                     for item in report["selected_files"]:
-                        print(f"  {item['path']} — {'; '.join(item['reasons'])}")
+                        print(f"  {item['path']} — {item['reason']} ({'; '.join(item['reasons'])})")
+                    if report["excluded_files"]:
+                        print("Not selected (ownership retained):")
+                        for item in report["excluded_files"]:
+                            print(f"  {item['path']} — {item['reason']}")
             return 0
         if args.command == "packet":
-            path, text = generate_packet(root, task_dir, args.stage)
+            path, text = build_packet(root, task_dir, args.stage)
             print(path.relative_to(root))
             print(f"estimated packet size: ~{estimate_tokens(text):,} tokens")
             return 0
@@ -326,14 +380,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{item['command']} -> exit {item['exit_code']} ({item['output_sha256'][:12]})")
             return 0 if all(item["exit_code"] == 0 for item in results) else 2
         if args.command == "budget":
-            report = budget_report(root, task_dir)
+            report = budget_view(root, task_dir)
             if args.json:
                 _print_json(report)
             else:
                 print(f"Full-source orientation: ~{report['full_source_tokens']:,} tokens")
                 print(f"Map + capsule orientation: ~{report['orientation_tokens']:,} tokens")
                 print(f"Estimated orientation avoided: ~{report['estimated_orientation_tokens_avoided']:,} tokens ({report['estimated_avoidance_percent']}%)")
-                print(f"Owned context: ~{report['owned_context_tokens']:,} tokens")
+                print(
+                    f"Ownership: {report['ownership']['file_count']} files "
+                    f"(~{report['ownership']['estimated_tokens']:,} tokens, authorization only)"
+                )
+                print(
+                    f"Selected {report['required_stage']} context: {report['selected_context']['file_count']} files "
+                    f"(~{report['estimated_context_tokens']:,} tokens with stage overhead)"
+                )
                 print(f"Stage budget: {report['stage_budget_tokens']:,} tokens")
                 print(f"Within budget: {'yes' if report['within_budget'] else 'no'}")
             return 0
@@ -386,6 +447,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "seal":
             seal = create_seal(root, task_dir)
             print(f"Sealed {seal['task_id']} at fingerprint {seal['fingerprint'][:16]}")
+            print(f"Bound to HEAD {seal['repository_identity']['head_sha']}")
+            print(f"Bound to HEAD tree {seal['repository_identity']['head_tree_sha']}")
+            print(f"Bound to review ledger {seal['review_ledger_fingerprint'][:16]}")
             return 0
         if args.command in {"check", "status"}:
             result = check_task(root, task_dir)
@@ -396,11 +460,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 if args.command == "check":
                     result["seal_required_failure"] = seal_required_failure
+                    result["seal_required_failure_reasons"] = (
+                        (result["seal_stale_reasons"] or ["seal_missing"])
+                        if seal_required_failure
+                        else []
+                    )
                 _print_json(result)
             else:
                 print(f"Task: {task['id']}")
                 print(f"Status: {'ready' if result['ok'] else 'blocked'}")
                 print(f"Fingerprint: {result['fingerprint']}")
+                print(f"HEAD: {result['head_identity']['head_sha']}")
                 print(f"Changed files: {len(result['changed_files'])}")
                 print(f"Out of scope: {', '.join(result['out_of_scope']) or 'none'}")
                 print(f"Missing verification: {', '.join(result['missing_verification']) or 'none'}")
@@ -412,7 +482,9 @@ def main(argv: list[str] | None = None) -> int:
                     print("Reviews: none")
                 print(f"Missing reviews: {', '.join(result['missing_reviews']) or 'none'}")
                 if result["seal"]:
-                    print(f"Seal: {'stale' if result['seal_stale'] else 'current'} ({result['seal']['fingerprint'][:16]})")
+                    print(f"Seal: {result['seal_status']} ({result['seal']['fingerprint'][:16]})")
+                    for reason in result["seal_stale_reasons"]:
+                        print(f"  {reason}")
                 else:
                     print("Seal: none")
                 print(f"Next: {result['next_action']}")

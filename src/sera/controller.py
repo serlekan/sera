@@ -1,58 +1,64 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
+from .context import (
+    SELECTION_REASONS,
+    STOP_WORDS,
+    required_stage,
+    select_context,
+    select_task_context,
+)
 from .core import (
+    HIGH_RISK_TERMS,
+    MEDIUM_RISK_TERMS,
     SeraError,
+    apply_task_policy,
+    assess_risk,
     budget_report,
     check_task,
     decide_route,
     estimate_tokens,
+    format_risk_reason,
     generate_packet,
     lane_label,
     load_config,
-    load_repo_map,
     load_task,
     new_task,
+    normalize_repo_path,
+    packet_state,
     resolve_task_dir,
     state_path,
     utc_now,
     update_repo_map,
+    write_task_capsule,
 )
 
-STOP_WORDS = {
-    "about", "after", "again", "against", "also", "and", "are", "because", "before", "build",
-    "change", "code", "could", "does", "from", "have", "into", "just", "make", "more", "project",
-    "should", "that", "the", "their", "then", "this", "through", "use", "using", "want", "what",
-    "when", "where", "which", "with", "without", "work",
-}
-
-HIGH_RISK_TERMS = {
-    "auth", "authentication", "authorization", "balance", "cryptography", "deploy", "deployment",
-    "ledger", "migration", "money", "password", "payment", "payout", "permission", "production",
-    "secret", "session", "settlement", "transaction", "treasury", "wallet",
-}
-
-MEDIUM_RISK_TERMS = {
-    "api", "concurrency", "database", "idempotency", "idempotent", "integration", "schema", "state",
-    "webhook",
-}
-
-
-def _tokens(value: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", value.lower())
-        if len(token) >= 3 and token not in STOP_WORDS
-    }
-
-
-def _symbol_tokens(symbol: str) -> set[str]:
-    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", symbol).replace("_", "-")
-    return _tokens(expanded)
+__all__ = [
+    "HIGH_RISK_TERMS",
+    "MEDIUM_RISK_TERMS",
+    "STOP_WORDS",
+    "SELECTION_REASONS",
+    "assess_risk",
+    "auto_task",
+    "budget_view",
+    "build_packet",
+    "confirm_task_ownership",
+    "context_report",
+    "efficiency_report",
+    "ensure_controller_config",
+    "inbox_report",
+    "infer_risk",
+    "next_action",
+    "prepare_run",
+    "record_context",
+    "required_stage",
+    "resume_report",
+    "select_context",
+    "select_task_context",
+]
 
 
 def ensure_controller_config(root: Path) -> dict[str, Any]:
@@ -63,6 +69,9 @@ def ensure_controller_config(root: Path) -> dict[str, Any]:
     controller.setdefault("context_min_score", 2)
     controller.setdefault("enforce_context_budget", True)
     controller.setdefault("auto_risk", True)
+    policy = config.setdefault("risk_policy", {})
+    policy.setdefault("high_risk_terms", [])
+    policy.setdefault("high_risk_paths", [])
     fable = config.setdefault("lanes", {}).setdefault("optional_fable", {})
     if fable.get("provider") in {None, "custom"}:
         fable["provider"] = "anthropic"
@@ -70,92 +79,18 @@ def ensure_controller_config(root: Path) -> dict[str, Any]:
     return config
 
 
-def infer_risk(objective: str, files: list[str] | None = None) -> tuple[str, list[str]]:
-    haystack = " ".join([objective, *(files or [])]).lower()
-    words = _tokens(haystack)
-    high = sorted(term for term in HIGH_RISK_TERMS if term in words)
-    if high:
-        return "high", [f"high-risk term: {term}" for term in high]
-    medium = sorted(term for term in MEDIUM_RISK_TERMS if term in words)
-    if medium:
-        return "medium", [f"medium-risk term: {term}" for term in medium]
-    return "low", ["no configured high- or medium-risk terms detected"]
-
-
-def select_context(
-    root: Path,
+def infer_risk(
     objective: str,
-    explicit_files: list[str] | None = None,
-    max_files: int | None = None,
-) -> dict[str, Any]:
-    repo_map = load_repo_map(root)
-    config = load_config(root)
-    controller = config.get("controller", {})
-    max_files = int(max_files or controller.get("context_max_files", 12))
-    min_score = int(controller.get("context_min_score", 2))
-    query = _tokens(objective)
-    explicit = {path.replace("\\", "/") for path in (explicit_files or [])}
-    ranked: list[dict[str, Any]] = []
+    files: list[str] | None = None,
+    config: dict[str, Any] | None = None,
+) -> tuple[str, list[str]]:
+    """Human-readable view of `assess_risk`.
 
-    for item in repo_map["files"]:
-        path = item["path"]
-        path_words = _tokens(path.replace("/", " ").replace(".", " "))
-        symbol_words: set[str] = set()
-        for symbol in item.get("symbols", []):
-            symbol_words |= _symbol_tokens(symbol)
-        overlap_path = sorted(query & path_words)
-        overlap_symbol = sorted(query & symbol_words)
-        score = len(overlap_path) * 4 + len(overlap_symbol) * 3
-        reasons: list[str] = []
-        if path in explicit:
-            score += 1000
-            reasons.append("explicit ownership")
-        if overlap_path:
-            reasons.append("path matches: " + ", ".join(overlap_path))
-        if overlap_symbol:
-            reasons.append("symbol matches: " + ", ".join(overlap_symbol))
-        if score >= min_score or path in explicit:
-            ranked.append(
-                {
-                    "path": path,
-                    "score": score,
-                    "reasons": reasons or ["objective relevance"],
-                    "bytes": int(item.get("bytes", 0)),
-                    "tokens": estimate_tokens(int(item.get("bytes", 0))),
-                    "symbols": item.get("symbols", []),
-                }
-            )
-
-    ranked.sort(key=lambda value: (-value["score"], value["tokens"], value["path"]))
-    selected = ranked[:max_files]
-    selected_paths = {item["path"] for item in selected}
-    for path in sorted(explicit - selected_paths):
-        selected.append(
-            {
-                "path": path,
-                "score": 1000,
-                "reasons": ["explicit ownership; file is not present in the current repository map"],
-                "bytes": 0,
-                "tokens": 0,
-                "symbols": [],
-            }
-        )
-
-    selected_tokens = sum(item["tokens"] for item in selected)
-    full_tokens = int(repo_map.get("estimated_full_source_tokens", 0))
-    reduction = max(0, full_tokens - selected_tokens)
-    return {
-        "generated_at": utc_now(),
-        "objective": objective,
-        "query_terms": sorted(query),
-        "repository_fingerprint": repo_map["fingerprint"],
-        "repository_available_tokens": full_tokens,
-        "selected_files": selected,
-        "selected_source_tokens": selected_tokens,
-        "context_reduction_tokens": reduction,
-        "context_reduction_percent": round(reduction / full_tokens * 100, 2) if full_tokens else 0.0,
-        "max_files": max_files,
-    }
+    Machine consumers should use `assess_risk`, which returns structured
+    reasons; this wrapper renders them as text for terminal output.
+    """
+    assessment = assess_risk(config, objective, files)
+    return assessment["risk"], [format_risk_reason(reason) for reason in assessment["reasons"]]
 
 
 def record_context(task_dir: Path, report: dict[str, Any], stage: str) -> dict[str, Any]:
@@ -164,12 +99,23 @@ def record_context(task_dir: Path, report: dict[str, Any], stage: str) -> dict[s
         "stage": stage,
         "repository_fingerprint": report["repository_fingerprint"],
         "repository_available_tokens": report["repository_available_tokens"],
+        "ownership": report.get("ownership", {}),
+        "selected_context": report.get("selected_context", {}),
         "selected_source_tokens": report["selected_source_tokens"],
         "context_reduction_tokens": report["context_reduction_tokens"],
         "context_reduction_percent": report["context_reduction_percent"],
         "files": [
-            {"path": item["path"], "tokens": item["tokens"], "reasons": item["reasons"]}
+            {
+                "path": item["path"],
+                "tokens": item["tokens"],
+                "reason": item["reason"],
+                "reasons": item["reasons"],
+            }
             for item in report["selected_files"]
+        ],
+        "excluded": [
+            {"path": item["path"], "reason": item["reason"], "tokens": item["tokens"]}
+            for item in report.get("excluded_files", [])
         ],
     }
     with (task_dir / "context-ledger.jsonl").open("a", encoding="utf-8") as handle:
@@ -194,30 +140,15 @@ def auto_task(
     update_repo_map(root)
     context = select_context(root, request, files)
     context_candidates = [item["path"] for item in context["selected_files"]]
-    candidate_files = [path.replace("\\", "/") for path in files] if files else context_candidates
-    inferred_risk, risk_reasons = infer_risk(request, candidate_files)
-    controller_cfg = load_config(root).get("controller", {})
-    final_risk = (inferred_risk if controller_cfg.get("auto_risk", True) else "medium") if risk == "auto" else risk
-    if mode == "auto":
-        if final_risk == "high":
-            final_mode = "assured"
-        elif final_risk == "low" and uncertainty == 0 and len(candidate_files) <= 2:
-            final_mode = "fast"
-        else:
-            final_mode = "standard"
-    else:
-        final_mode = mode
-
-    if final_risk == "high" and final_mode != "assured":
-        final_mode = "assured"
-        risk_reasons.append("high-risk work automatically escalates to assured mode")
-
+    candidate_files = list(files) if files else context_candidates
+    # `new_task` owns mode precedence and risk composition so every drafting
+    # path resolves them identically.
     task_dir = new_task(
         root,
         name or request[:72],
         request,
-        final_mode,
-        final_risk,
+        mode,
+        risk,
         candidate_files,
         constraints or [],
         verification or [],
@@ -228,7 +159,8 @@ def auto_task(
     task["controller"] = {
         "auto_drafted": True,
         "ownership_confirmed": bool(files),
-        "risk_reasons": risk_reasons,
+        "mode_source": task.get("mode_source"),
+        "risk_reasons": task.get("risk_reasons", []),
         "context_selection": {
             "repository_fingerprint": context["repository_fingerprint"],
             "selected_source_tokens": context["selected_source_tokens"],
@@ -243,34 +175,71 @@ def auto_task(
 
 
 def confirm_task_ownership(root: Path, task_dir: Path, files: list[str] | None = None) -> dict[str, Any]:
+    """Confirm exact ownership and re-derive policy from the new contract.
+
+    Confirming ownership changes what the task is authorized to touch, so it
+    must re-run the same risk and mode resolution used at creation. Skipping it
+    would let a task confirmed onto a high-risk path keep a fast, review-free
+    route.
+    """
     task = load_task(task_dir)
     if files:
-        task["allowed_files"] = sorted({path.replace("\\", "/") for path in files})
+        task["allowed_files"] = sorted({normalize_repo_path(path) for path in files})
     if not task.get("allowed_files"):
         raise SeraError("Cannot confirm empty ownership; provide --file at least once.")
+    config = load_config(root)
+    apply_task_policy(config, task)
     controller = task.setdefault("controller", {})
     controller["ownership_confirmed"] = True
     controller["ownership_confirmed_at"] = utc_now()
+    controller["mode_source"] = task.get("mode_source")
+    controller["risk_reasons"] = task.get("risk_reasons", [])
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+    # Derived artifacts must not survive a contract mutation as authoritative:
+    # the capsule is rewritten now, and packets become stale by fingerprint.
+    write_task_capsule(task_dir, task)
     return task
 
 def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     task = load_task(task_dir)
     config = load_config(root)
     decision = decide_route(root, task)
-    packet_build = task_dir / "packet-build.md"
-    packet_review = task_dir / "packet-review.md"
     result = check_task(root, task_dir)
+    build_packet_state = packet_state(root, task_dir, "build", task)
+    review_packet_state = packet_state(root, task_dir, "review", task, result["fingerprint"])
+    stage = required_stage(result)
+    stage_context = context_report(root, task_dir, stage=stage, record=False)
 
     controller = task.get("controller", {})
     if not task.get("allowed_files"):
         action, command, reason = "resolve_ownership", None, "No exact owned files are defined."
     elif controller.get("auto_drafted") and not controller.get("ownership_confirmed", False):
         action, command, reason = "confirm_ownership", "sera task confirm", "Auto-selected files are candidates until the controller confirms exact ownership."
-    elif load_config(root).get("controller", {}).get("enforce_context_budget", True) and not context_report(root, task_dir, record=False)["within_budget"]:
-        action, command, reason = "reduce_context", "sera context --why", "Selected task context exceeds the configured mode budget; reduce ownership/context or split the task."
-    elif not packet_build.exists():
-        action, command, reason = "build_packet", "sera packet build", "The task is specified but no builder handoff exists."
+    elif stage == "review" and not stage_context.get("review_diff_ok", True):
+        # Fail closed rather than hand a reviewer a packet that hides changes.
+        action, command, reason = (
+            "review_diff_budget_insufficient",
+            None,
+            f"Covering every changed file needs at least "
+            f"{stage_context['review_diff_required_chars']:,} characters of review diff, which exceeds "
+            f"max_packet_chars. Raise max_packet_chars or split the task.",
+        )
+    elif config.get("controller", {}).get("enforce_context_budget", True) and not stage_context["within_budget"]:
+        # Budget is measured against the context selected for the required next
+        # stage, never against the full ownership set.
+        action, command, reason = (
+            "reduce_context",
+            "sera context --why",
+            f"Selected {stage} context is {stage_context['estimated_context_tokens']:,} tokens against a "
+            f"{stage_context['stage_budget_tokens']:,} budget; split the task or narrow the stage context.",
+        )
+    elif not build_packet_state["current"]:
+        action, command = "build_packet", "sera packet build"
+        reason = {
+            "packet_missing": "The task is specified but no builder handoff exists.",
+            "packet_unbound": "The existing builder packet has no valid task binding and cannot be dispatched.",
+            "packet_stale_contract": "The task contract changed after this builder packet was generated; regenerate before dispatch.",
+        }.get(build_packet_state["reason"], "The builder packet is not current for this task contract.")
     elif not result["changed_files"]:
         action, command, reason = (
             "dispatch_builder",
@@ -284,7 +253,7 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     elif result["stale_reviews"]:
         action, command, reason = "review", "sera packet review", "One or more required reviews are stale for the current fingerprint."
     elif result["missing_reviews"]:
-        if not packet_review.exists():
+        if not review_packet_state["current"]:
             action, command = "review_packet", "sera packet review"
         else:
             action, command = "dispatch_review", None
@@ -304,12 +273,25 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         "next_action": action,
         "command": command,
         "reason": reason,
+        "mode": task["mode"],
+        "risk": task["risk"],
+        "risk_reasons": task.get("risk_reasons", []),
         "route": {
             "builder": lane_label(config, decision.builder),
             "reviewer": lane_label(config, decision.reviewer),
             "gate": lane_label(config, decision.gate),
         },
+        "required_stage": stage,
+        "build_packet": build_packet_state,
+        "review_packet": review_packet_state,
+        "ownership": stage_context["ownership"],
+        "selected_context": stage_context["selected_context"],
+        "stage_budget_tokens": stage_context["stage_budget_tokens"],
+        "within_budget": stage_context["within_budget"],
         "fingerprint": result["fingerprint"],
+        "head_identity": result["head_identity"],
+        "seal_status": result["seal_status"],
+        "seal_stale_reasons": result["seal_stale_reasons"],
         "seal_current": bool(result["seal"] and not result["seal_stale"]),
     }
 
@@ -324,9 +306,10 @@ def resume_report(root: Path, task_ref: str | None = None) -> dict[str, Any]:
             "objective": task["objective"],
             "mode": task["mode"],
             "risk": task["risk"],
+            "risk_reasons": task.get("risk_reasons", []),
             "owned_files": task["allowed_files"],
         },
-        "budget": budget_report(root, task_dir),
+        "budget": budget_view(root, task_dir),
         "next": next_action(root, task_dir),
     }
 
@@ -354,20 +337,39 @@ def inbox_report(root: Path) -> dict[str, Any]:
     return {"generated_at": utc_now(), "count": len(tasks), "tasks": tasks}
 
 
-def context_report(root: Path, task_dir: Path, *, record: bool = True) -> dict[str, Any]:
-    task = load_task(task_dir)
-    report = select_context(root, task["objective"], task.get("allowed_files", []))
+def context_report(
+    root: Path,
+    task_dir: Path,
+    *,
+    stage: str | None = None,
+    record: bool = True,
+) -> dict[str, Any]:
+    """Select and budget context for one stage of a task."""
+    if stage is None:
+        stage = required_stage(check_task(root, task_dir))
+    report = select_task_context(root, task_dir, stage)
     if record:
-        record_context(task_dir, report, "inspect")
-    route = decide_route(root, task)
-    capsule_tokens = estimate_tokens((task_dir / "capsule.md").read_text(encoding="utf-8"))
-    total = report["selected_source_tokens"] + capsule_tokens
-    report["task_id"] = task["id"]
-    report["capsule_tokens"] = capsule_tokens
-    report["stage_budget_tokens"] = route.budget_tokens
-    report["estimated_context_tokens"] = total
-    report["within_budget"] = total <= route.budget_tokens
-    report["budget_overage_tokens"] = max(0, total - route.budget_tokens)
+        record_context(task_dir, report, stage)
+    return report
+
+
+def build_packet(root: Path, task_dir: Path, stage: str) -> tuple[Path, str]:
+    """Generate a stage packet carrying stage-selected context."""
+    selected = select_task_context(root, task_dir, stage)
+    record_context(task_dir, selected, stage)
+    return generate_packet(root, task_dir, stage, selected_context=selected)
+
+
+def budget_view(root: Path, task_dir: Path) -> dict[str, Any]:
+    """Merge orientation/ownership accounting with stage context budgeting."""
+    report = budget_report(root, task_dir)
+    stage = required_stage(check_task(root, task_dir))
+    context = context_report(root, task_dir, stage=stage, record=False)
+    report["required_stage"] = stage
+    report["selected_context"] = context["selected_context"]
+    report["stage_overhead_tokens"] = context["stage_overhead_tokens"]
+    report["estimated_context_tokens"] = context["estimated_context_tokens"]
+    report["within_budget"] = context["within_budget"]
     return report
 
 
@@ -446,22 +448,28 @@ def prepare_run(
     packet_path = None
     packet = ""
     config = load_config(root)
-    context_budget = context_report(root, task_dir, record=False)
+    context_budget = context_report(root, task_dir, stage="build", record=False)
     ownership_confirmed = task.get("controller", {}).get("ownership_confirmed", False)
     budget_ok = context_budget["within_budget"] or not config.get("controller", {}).get("enforce_context_budget", True)
     if ownership_confirmed and budget_ok:
-        packet_path, packet = generate_packet(root, task_dir, "build")
+        packet_path, packet = build_packet(root, task_dir, "build")
     route = decide_route(root, task)
     return {
         "task_id": task["id"],
         "task_dir": task_dir.relative_to(root).as_posix(),
         "mode": task["mode"],
+        "mode_source": task.get("mode_source"),
         "risk": task["risk"],
+        "risk_reasons": task.get("risk_reasons", []),
         "owned_files": task["allowed_files"],
+        "ownership": context_budget["ownership"],
+        "selected_context": context_budget["selected_context"],
         "context": {
             "repository_available_tokens": context["repository_available_tokens"],
-            "selected_source_tokens": context["selected_source_tokens"],
-            "context_reduction_percent": context["context_reduction_percent"],
+            "selected_source_tokens": context_budget["selected_source_tokens"],
+            "context_reduction_percent": context_budget["context_reduction_percent"],
+            "stage_budget_tokens": context_budget["stage_budget_tokens"],
+            "within_budget": context_budget["within_budget"],
         },
         "route": {
             "builder": lane_label(config, route.builder),
