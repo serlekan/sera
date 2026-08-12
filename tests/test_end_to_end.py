@@ -19,6 +19,7 @@ from sera.core import (
     load_task,
     record_evidence,
     record_review,
+    new_task,
     task_fingerprint,
 )
 
@@ -109,6 +110,87 @@ class CrossFindingTests(unittest.TestCase):
         self.assertTrue(mutated["seal_stale"])
         self.assertEqual(mutated["seal_status"], "review_mismatch")
         self.assertIn(SEAL_REVIEW_MISMATCH, mutated["seal_stale_reasons"])
+
+
+class PacketFreshnessAndBoundedReviewTests(unittest.TestCase):
+    """Orchestration freshness and exact review budgeting, together."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        git(self.root, "init", "-b", "main")
+        git(self.root, "config", "user.name", "Test")
+        git(self.root, "config", "user.email", "test@example.com")
+        (self.root / "docs").mkdir()
+        (self.root / "critical").mkdir()
+        (self.root / "docs" / "note.py").write_text("NOTE = 1\n", encoding="utf-8")
+        for index in range(24):
+            (self.root / "critical" / f"unit_{index:02d}.py").write_text(
+                f"UNIT_{index:02d} = 0\n" * 30, encoding="utf-8"
+            )
+        initialize(self.root)
+        path = self.root / ".sera" / "config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["default_mode"] = "fast"
+        config["risk_policy"] = {"high_risk_terms": [], "high_risk_paths": ["critical/**"]}
+        config["max_packet_chars"] = 30_000
+        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-m", "baseline")
+        build_repo_map(self.root)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_stale_packet_rejected_then_bounded_review_accepted(self) -> None:
+        from sera.core import review_diff_coverage
+
+        # Low-risk draft, packet generated, ready to dispatch.
+        task_dir = new_task(self.root, "low risk", "low-risk task", allowed_files=["docs/note.py"])
+        build_packet(self.root, task_dir, "build")
+        self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_builder")
+
+        # Ownership escalates: the old packet must not be dispatchable.
+        owned = [f"critical/unit_{index:02d}.py" for index in range(24)]
+        confirm_task_ownership(self.root, task_dir, owned)
+        task = load_task(task_dir)
+        self.assertEqual(task["risk"], "high")
+        self.assertEqual(task["mode"], "assured")
+        self.assertEqual(next_action(self.root, task_dir)["state"], "build_packet")
+
+        _, build_text = build_packet(self.root, task_dir, "build")
+        self.assertIn("deep_builder", build_text)
+        self.assertNotIn("docs/note.py", build_text)
+        self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_builder")
+
+        # Many changed files, bounded review budget.
+        for index in range(24):
+            (self.root / "critical" / f"unit_{index:02d}.py").write_text(
+                f"UNIT_{index:02d} = 1\nEDITED_{index:02d} = True\n" * 30, encoding="utf-8"
+            )
+        max_chars = json.loads(
+            (self.root / ".sera" / "config.json").read_text(encoding="utf-8")
+        )["max_packet_chars"]
+        coverage = review_diff_coverage(self.root, owned, max_chars)
+        self.assertTrue(coverage["ok"])
+        self.assertLessEqual(len(coverage["text"]), max_chars)
+        self.assertEqual(coverage["rendered_chars"], len(coverage["text"]))
+        for path in owned:
+            self.assertIn(path, coverage["text"])
+
+        record_evidence(task_dir, "python -m unittest", 0, "tests passed")
+        build_packet(self.root, task_dir, "review")
+        self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_review")
+
+        fingerprint = task_fingerprint(self.root, task_dir)
+        record_review(task_dir, fingerprint, "ship", "independent-peer", "bounded review", "independent")
+        record_review(task_dir, fingerprint, "ship", "release-gate", "acceptable", "gate")
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["ok"], msg=result["next_action"])
+
+        seal = create_seal(self.root, task_dir)
+        self.assertIn("review_ledger_fingerprint", seal)
+        self.assertEqual(next_action(self.root, task_dir)["state"], "accepted")
 
 
 if __name__ == "__main__":

@@ -28,10 +28,12 @@ from .core import (
     load_task,
     new_task,
     normalize_repo_path,
+    packet_state,
     resolve_task_dir,
     state_path,
     utc_now,
     update_repo_map,
+    write_task_capsule,
 )
 
 __all__ = [
@@ -193,15 +195,18 @@ def confirm_task_ownership(root: Path, task_dir: Path, files: list[str] | None =
     controller["mode_source"] = task.get("mode_source")
     controller["risk_reasons"] = task.get("risk_reasons", [])
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+    # Derived artifacts must not survive a contract mutation as authoritative:
+    # the capsule is rewritten now, and packets become stale by fingerprint.
+    write_task_capsule(task_dir, task)
     return task
 
 def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     task = load_task(task_dir)
     config = load_config(root)
     decision = decide_route(root, task)
-    packet_build = task_dir / "packet-build.md"
-    packet_review = task_dir / "packet-review.md"
     result = check_task(root, task_dir)
+    build_packet_state = packet_state(task_dir, "build", task)
+    review_packet_state = packet_state(task_dir, "review", task, result["fingerprint"])
     stage = required_stage(result)
     stage_context = context_report(root, task_dir, stage=stage, record=False)
 
@@ -228,8 +233,13 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             f"Selected {stage} context is {stage_context['estimated_context_tokens']:,} tokens against a "
             f"{stage_context['stage_budget_tokens']:,} budget; split the task or narrow the stage context.",
         )
-    elif not packet_build.exists():
-        action, command, reason = "build_packet", "sera packet build", "The task is specified but no builder handoff exists."
+    elif not build_packet_state["current"]:
+        action, command = "build_packet", "sera packet build"
+        reason = {
+            "packet_missing": "The task is specified but no builder handoff exists.",
+            "packet_unbound": "The existing builder packet has no valid task binding and cannot be dispatched.",
+            "packet_stale_contract": "The task contract changed after this builder packet was generated; regenerate before dispatch.",
+        }.get(build_packet_state["reason"], "The builder packet is not current for this task contract.")
     elif not result["changed_files"]:
         action, command, reason = (
             "dispatch_builder",
@@ -243,7 +253,7 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     elif result["stale_reviews"]:
         action, command, reason = "review", "sera packet review", "One or more required reviews are stale for the current fingerprint."
     elif result["missing_reviews"]:
-        if not packet_review.exists():
+        if not review_packet_state["current"]:
             action, command = "review_packet", "sera packet review"
         else:
             action, command = "dispatch_review", None
@@ -272,6 +282,8 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             "gate": lane_label(config, decision.gate),
         },
         "required_stage": stage,
+        "build_packet": build_packet_state,
+        "review_packet": review_packet_state,
         "ownership": stage_context["ownership"],
         "selected_context": stage_context["selected_context"],
         "stage_budget_tokens": stage_context["stage_budget_tokens"],
