@@ -99,6 +99,38 @@ Explicit input can raise risk. It never silently lowers automatically detected
 risk; the rejected downgrade is recorded as `explicit_risk_not_applied` so the
 attempt stays auditable.
 
+### Requested inputs versus derived policy
+
+A task stores two different things:
+
+| Field | Meaning |
+| --- | --- |
+| `requested_mode` / `requested_risk` | what the user explicitly asked for, or `null` |
+| `mode` / `risk` / `risk_reasons` | what SERA derived from the current contract |
+
+Policy is always re-derived from the *requested* inputs plus the *current*
+objective and ownership — never from a previously derived value. That keeps a
+transiently confirmed high-risk path from making risk permanently sticky, while
+an explicit `--risk high` remains a floor that survives any later change.
+
+### Ownership confirmation re-runs policy
+
+Confirming ownership changes what a task is authorized to touch, so it re-runs
+the same risk and mode resolution used at creation:
+
+```bash
+sera task confirm --file critical/secret.py
+```
+
+recomputes effective risk, re-escalates the mode, and reroutes the lanes. A task
+drafted as low-risk `fast` and then confirmed onto a high-risk path becomes
+`assured` with independent review and the release gate required. `risk_reasons`
+is rebuilt from the current contract, so reasons from previous ownership do not
+linger.
+
+Reverting ownership back to low-risk paths recomputes to low risk again — unless
+an explicit risk floor was requested, which persists.
+
 Setting `controller.auto_risk` to `false` disables the built-in classifier only.
 Project risk policy is explicit repository configuration and always applies.
 
@@ -153,6 +185,40 @@ dependencies, the verification summary, and relevant tests. Raw logs are never
 forwarded. **Every changed file stays represented through the bounded diff even
 when its full contents are not selected** — narrowing review context never hides a
 change from the reviewer.
+
+### Review packet safety invariant
+
+> Every changed file is represented in the review packet by actual bounded change
+> evidence, or by an explicit deterministic non-text/binary representation. If
+> the configured budget cannot provide minimum representation for every changed
+> file, review packet generation fails closed rather than silently omitting
+> changes.
+
+The diff is built **per file**, never as one combined patch truncated at its
+head and tail — that older approach could drop every file between the first and
+last. Each changed file gets its own block:
+
+```text
+### `src/payments/gateway.py`
+- status: modified
+- location: staged+unstaged
+- blobs: `a1b2c3d`..`e4f5a6b`
+- content: text
+- patch sha256: `9f2c…`
+- shown: 512 of 4,096 patch characters
+```
+
+Budget allocation runs in two phases:
+
+1. **Guaranteed minimum** — every changed file is reserved real patch body first,
+   so no file can reach zero coverage.
+2. **Relevance allocation** — the remainder is water-filled smallest-need first,
+   so unused headroom flows to the files that need it. The result depends only
+   on the change set, never on input order.
+
+When even the guaranteed minimum does not fit, `sera packet review` fails with
+`review_diff_budget_insufficient` and `sera next` returns that as its state.
+Raise `max_packet_chars` or split the task.
 
 ## `sera context --why`
 
@@ -227,6 +293,30 @@ identity:
 task + evidence + reviews + HEAD + HEAD tree + working-tree delta + relevant untracked state
 ```
 
+### Review-ledger binding
+
+Acceptance composes three independent components:
+
+```text
+task_fingerprint            task + evidence + staged/unstaged delta + relevant untracked
+review_ledger_fingerprint   canonical hash of every persisted review record
+repository_identity         exact HEAD commit + HEAD tree
+        │
+        ▼
+        seal identity
+```
+
+`review_ledger_fingerprint` binds the *contents* of every review record — stage,
+verdict, reviewer, rationale, reviewed fingerprint, timestamp — in ledger order,
+not merely the stage names. Editing an accepted reviewer's identity or rationale,
+changing a verdict, deleting a required review, or appending a record all make
+the seal stale with `seal_review_mismatch`, even though the task fingerprint is
+untouched.
+
+This stays deliberately non-circular: a review records the task fingerprint it
+judged, so folding reviews back into that fingerprint would be self-referential.
+Review freshness binds the task fingerprint; acceptance binds both.
+
 `sera check --require-seal` therefore fails whenever HEAD moves, even if nothing
 else changed:
 
@@ -245,12 +335,31 @@ in `seal_required_failure_reasons`:
 | Reason | Meaning |
 | --- | --- |
 | `seal_fingerprint_mismatch` | task, evidence, or working-tree delta changed |
+| `seal_review_mismatch` | the review ledger changed after acceptance |
 | `seal_head_mismatch` | HEAD commit differs from the accepted commit |
 | `seal_head_tree_mismatch` | HEAD tree differs while the commit matches |
 | `seal_missing_head_identity` | 0.4.0 seal with no repository identity |
+| `seal_schema_unsupported` | schema version is missing or unknown |
+| `seal_schema_inconsistent` | declared version disagrees with the record's contents |
 
 `seal_status` summarises the same state as `current`, `stale_fingerprint`,
-`head_mismatch`, `legacy_unbound`, or `none`.
+`review_mismatch`, `head_mismatch`, `legacy_unbound`, `schema_unsupported`,
+`schema_inconsistent`, or `none`.
+
+### Schema enforcement
+
+The declared `schema_version` is interpreted *before* anything else, so a
+tampered version can never be validated as if it were current:
+
+| Record | Result |
+| --- | --- |
+| `2` with all required v2 fields | validated normally |
+| `2` missing `repository_identity` or `review_ledger_fingerprint` | `seal_schema_inconsistent` |
+| `1` with no v2-only fields (genuine 0.4.0) | `legacy_unbound` |
+| `1` carrying v2-only fields | `seal_schema_inconsistent` |
+| missing, or any other value | `seal_schema_unsupported` |
+
+Every non-current outcome fails `sera check --require-seal`.
 
 ### 0.4.0 seal compatibility
 
@@ -267,6 +376,29 @@ existing state model. Pre-existing dirty paths recorded at task creation stay th
 user's baseline and are not part of the delta; changes made to owned files after
 task creation are. Exact-head binding is additive — it does not replace or relax
 any dirty-worktree protection.
+
+## Configuration validation
+
+`.sera/config.json` is validated on load, before any downstream use. Expected
+mistakes surface as ordinary SERA errors on the normal CLI path — never as a
+Python traceback:
+
+```console
+$ sera map
+error: controller must be an object, got NoneType.
+
+$ sera map
+error: token_budgets.fast must be an integer, got str.
+```
+
+Types and shapes are checked for `default_mode`, `schema_version`,
+`max_builder_attempts`, `max_file_bytes`, `max_packet_chars`, `exclude_dirs`,
+`verification`, the `controller` block and its scalars, `token_budgets` and each
+mode budget, `risk_policy` and its two lists, every `lanes` entry, and `rules`.
+
+An explicit `null` is a malformed value, not an omission: omit a key entirely to
+accept its default. Numeric settings reject booleans, and budgets must be
+positive.
 
 ## Dirty worktrees
 

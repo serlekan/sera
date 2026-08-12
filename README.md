@@ -97,6 +97,11 @@ Inferred files are **candidate ownership**, not permission to edit. Confirm them
 sera task confirm
 ```
 
+Confirming ownership re-runs risk policy against the new file set. A task drafted
+low-risk and then confirmed onto `critical/**` is escalated to `assured` and
+rerouted to independent review plus the release gate — ownership changes cannot
+bypass policy.
+
 Or provide exact files up front:
 
 ```bash
@@ -157,6 +162,11 @@ its own triggers `reduce_context`.
 ```bash
 sera context --why
 ```
+
+Every changed file reaches the reviewer with its own bounded patch — SERA never
+truncates one combined diff at its ends, which used to drop the files in between.
+If the budget cannot cover every changed file, packet generation fails with
+`review_diff_budget_insufficient` rather than implying complete coverage.
 
 SERA reports why each file earned or lost its place — `selected_owned`,
 `selected_changed_file`, `selected_dependency`, `owned_not_selected`,
@@ -367,8 +377,11 @@ sera seal
 sera check --require-seal
 ```
 
-A seal binds the task, evidence, reviews, working-tree delta, relevant untracked
-state, **and the exact `HEAD` commit and tree**. A later code change makes the
+A seal binds the task, evidence, working-tree delta, relevant untracked state,
+**the review ledger that justified acceptance**, and **the exact `HEAD` commit and
+tree**. Editing an accepted reviewer, rationale, or verdict afterwards makes the
+seal stale with `seal_review_mismatch`, and a seal whose `schema_version` is
+missing, unknown, or inconsistent with its contents fails closed. A later code change makes the
 verdict and seal stale — and so does moving HEAD at all:
 
 ```bash

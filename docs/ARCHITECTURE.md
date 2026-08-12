@@ -7,8 +7,9 @@ SERA 0.4 has three layers.
 The zero-dependency Python core owns deterministic work:
 
 - content-hashed repository maps;
+- configuration validation;
 - task contracts and dirty-worktree baselines;
-- mode precedence and risk composition;
+- mode precedence and risk composition, re-derived whenever ownership changes;
 - routing inputs;
 - evidence storage;
 - review fingerprints;
@@ -59,6 +60,12 @@ score, then size, then path, and filled greedily against the file cap and the
 stage token allowance. The highest-priority candidate is always included so a
 stage is never handed empty context.
 
+Change evidence is assembled per file, not as one combined patch trimmed at its
+ends, so no changed file can be lost between the first and last. Budget is
+allocated in two phases — a guaranteed minimum for every changed file, then
+water-filled relevance for the remainder — and generation fails closed when even
+the minimum does not fit.
+
 Review selection is diff-aware. Changed files rank above unchanged owned files,
 and files imported by changed files are pulled in as dependencies using a bounded,
 language-agnostic scan of import-like lines in the changed files only. Every
@@ -79,6 +86,23 @@ Task creation records fingerprints of pre-existing dirty paths. Scope checks com
 ## Fingerprint-bound review
 
 Review validity still depends on the exact task, evidence, staged diff, unstaged diff, and relevant untracked content. Any later mutation makes a required verdict stale.
+
+## Acceptance composition
+
+Acceptance composes three independent fingerprints rather than one:
+
+```text
+task_fingerprint  +  review_ledger_fingerprint  +  repository_identity
+```
+
+`review_ledger_fingerprint` is a canonical hash of every persisted review record.
+Keeping it separate from `task_fingerprint` avoids a circular definition: reviews
+record the task fingerprint they judged, so reviews cannot also be inside it.
+Review freshness binds the task fingerprint; acceptance binds all three.
+
+Seal records are versioned, and the declared version is interpreted before any
+other field, so a relabelled or unknown schema fails closed instead of being
+validated as current.
 
 ## Exact-head acceptance
 

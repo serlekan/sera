@@ -5,6 +5,46 @@
 High-assurance controller hardening. Corrections found by integrating 0.4.0 into a
 real high-assurance repository, fixed generically rather than downstream.
 
+### Correction pass (independent review of the first 0.4.1 candidate)
+
+An exact-head independent review reproduced five defects in the first 0.4.1
+candidate. All five are corrected here.
+
+- **Ownership confirmation now re-runs risk policy.** `sera task confirm`
+  replaced `allowed_files` without re-resolving risk or mode, so a task drafted
+  low-risk and confirmed onto a high-risk path kept its fast, review-free route.
+  Creation and confirmation now share one policy resolver. Tasks persist
+  `requested_mode` / `requested_risk` separately from derived `mode` / `risk`, so
+  an explicit risk floor survives ownership changes while a transiently confirmed
+  high-risk path never makes risk permanently sticky. `risk_reasons` is rebuilt
+  from the current contract.
+- **Seals now bind the review ledger.** Acceptance recorded only review stage
+  names, so editing an accepted reviewer identity, rationale, or verdict left the
+  seal reporting `current`. Seals now carry `review_ledger_fingerprint`, a
+  canonical hash of every persisted review record. Mutating, deleting, or
+  appending review records makes the seal stale with `seal_review_mismatch`. The
+  composition stays non-circular: reviews bind the task fingerprint, acceptance
+  binds task, reviews, and repository identity.
+- **Review diffs are now per file.** One combined patch was truncated at its head
+  and tail, which could reduce every file in between to a bare filename. Change
+  evidence is now assembled per changed file with status, blob identity, patch
+  hash, and bounded body. Budget is allocated in two phases — a guaranteed
+  minimum for every changed file, then water-filled relevance — and generation
+  fails with `review_diff_budget_insufficient` rather than emitting a packet that
+  hides changes.
+- **Seal schema versions are now enforced.** A v2 record relabelled
+  `schema_version: 1` still validated as current. The declared version is now
+  interpreted first: unknown or missing versions fail with
+  `seal_schema_unsupported`, and a version that disagrees with the record's
+  contents fails with `seal_schema_inconsistent`. Genuine 0.4.0 seals still
+  report `legacy_unbound`.
+- **Malformed configuration now fails closed.** `controller: null` and
+  `token_budgets.fast: "six thousand"` escaped as uncaught `AttributeError` /
+  `ValueError` tracebacks. `validate_config` now type- and shape-checks the
+  controller block, token budgets, risk policy, lanes, rules, and scalar limits,
+  reporting ordinary SERA errors. An explicit `null` is malformed; omit a key to
+  accept its default.
+
 ### Controller
 
 - `default_mode` is now honored. One canonical resolver applies the precedence

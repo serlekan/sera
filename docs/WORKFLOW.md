@@ -18,6 +18,10 @@ SERA can draft candidate ownership, risk, mode, and context. Auto-selected owner
 sera task confirm --file src/example.py
 ```
 
+Confirming ownership re-runs risk policy against the new file set, so a task
+confirmed onto a high-risk path is escalated and rerouted rather than keeping its
+original low-risk lane.
+
 The task's mode comes from your project's `default_mode` unless you pass an
 explicit `--mode`. High-risk work — from built-in terminology or from your own
 `risk_policy` terms and paths — escalates to `assured` regardless.
@@ -35,12 +39,16 @@ each stage selects only the context it needs; see
 `sera verify` records reproducible evidence. A fresh reviewer receives the review packet, bounded diff, and evidence—not the builder conversation. It returns `ship`, `fix-first`, or `rethink`.
 
 Review context is diff-aware rather than "every owned file", but every changed
-file stays represented through the bounded diff. Narrower context, same authority.
+file stays represented through its own bounded per-file patch. Narrower context,
+same authority. If the budget cannot cover every changed file, packet generation
+fails with `review_diff_budget_insufficient` instead of quietly omitting one.
 
 ## Accept
 
-`sera seal` binds acceptance to the exact task/evidence/diff fingerprint **and the
-exact `HEAD` commit and tree**. `sera check --require-seal` rejects stale,
+`sera seal` binds acceptance to the exact task/evidence/diff fingerprint, the
+**review ledger that justified it**, and the **exact `HEAD` commit and tree**.
+Editing an accepted reviewer, rationale, or verdict after sealing makes the seal
+stale with `seal_review_mismatch`. `sera check --require-seal` rejects stale,
 unsealed, or moved-HEAD work:
 
 ```bash
