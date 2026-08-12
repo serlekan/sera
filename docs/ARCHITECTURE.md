@@ -99,8 +99,11 @@ constraints, verification. Generated content is excluded, so an artifact can be
 compared against the contract that produced it without circularity.
 
 Packet provenance is stored adjacent to each packet rather than parsed back out
-of markdown. Existence never implies freshness: missing, malformed, or mismatched
-provenance fails closed and forces regeneration. Verification evidence carries
+of markdown. Existence never implies freshness, and neither does recorded
+metadata: the task contract, the resolved route (selected lane, provider, and
+model per required stage), and the SHA-256 of the packet's exact bytes are all
+recomputed at validation time and compared. Missing, malformed, or mismatched
+bindings fail closed and force regeneration. Verification evidence carries
 the same binding, so evidence gathered under a superseded contract stops
 satisfying it while remaining in the ledger for audit.
 

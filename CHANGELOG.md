@@ -5,6 +5,28 @@
 High-assurance controller hardening. Corrections found by integrating 0.4.0 into a
 real high-assurance repository, fixed generically rather than downstream.
 
+### Third correction pass (packet integrity)
+
+A third exact-head review confirmed all prior blockers fixed and reproduced one
+P1: packet provenance recorded a route but never validated it, so rewriting the
+stored route to `release_gate` for every stage left the packet `current` and
+still dispatchable. Packet Markdown could likewise be edited without
+invalidation.
+
+- Packet freshness is now `contract + state (review only) + resolved route +
+  content`. `packet_state` independently re-resolves the current route — the
+  selected lane, provider, and model for every stage the task requires — and
+  re-hashes it, rather than trusting the stored object. Mismatch, or a route
+  that can no longer be resolved, yields `packet_stale_route`.
+- Only selected stages are bound, so changing an unrelated lane does not
+  invalidate a packet while changing the selected model, provider, or lane does.
+- Provenance now carries `content_sha256` over the exact bytes written to disk,
+  recomputed at validation time. A tampered packet body yields
+  `packet_content_mismatch`; the checksum embedded inside the Markdown is not
+  trusted, so rewriting body and embedded checksum together still fails.
+- Packet provenance schema is version 2; a packet lacking either binding fails
+  closed as `packet_unbound`.
+
 ### Second correction pass (independent review of the corrected candidate)
 
 A second exact-head independent review confirmed the five earlier blockers were

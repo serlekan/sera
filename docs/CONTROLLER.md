@@ -280,20 +280,41 @@ Each generated packet is written alongside machine-readable provenance in
 }
 ```
 
-A packet is current only when its provenance parses, its schema version and
-type match, its task ID matches, and its contract fingerprint equals the task's
-current one. A review packet additionally binds the task/evidence/delta
-`state_fingerprint`, because it embeds the diff and evidence; a build packet does
-not.
+Freshness is:
 
-Anything else fails closed:
+```text
+contract + state (review packets only) + resolved route + content
+```
+
+Recorded metadata is never trusted on its own. Each identity is recomputed from
+current state and compared:
+
+- **contract** — recomputed from the task;
+- **state** — the task/evidence/delta fingerprint a review packet embeds;
+- **route** — the *currently* resolved lane, provider, and model for every stage
+  this task requires, re-derived from task and configuration and re-hashed. The
+  `route` object in provenance is diagnostics only; editing it changes nothing.
+  Only selected stages are bound, so changing an unused lane does not invalidate
+  a packet, while changing the selected model, provider, or lane does;
+- **content** — SHA-256 of the exact bytes written to `packet-<stage>.md`. The
+  checksum embedded inside the Markdown is not the authority; provenance is the
+  integrity envelope, so rewriting the body and its embedded checksum together
+  still fails.
+
+Validation is ordered, and every failure is a closed one:
+
+```text
+missing -> unbound -> contract -> state -> route -> content -> current
+```
 
 | Reason | Meaning |
 | --- | --- |
 | `packet_missing` | no packet has been generated |
-| `packet_unbound` | provenance absent, unparseable, or for a different task/stage |
+| `packet_unbound` | provenance absent, unparseable, or missing a required binding |
 | `packet_stale_contract` | the task contract changed after generation |
 | `packet_stale_state` | review packet's embedded diff/evidence state moved on |
+| `packet_stale_route` | the resolved route changed, or can no longer be resolved |
+| `packet_content_mismatch` | the packet bytes differ from what was generated |
 
 So a semantic task mutation — ownership confirmation being the common one —
 invalidates the previous build packet, the previous review packet, and rewrites
