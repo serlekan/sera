@@ -21,11 +21,22 @@ RISK_LEVELS = ("low", "medium", "high")
 RISK_RANK = {"low": 1, "medium": 2, "high": 3}
 
 SEAL_SCHEMA_VERSION = 2
+SEAL_LEGACY_SCHEMA_VERSION = 1
 SEAL_FINGERPRINT_MISMATCH = "seal_fingerprint_mismatch"
 SEAL_HEAD_MISMATCH = "seal_head_mismatch"
 SEAL_HEAD_TREE_MISMATCH = "seal_head_tree_mismatch"
 SEAL_MISSING_HEAD_IDENTITY = "seal_missing_head_identity"
+SEAL_REVIEW_MISMATCH = "seal_review_mismatch"
+SEAL_SCHEMA_UNSUPPORTED = "seal_schema_unsupported"
+SEAL_SCHEMA_INCONSISTENT = "seal_schema_inconsistent"
+SEAL_V2_REQUIRED_FIELDS = ("task_id", "sealed_at", "fingerprint", "repository_identity", "review_ledger_fingerprint")
+SEAL_V2_ONLY_FIELDS = ("repository_identity", "review_ledger_fingerprint")
 UNBORN_HEAD = "unborn"
+
+REVIEW_DIFF_BUDGET_INSUFFICIENT = "review_diff_budget_insufficient"
+# Every changed file is guaranteed at least this many characters of real patch
+# body before any remaining review-diff budget is distributed by relevance.
+MIN_FILE_DIFF_CHARS = 320
 
 HIGH_RISK_TERMS = {
     "auth", "authentication", "authorization", "balance", "cryptography", "deploy", "deployment",
@@ -339,6 +350,45 @@ def assess_risk(
     return {"risk": level, "reasons": reasons}
 
 
+def resolve_task_policy(config: dict[str, Any] | None, task: dict[str, Any]) -> dict[str, Any]:
+    """Derive effective mode and risk from a task's *current* contract.
+
+    This is the single policy evaluation shared by task creation and ownership
+    confirmation, so changing confirmed ownership cannot bypass risk policy.
+
+    Derivation always starts from the task's persisted *requested* inputs —
+    `requested_mode` and `requested_risk` — never from a previously derived
+    value. That keeps a transiently confirmed high-risk path from making risk
+    permanently sticky, while an explicit `requested_risk` remains a floor that
+    survives any later ownership change.
+    """
+    requested_mode = task.get("requested_mode")
+    requested_risk = task.get("requested_risk")
+    resolved_mode, mode_source = resolve_mode(config, requested_mode)
+    assessment = assess_risk(
+        config,
+        task.get("objective", ""),
+        list(task.get("allowed_files", [])),
+        explicit_risk=requested_risk,
+    )
+    risk = assessment["risk"]
+    mode = escalate_mode_for_risk(resolved_mode, risk)
+    reasons = list(assessment["reasons"])
+    if mode != resolved_mode:
+        reasons.append({"type": "mode_escalation", "value": mode})
+    return {"mode": mode, "mode_source": mode_source, "risk": risk, "risk_reasons": reasons}
+
+
+def apply_task_policy(config: dict[str, Any] | None, task: dict[str, Any]) -> dict[str, Any]:
+    """Recompute and write effective policy onto a task contract in place."""
+    policy = resolve_task_policy(config, task)
+    task["mode"] = policy["mode"]
+    task["mode_source"] = policy["mode_source"]
+    task["risk"] = policy["risk"]
+    task["risk_reasons"] = policy["risk_reasons"]
+    return policy
+
+
 def format_risk_reason(reason: dict[str, str]) -> str:
     kind = reason.get("type", "")
     value = reason.get("value", "")
@@ -417,20 +467,80 @@ def load_config(root: Path) -> dict[str, Any]:
     return merged
 
 
+def _require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SeraError(f"{label} must be an object, got {type(value).__name__}.")
+    return value
+
+
+def _require_int(container: dict[str, Any], key: str, label: str, minimum: int = 1) -> None:
+    if key not in container:
+        return
+    value = container[key]
+    # bool is a subclass of int; a flag is never a valid numeric setting.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SeraError(f"{label} must be an integer, got {type(value).__name__}.")
+    if value < minimum:
+        raise SeraError(f"{label} must be >= {minimum}, got {value}.")
+
+
+def _require_bool(container: dict[str, Any], key: str, label: str) -> None:
+    if key in container and not isinstance(container[key], bool):
+        raise SeraError(f"{label} must be true or false, got {type(container[key]).__name__}.")
+
+
+def _require_string_list(container: dict[str, Any], key: str, label: str) -> None:
+    value = container.get(key, [])
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise SeraError(f"{label} must be a list of strings.")
+
+
 def validate_config(config: dict[str, Any]) -> None:
-    """Fail closed on configuration SERA cannot honor deterministically."""
+    """Fail closed on configuration SERA cannot honor deterministically.
+
+    Every expected mistake must surface as a `SeraError` on the normal CLI error
+    path. An explicit `null` is a malformed value, not an omission: omit a key
+    entirely to accept its default.
+    """
+    _require_mapping(config, "configuration")
     resolve_mode(config)
-    policy = config.get("risk_policy", {})
-    if not isinstance(policy, dict):
-        raise SeraError("risk_policy must be an object with high_risk_terms and high_risk_paths.")
-    for key in ("high_risk_terms", "high_risk_paths"):
-        value = policy.get(key, [])
-        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-            raise SeraError(f"risk_policy.{key} must be a list of strings.")
-    budgets = config.get("token_budgets", {})
+    _require_int(config, "schema_version", "schema_version", minimum=1)
+    _require_int(config, "max_builder_attempts", "max_builder_attempts", minimum=1)
+    _require_int(config, "max_file_bytes", "max_file_bytes", minimum=1)
+    _require_int(config, "max_packet_chars", "max_packet_chars", minimum=1)
+    _require_string_list(config, "exclude_dirs", "exclude_dirs")
+    _require_string_list(config, "verification", "verification")
+
+    controller = _require_mapping(config.get("controller", {}), "controller")
+    _require_int(controller, "context_max_files", "controller.context_max_files", minimum=1)
+    _require_int(controller, "context_min_score", "controller.context_min_score", minimum=0)
+    _require_bool(controller, "enforce_context_budget", "controller.enforce_context_budget")
+    _require_bool(controller, "auto_risk", "controller.auto_risk")
+
+    policy = _require_mapping(config.get("risk_policy", {}), "risk_policy")
+    _require_string_list(policy, "high_risk_terms", "risk_policy.high_risk_terms")
+    _require_string_list(policy, "high_risk_paths", "risk_policy.high_risk_paths")
+
+    budgets = _require_mapping(config.get("token_budgets", {}), "token_budgets")
     for mode in VALID_MODES:
         if mode not in budgets:
             raise SeraError(f"token_budgets is missing the {mode!r} mode budget.")
+        _require_int(budgets, mode, f"token_budgets.{mode}", minimum=1)
+
+    lanes = _require_mapping(config.get("lanes", {}), "lanes")
+    for name, lane in lanes.items():
+        _require_mapping(lane, f"lanes.{name}")
+        _require_bool(lane, "enabled", f"lanes.{name}.enabled")
+        _require_bool(lane, "may_be_sole_release_gate", f"lanes.{name}.may_be_sole_release_gate")
+        for field in ("provider", "model"):
+            if field in lane and not isinstance(lane[field], str):
+                raise SeraError(f"lanes.{name}.{field} must be a string.")
+        _require_string_list(lane, "allowed_uses", f"lanes.{name}.allowed_uses")
+
+    rules = _require_mapping(config.get("rules", {}), "rules")
+    for name, value in rules.items():
+        if not isinstance(value, bool):
+            raise SeraError(f"rules.{name} must be true or false.")
 
 
 def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -709,13 +819,19 @@ def new_task(
         raise SeraError("Objective cannot be empty.")
     config = load_config(root)
     owned = sorted({normalize_repo_path(path) for path in (allowed_files or [])})
-    resolved_mode, mode_source = resolve_mode(config, mode)
-    assessment = assess_risk(config, objective, owned, explicit_risk=risk)
-    final_risk = assessment["risk"]
-    final_mode = escalate_mode_for_risk(resolved_mode, final_risk)
-    risk_reasons = list(assessment["reasons"])
-    if final_mode != resolved_mode:
-        risk_reasons.append({"type": "mode_escalation", "value": final_mode})
+    requested_mode = None if mode in (None, "auto") else mode
+    requested_risk = None if risk in (None, "auto") else risk
+    # Validate explicit inputs eagerly so a bad flag fails at creation.
+    resolve_mode(config, requested_mode)
+    if requested_risk is not None and requested_risk not in RISK_LEVELS:
+        raise SeraError(f"Risk must be {', '.join(RISK_LEVELS)}.")
+    draft = {
+        "objective": objective.strip(),
+        "allowed_files": owned,
+        "requested_mode": requested_mode,
+        "requested_risk": requested_risk,
+    }
+    policy = resolve_task_policy(config, draft)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     tasks_root = state_path(root) / "tasks"
     base_id = f"{timestamp}-{slugify(name)}"
@@ -733,10 +849,12 @@ def new_task(
         "id": task_id,
         "name": name,
         "created_at": utc_now(),
-        "mode": final_mode,
-        "mode_source": mode_source,
-        "risk": final_risk,
-        "risk_reasons": risk_reasons,
+        "mode": policy["mode"],
+        "mode_source": policy["mode_source"],
+        "requested_mode": requested_mode,
+        "risk": policy["risk"],
+        "requested_risk": requested_risk,
+        "risk_reasons": policy["risk_reasons"],
         "uncertainty": max(0, min(3, int(uncertainty))),
         "use_case": use_case,
         "objective": objective.strip(),
@@ -952,30 +1070,220 @@ def changed_files(root: Path) -> list[str]:
     return sorted(set(paths))
 
 
-def compact_diff(root: Path, allowed_files: list[str], max_chars: int) -> str:
-    args = ["diff", "--no-ext-diff", "--unified=3", "--"]
-    args.extend(allowed_files)
-    diff = run_git(root, *args, check=False)
-    staged_args = ["diff", "--cached", "--no-ext-diff", "--unified=3", "--"]
-    staged_args.extend(allowed_files)
-    staged = run_git(root, *staged_args, check=False)
-    if staged:
-        diff += "\n# STAGED CHANGES\n" + staged
+_STATUS_LABELS = {"M": "modified", "A": "added", "D": "deleted", "R": "renamed", "C": "copied", "T": "type-changed"}
+
+
+def _parse_raw_z(output: str) -> list[dict[str, Any]]:
+    """Parse `git diff --raw -z` records into path/status/blob identity."""
+    items = output.split("\0")
+    records: list[dict[str, Any]] = []
+    index = 0
+    while index < len(items):
+        meta = items[index]
+        index += 1
+        if not meta.startswith(":"):
+            continue
+        fields = meta[1:].split()
+        if len(fields) < 5:
+            continue
+        status = fields[4]
+        source = items[index] if index < len(items) else ""
+        index += 1
+        destination = ""
+        if status[:1] in {"R", "C"}:
+            destination = items[index] if index < len(items) else ""
+            index += 1
+        records.append(
+            {
+                "status": status,
+                "old_sha": fields[2],
+                "new_sha": fields[3],
+                "path": normalize_repo_path(destination or source),
+                "old_path": normalize_repo_path(source) if destination else None,
+            }
+        )
+    return records
+
+
+def _collect_changed_files(root: Path, allowed_files: list[str]) -> list[dict[str, Any]]:
+    """Build one change record per changed owned file, staged and unstaged.
+
+    Records are keyed and returned by path so no file can be lost between the
+    beginning and end of a combined patch.
+    """
+    if not allowed_files:
+        return []
+    changes: dict[str, dict[str, Any]] = {}
+    for cached in (False, True):
+        args = ["diff", "--no-ext-diff", "--raw", "-M", "-z"]
+        if cached:
+            args.insert(1, "--cached")
+        raw = run_git(root, *args, "--", *allowed_files, check=False)
+        for record in _parse_raw_z(raw):
+            entry = changes.setdefault(
+                record["path"],
+                {
+                    "path": record["path"],
+                    "status": record["status"],
+                    "old_path": record["old_path"],
+                    "old_sha": record["old_sha"],
+                    "new_sha": record["new_sha"],
+                    "staged": False,
+                    "unstaged": False,
+                    "patch": "",
+                    "binary": False,
+                },
+            )
+            entry["staged" if cached else "unstaged"] = True
+            if record["old_path"]:
+                entry["old_path"] = record["old_path"]
+                entry["status"] = record["status"]
+
+    for path, entry in changes.items():
+        sections: list[str] = []
+        for cached in (False, True):
+            if not entry["staged" if cached else "unstaged"]:
+                continue
+            args = ["diff", "--no-ext-diff", "--unified=3", "-M"]
+            if cached:
+                args.insert(1, "--cached")
+            patch = run_git(root, *args, "--", path, check=False)
+            if patch.strip():
+                label = "staged" if cached else "unstaged"
+                sections.append(f"# {label}\n{patch}")
+        entry["patch"] = "\n".join(sections)
+        entry["binary"] = "Binary files" in entry["patch"] or "GIT binary patch" in entry["patch"]
+
     tracked = set(run_git(root, "ls-files").splitlines())
     for relative in allowed_files:
         path = root / relative
-        if relative not in tracked and path.is_file():
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            diff += f"\n# UNTRACKED FILE: {relative}\n" + content + "\n"
-    if len(diff) <= max_chars:
-        return diff
-    head = diff[: max_chars // 2]
-    tail = diff[-max_chars // 2 :]
-    omitted = len(diff) - len(head) - len(tail)
-    return head + f"\n\n... {omitted} characters omitted by packet budget ...\n\n" + tail
+        if relative in changes or relative in tracked or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        binary = b"\x00" in data[:2048]
+        if binary:
+            body = f"Binary untracked file, {len(data)} bytes, sha256 {sha256_bytes(data)[:16]}"
+        else:
+            body = data.decode("utf-8", errors="replace")
+        changes[relative] = {
+            "path": relative,
+            "status": "A",
+            "old_path": None,
+            "old_sha": "0" * 7,
+            "new_sha": sha256_bytes(data)[:7],
+            "staged": False,
+            "unstaged": True,
+            "patch": f"# untracked\n{body}",
+            "binary": binary,
+        }
+    return [changes[key] for key in sorted(changes)]
+
+
+def _render_change_header(entry: dict[str, Any], shown: int, total: int) -> str:
+    status = _STATUS_LABELS.get(entry["status"][:1], entry["status"])
+    where = "+".join(part for part, flag in (("staged", entry["staged"]), ("unstaged", entry["unstaged"])) if flag)
+    lines = [
+        f"### `{entry['path']}`",
+        f"- status: {status}" + (f" (from `{entry['old_path']}`)" if entry.get("old_path") else ""),
+        f"- location: {where or 'none'}",
+        f"- blobs: `{entry['old_sha']}`..`{entry['new_sha']}`",
+        f"- content: {'binary/non-text' if entry['binary'] else 'text'}",
+        f"- patch sha256: `{sha256_text(entry['patch'])[:16]}`",
+        f"- shown: {shown:,} of {total:,} patch characters",
+    ]
+    return "\n".join(lines)
+
+
+def _allocate_diff_budget(needs: list[int], budget: int, floor: int) -> list[int]:
+    """Water-fill allocation: guarantee each file its floor, then spread the rest.
+
+    Files are filled smallest-need first so unused headroom flows to the files
+    that actually need it, and the result depends only on the needs, never on
+    input order.
+    """
+    allocation = [0] * len(needs)
+    remaining = budget
+    left = len(needs)
+    for index in sorted(range(len(needs)), key=lambda i: (needs[i], i)):
+        guaranteed = min(needs[index], floor)
+        share = max(guaranteed, remaining // left) if left else guaranteed
+        take = min(needs[index], share)
+        allocation[index] = take
+        remaining -= take
+        left -= 1
+    return allocation
+
+
+def _bound_patch(patch: str, allowance: int) -> str:
+    if len(patch) <= allowance:
+        return patch
+    head = patch[: max(1, (allowance * 3) // 5)]
+    tail = patch[-max(1, allowance - len(head)) :]
+    omitted = len(patch) - len(head) - len(tail)
+    return f"{head}\n... {omitted:,} characters omitted from this file by review budget ...\n{tail}"
+
+
+def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -> dict[str, Any]:
+    """Render a per-file review diff in which no changed file can be omitted.
+
+    Budgeting runs in two phases: every changed file is first guaranteed a
+    minimum of real patch body, and only the remainder is distributed by
+    relevance. When even the guaranteed minimum does not fit, this reports
+    failure instead of emitting a packet that looks complete.
+    """
+    entries = _collect_changed_files(root, allowed_files)
+    if not entries:
+        return {
+            "ok": True,
+            "text": "No task-relative changes to review.",
+            "files": [],
+            "required_chars": 0,
+            "reason": None,
+        }
+
+    headers = [_render_change_header(entry, 0, len(entry["patch"])) for entry in entries]
+    overhead = sum(len(header) + 24 for header in headers)
+    needs = [len(entry["patch"]) for entry in entries]
+    required = overhead + sum(min(need, MIN_FILE_DIFF_CHARS) for need in needs)
+    if max_chars < required:
+        return {
+            "ok": False,
+            "text": "",
+            "files": [entry["path"] for entry in entries],
+            "required_chars": required,
+            "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
+        }
+
+    allocation = _allocate_diff_budget(needs, max(0, max_chars - overhead), MIN_FILE_DIFF_CHARS)
+    blocks: list[str] = []
+    covered: list[dict[str, Any]] = []
+    for entry, allowance, need in zip(entries, allocation, needs):
+        body = _bound_patch(entry["patch"], allowance)
+        blocks.append(_render_change_header(entry, min(allowance, need), need) + "\n\n```diff\n" + body + "\n```")
+        covered.append({"path": entry["path"], "shown_chars": min(allowance, need), "total_chars": need})
+    return {
+        "ok": True,
+        "text": "\n\n".join(blocks),
+        "files": [entry["path"] for entry in entries],
+        "covered": covered,
+        "required_chars": required,
+        "reason": None,
+    }
+
+
+def compact_diff(root: Path, allowed_files: list[str], max_chars: int) -> str:
+    """Per-file review diff, or a controlled failure when coverage cannot fit."""
+    coverage = review_diff_coverage(root, allowed_files, max_chars)
+    if not coverage["ok"]:
+        raise SeraError(
+            f"{coverage['reason']}: reviewing {len(coverage['files'])} changed files needs at least "
+            f"{coverage['required_chars']:,} characters but max_packet_chars is {max_chars:,}. "
+            "Raise max_packet_chars or split the task; SERA will not emit a review packet that hides changes."
+        )
+    return coverage["text"]
 
 
 def read_ledger(task_dir: Path) -> list[dict[str, Any]]:
@@ -1104,11 +1412,12 @@ def generate_packet(
             "",
             *([f"- `{item}`" for item in task_changed_files(root, task)] or ["- No task-relative working-tree changes detected."]),
             "",
-            "## Compact diff",
+            "## Per-file change evidence",
             "",
-            "```diff",
+            "Each changed file below carries bounded patch material of its own. If the budget",
+            "could not cover every changed file, this packet would have failed instead.",
+            "",
             compact_diff(root, task["allowed_files"], int(config["max_packet_chars"])),
-            "```",
             "",
             "## Required verdict",
             "",
@@ -1212,6 +1521,22 @@ def read_reviews(task_dir: Path) -> list[dict[str, Any]]:
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
+def review_ledger_fingerprint(task_dir: Path) -> str:
+    """Canonical fingerprint of the full review ledger for a task.
+
+    Binds every persisted field of every review record — stage, verdict,
+    reviewer, rationale, reviewed fingerprint, timestamp — in ledger order,
+    not merely the stage names. Serialization is canonical JSON so the value is
+    stable across runs.
+
+    This deliberately lives outside `task_fingerprint`: reviews record the task
+    fingerprint they judged, so folding reviews back into that fingerprint would
+    be circular. Acceptance composes the two instead.
+    """
+    records = read_reviews(task_dir)
+    return sha256_text(json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
 def generate_summary(root: Path, task_dir: Path) -> tuple[Path, str]:
     task = load_task(task_dir)
     result = check_task(root, task_dir)
@@ -1266,33 +1591,67 @@ def evaluate_seal(
     seal: dict[str, Any] | None,
     fingerprint: str,
     head_identity: dict[str, str],
+    review_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Decide whether a seal still describes the exact reviewed repository state.
 
-    A 0.4.1 seal binds the task/evidence/delta fingerprint *and* the exact HEAD
-    commit and tree. A 0.4.0 seal carries no repository identity, so it can
-    never be treated as an exact-head acceptance; it fails closed with
-    `seal_missing_head_identity` and must be re-sealed under 0.4.1.
+    The declared schema version is interpreted *before* anything else, so a
+    tampered or unknown version can never be validated as if it were current.
+
+    - `schema_version: 2` must carry every required v2 field, and then binds the
+      task/evidence/delta fingerprint, the review ledger, and the exact HEAD
+      commit and tree.
+    - `schema_version: 1` is a genuine 0.4.0 seal only when it carries no
+      v2-only fields; it reports `legacy_unbound` and fails closed.
+    - A v1 record carrying v2-only fields, a v2 record missing required fields,
+      a missing version, and any unknown version all fail closed.
     """
     if not seal:
         return {"status": "none", "stale": False, "reasons": []}
+
+    version = seal.get("schema_version")
+    present_v2_only = [field for field in SEAL_V2_ONLY_FIELDS if field in seal]
+
+    if version == SEAL_LEGACY_SCHEMA_VERSION:
+        if present_v2_only:
+            return {
+                "status": "schema_inconsistent",
+                "stale": True,
+                "reasons": [SEAL_SCHEMA_INCONSISTENT],
+            }
+        return {
+            "status": "legacy_unbound",
+            "stale": True,
+            "reasons": [SEAL_MISSING_HEAD_IDENTITY],
+        }
+
+    if version != SEAL_SCHEMA_VERSION:
+        return {"status": "schema_unsupported", "stale": True, "reasons": [SEAL_SCHEMA_UNSUPPORTED]}
+
+    missing = [field for field in SEAL_V2_REQUIRED_FIELDS if seal.get(field) in (None, "")]
+    identity = seal.get("repository_identity")
+    if not isinstance(identity, dict) or not identity.get("head_sha") or not identity.get("head_tree_sha"):
+        if "repository_identity" not in missing:
+            missing.append("repository_identity")
+    if missing:
+        return {"status": "schema_inconsistent", "stale": True, "reasons": [SEAL_SCHEMA_INCONSISTENT]}
+
     reasons: list[str] = []
     if seal.get("fingerprint") != fingerprint:
         reasons.append(SEAL_FINGERPRINT_MISMATCH)
-    identity = seal.get("repository_identity")
-    if not isinstance(identity, dict) or not identity.get("head_sha"):
-        reasons.append(SEAL_MISSING_HEAD_IDENTITY)
-    elif identity.get("head_sha") != head_identity.get("head_sha"):
+    if review_fingerprint is not None and seal.get("review_ledger_fingerprint") != review_fingerprint:
+        reasons.append(SEAL_REVIEW_MISMATCH)
+    if identity.get("head_sha") != head_identity.get("head_sha"):
         reasons.append(SEAL_HEAD_MISMATCH)
     elif identity.get("head_tree_sha") != head_identity.get("head_tree_sha"):
         reasons.append(SEAL_HEAD_TREE_MISMATCH)
 
     if not reasons:
         status = "current"
-    elif reasons == [SEAL_MISSING_HEAD_IDENTITY]:
-        status = "legacy_unbound"
     elif SEAL_HEAD_MISMATCH in reasons or SEAL_HEAD_TREE_MISMATCH in reasons:
         status = "head_mismatch"
+    elif SEAL_REVIEW_MISMATCH in reasons:
+        status = "review_mismatch"
     else:
         status = "stale_fingerprint"
     return {"status": status, "stale": bool(reasons), "reasons": reasons}
@@ -1310,6 +1669,7 @@ def create_seal(root: Path, task_dir: Path) -> dict[str, Any]:
         "sealed_at": utc_now(),
         "fingerprint": result["fingerprint"],
         "repository_identity": result["head_identity"],
+        "review_ledger_fingerprint": result["review_ledger_fingerprint"],
         "evidence_records": len(read_ledger(task_dir)),
         "review_stages": sorted(result["reviews"].keys()),
         "changed_files": result["changed_files"],
@@ -1366,10 +1726,21 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
     seal_path = task_dir / "seal.json"
     seal = json.loads(seal_path.read_text(encoding="utf-8")) if seal_path.exists() else None
     head_identity = git_head_identity(root)
-    seal_state = evaluate_seal(seal, fingerprint, head_identity)
+    review_fingerprint = review_ledger_fingerprint(task_dir)
+    seal_state = evaluate_seal(seal, fingerprint, head_identity, review_fingerprint)
     seal_stale = seal_state["stale"]
     if ok and seal_stale:
-        if seal_state["status"] == "head_mismatch":
+        if seal_state["status"] == "review_mismatch":
+            next_action = (
+                "The review ledger changed after acceptance; this seal no longer binds the reviews "
+                "that justified it. Re-review and seal the current records."
+            )
+        elif seal_state["status"] in {"schema_unsupported", "schema_inconsistent"}:
+            next_action = (
+                "This seal's schema version is unsupported or inconsistent with its contents. "
+                "Create a new SERA Seal."
+            )
+        elif seal_state["status"] == "head_mismatch":
             next_action = (
                 "HEAD moved after acceptance; this seal no longer describes the current commit. "
                 "Re-review and seal the exact current repository identity."
@@ -1390,6 +1761,7 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         "missing_verification": missing_verification,
         "fingerprint": fingerprint,
         "head_identity": head_identity,
+        "review_ledger_fingerprint": review_fingerprint,
         "required_review_stages": required_review_stages,
         "reviews": latest_by_stage,
         "missing_reviews": missing_reviews,

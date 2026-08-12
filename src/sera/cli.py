@@ -449,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Sealed {seal['task_id']} at fingerprint {seal['fingerprint'][:16]}")
             print(f"Bound to HEAD {seal['repository_identity']['head_sha']}")
             print(f"Bound to HEAD tree {seal['repository_identity']['head_tree_sha']}")
+            print(f"Bound to review ledger {seal['review_ledger_fingerprint'][:16]}")
             return 0
         if args.command in {"check", "status"}:
             result = check_task(root, task_dir)

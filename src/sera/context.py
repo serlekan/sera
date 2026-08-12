@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    compact_diff,
     decide_route,
     estimate_tokens,
     load_config,
@@ -23,6 +22,7 @@ from .core import (
     normalize_repo_path,
     ownership_summary,
     read_ledger,
+    review_diff_coverage,
     task_changed_files,
     text_tokens,
     utc_now,
@@ -300,10 +300,18 @@ def select_task_context(
     changed: list[str] = []
     diff_tokens = 0
     evidence_tokens = 0
+    diff_ok = True
+    diff_reason: str | None = None
+    diff_required_chars = 0
     if stage == "review":
         changed = task_changed_files(root, task)
-        diff = compact_diff(root, task["allowed_files"], int(config["max_packet_chars"]))
-        diff_tokens = estimate_tokens(diff) if diff else 0
+        # Non-raising here: `sera next` must report an insufficient review-diff
+        # budget as a controller state rather than crashing.
+        coverage = review_diff_coverage(root, task["allowed_files"], int(config["max_packet_chars"]))
+        diff_ok = coverage["ok"]
+        diff_reason = coverage["reason"]
+        diff_required_chars = coverage["required_chars"]
+        diff_tokens = estimate_tokens(coverage["text"]) if coverage["text"] else 0
         ledger = read_ledger(task_dir)
         evidence_tokens = estimate_tokens(json.dumps(ledger, sort_keys=True)) if ledger else 0
 
@@ -333,5 +341,8 @@ def select_task_context(
     report["budget_overage_tokens"] = max(0, total - route.budget_tokens)
     report["changed_files"] = changed
     report["ownership"] = ownership_summary(task, repo_map)
-    report["changed_files_covered_by_diff"] = bool(changed) and diff_tokens > 0
+    report["changed_files_covered_by_diff"] = diff_ok
+    report["review_diff_ok"] = diff_ok
+    report["review_diff_reason"] = diff_reason
+    report["review_diff_required_chars"] = diff_required_chars
     return report

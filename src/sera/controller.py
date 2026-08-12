@@ -197,6 +197,15 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         action, command, reason = "resolve_ownership", None, "No exact owned files are defined."
     elif controller.get("auto_drafted") and not controller.get("ownership_confirmed", False):
         action, command, reason = "confirm_ownership", "sera task confirm", "Auto-selected files are candidates until the controller confirms exact ownership."
+    elif stage == "review" and not stage_context.get("review_diff_ok", True):
+        # Fail closed rather than hand a reviewer a packet that hides changes.
+        action, command, reason = (
+            "review_diff_budget_insufficient",
+            None,
+            f"Covering every changed file needs at least "
+            f"{stage_context['review_diff_required_chars']:,} characters of review diff, which exceeds "
+            f"max_packet_chars. Raise max_packet_chars or split the task.",
+        )
     elif config.get("controller", {}).get("enforce_context_budget", True) and not stage_context["within_budget"]:
         # Budget is measured against the context selected for the required next
         # stage, never against the full ownership set.

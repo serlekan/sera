@@ -14,6 +14,9 @@ from sera.core import (
     SEAL_FINGERPRINT_MISMATCH,
     SEAL_HEAD_MISMATCH,
     SEAL_MISSING_HEAD_IDENTITY,
+    SEAL_REVIEW_MISMATCH,
+    SEAL_SCHEMA_INCONSISTENT,
+    SEAL_SCHEMA_UNSUPPORTED,
     SEAL_SCHEMA_VERSION,
     build_repo_map,
     check_task,
@@ -22,6 +25,7 @@ from sera.core import (
     initialize,
     new_task,
     record_review,
+    review_ledger_fingerprint,
     task_fingerprint,
 )
 
@@ -33,7 +37,9 @@ def git(root: Path, *args: str) -> str:
     return result.stdout
 
 
-class SealHeadBindingTests(unittest.TestCase):
+class SealRepository:
+    """A sealed single-file task on a one-commit repository."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -71,6 +77,8 @@ class SealHeadBindingTests(unittest.TestCase):
         record_review(task_dir, fingerprint, "ship", "reviewer", "correct")
         return task_dir, create_seal(self.root, task_dir)
 
+
+class SealHeadBindingTests(SealRepository, unittest.TestCase):
     def test_seal_records_exact_head_and_tree(self) -> None:
         task_dir, seal = self.seal_task()
         identity = git_head_identity(self.root)
@@ -193,6 +201,166 @@ class SealHeadBindingTests(unittest.TestCase):
         self.assertTrue(check_task(self.root, task_dir)["seal_stale"])
         create_seal(self.root, task_dir)
         self.assertFalse(check_task(self.root, task_dir)["seal_stale"])
+
+
+class SealReviewBindingTests(SealRepository, unittest.TestCase):
+    """Reproduces the acceptance defect: editing the accepted reviewer or
+    rationale left the seal reporting `current`."""
+
+    def rewrite_reviews(self, task_dir: Path, mutate) -> None:
+        path = task_dir / "reviews.jsonl"
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        mutate(records)
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records), encoding="utf-8"
+        )
+
+    def test_seal_records_the_review_ledger_fingerprint(self) -> None:
+        task_dir, seal = self.seal_task()
+        self.assertEqual(seal["review_ledger_fingerprint"], review_ledger_fingerprint(task_dir))
+        self.assertEqual(len(seal["review_ledger_fingerprint"]), 64)
+
+    def test_changing_the_reviewer_identity_invalidates_the_seal(self) -> None:
+        task_dir, _ = self.seal_task()
+        before = check_task(self.root, task_dir)
+        self.rewrite_reviews(task_dir, lambda records: records[0].__setitem__("reviewer", "someone-else"))
+        after = check_task(self.root, task_dir)
+        # The task/evidence/delta fingerprint is untouched; only review binding catches this.
+        self.assertEqual(before["fingerprint"], after["fingerprint"])
+        self.assertTrue(after["seal_stale"])
+        self.assertEqual(after["seal_status"], "review_mismatch")
+        self.assertEqual(after["seal_stale_reasons"], [SEAL_REVIEW_MISMATCH])
+
+    def test_changing_the_rationale_invalidates_the_seal(self) -> None:
+        task_dir, _ = self.seal_task()
+        self.rewrite_reviews(task_dir, lambda records: records[0].__setitem__("reason", "rewritten rationale"))
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertIn(SEAL_REVIEW_MISMATCH, result["seal_stale_reasons"])
+
+    def test_changing_the_verdict_invalidates_the_seal(self) -> None:
+        task_dir, _ = self.seal_task()
+        self.rewrite_reviews(task_dir, lambda records: records[0].__setitem__("verdict", "rethink"))
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertIn(SEAL_REVIEW_MISMATCH, result["seal_stale_reasons"])
+
+    def test_deleting_a_required_review_invalidates_the_seal(self) -> None:
+        task_dir, _ = self.seal_task()
+        (task_dir / "reviews.jsonl").write_text("", encoding="utf-8")
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertIn(SEAL_REVIEW_MISMATCH, result["seal_stale_reasons"])
+        self.assertFalse(result["ok"])
+        self.assertIn("independent", result["missing_reviews"])
+
+    def test_appending_a_review_record_invalidates_the_seal(self) -> None:
+        task_dir, _ = self.seal_task()
+        fingerprint = task_fingerprint(self.root, task_dir)
+        record_review(task_dir, fingerprint, "ship", "second-reviewer", "also fine", "supplementary")
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertIn(SEAL_REVIEW_MISMATCH, result["seal_stale_reasons"])
+
+    def test_gate_review_mutation_invalidates_the_seal(self) -> None:
+        task_dir = new_task(
+            self.root, "gated change", "adjust the returned number", "assured", "high",
+            ["src/app.py"], [], [], 1, "implementation",
+        )
+        (self.root / "src" / "app.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
+        fingerprint = task_fingerprint(self.root, task_dir)
+        record_review(task_dir, fingerprint, "ship", "independent-peer", "correct", "independent")
+        record_review(task_dir, fingerprint, "ship", "release-gate", "acceptable", "gate")
+        create_seal(self.root, task_dir)
+        self.assertFalse(check_task(self.root, task_dir)["seal_stale"])
+
+        self.rewrite_reviews(
+            task_dir,
+            lambda records: records[-1].__setitem__("reviewer", "not-the-gate"),
+        )
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertIn(SEAL_REVIEW_MISMATCH, result["seal_stale_reasons"])
+
+    def test_review_ledger_fingerprint_is_deterministic(self) -> None:
+        task_dir, _ = self.seal_task()
+        self.assertEqual(review_ledger_fingerprint(task_dir), review_ledger_fingerprint(task_dir))
+
+
+class SealSchemaEnforcementTests(SealRepository, unittest.TestCase):
+    """Reproduces the schema defect: a v2 seal relabelled `schema_version: 1`
+    still validated as current."""
+
+    def write_seal(self, task_dir: Path, seal: dict) -> None:
+        (task_dir / "seal.json").write_text(json.dumps(seal, indent=2), encoding="utf-8")
+
+    def test_valid_v2_seal_is_current(self) -> None:
+        task_dir, seal = self.seal_task()
+        self.assertEqual(seal["schema_version"], SEAL_SCHEMA_VERSION)
+        self.assertEqual(check_task(self.root, task_dir)["seal_status"], "current")
+
+    def test_v2_record_relabelled_as_v1_fails_closed(self) -> None:
+        task_dir, seal = self.seal_task()
+        tampered = dict(seal)
+        tampered["schema_version"] = 1
+        self.write_seal(task_dir, tampered)
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertEqual(result["seal_status"], "schema_inconsistent")
+        self.assertEqual(result["seal_stale_reasons"], [SEAL_SCHEMA_INCONSISTENT])
+
+    def test_unknown_schema_version_fails_closed(self) -> None:
+        task_dir, seal = self.seal_task()
+        tampered = dict(seal)
+        tampered["schema_version"] = 999
+        self.write_seal(task_dir, tampered)
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertEqual(result["seal_status"], "schema_unsupported")
+        self.assertEqual(result["seal_stale_reasons"], [SEAL_SCHEMA_UNSUPPORTED])
+
+    def test_missing_schema_version_fails_closed(self) -> None:
+        task_dir, seal = self.seal_task()
+        tampered = dict(seal)
+        tampered.pop("schema_version")
+        self.write_seal(task_dir, tampered)
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertEqual(result["seal_status"], "schema_unsupported")
+
+    def test_v2_seal_missing_repository_identity_fails_closed(self) -> None:
+        task_dir, seal = self.seal_task()
+        tampered = dict(seal)
+        tampered.pop("repository_identity")
+        self.write_seal(task_dir, tampered)
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertEqual(result["seal_status"], "schema_inconsistent")
+
+    def test_v2_seal_missing_review_binding_fails_closed(self) -> None:
+        task_dir, seal = self.seal_task()
+        tampered = dict(seal)
+        tampered.pop("review_ledger_fingerprint")
+        self.write_seal(task_dir, tampered)
+        result = check_task(self.root, task_dir)
+        self.assertTrue(result["seal_stale"])
+        self.assertEqual(result["seal_status"], "schema_inconsistent")
+
+    def test_genuine_legacy_seal_still_reports_legacy_unbound(self) -> None:
+        task_dir, seal = self.seal_task()
+        legacy = {
+            "schema_version": 1,
+            "task_id": seal["task_id"],
+            "sealed_at": seal["sealed_at"],
+            "fingerprint": seal["fingerprint"],
+            "evidence_records": seal["evidence_records"],
+            "review_stages": seal["review_stages"],
+            "changed_files": seal["changed_files"],
+        }
+        self.write_seal(task_dir, legacy)
+        result = check_task(self.root, task_dir)
+        self.assertEqual(result["seal_status"], "legacy_unbound")
+        self.assertEqual(result["seal_stale_reasons"], [SEAL_MISSING_HEAD_IDENTITY])
 
 
 class RequireSealCliTests(unittest.TestCase):
