@@ -1,7 +1,7 @@
 # SERA Controller
 
-Version 0.4 adds a controller layer on top of the original relay protocol. Version
-0.4.1 hardens it for high-assurance repositories.
+Version 0.4 adds a controller layer on top of the original relay protocol. Versions
+0.4.1 and 0.4.2 harden it for high-assurance repositories.
 
 The controller does **not** call model APIs. It prepares enough deterministic state for ChatGPT, Codex, Claude Code, or another runtime to dispatch the right worker without forwarding a large transcript.
 
@@ -201,12 +201,17 @@ last. Each changed file gets its own block:
 ```text
 ### `src/payments/gateway.py`
 - status: modified
-- location: staged+unstaged
+- location: committed+staged+unstaged
 - blobs: `a1b2c3d`..`e4f5a6b`
 - content: text
 - patch sha256: `9f2c…`
 - shown: 512 of 4,096 patch characters
 ```
+
+`location` names every source the file changed in. Blob identity spans the whole
+task range: the oldest source supplies where the file started, the newest where
+it stands now. One file is always exactly one block — never several competing
+ones — so a reviewer reads its cumulative task-relative change in one place.
 
 Budget allocation runs in two phases:
 
@@ -271,11 +276,14 @@ Each generated packet is written alongside machine-readable provenance in
 
 ```json
 {
-  "schema_version": 1,
-  "packet_type": "build",
+  "schema_version": 3,
+  "packet_type": "review",
   "task_id": "20260812T091006Z-low-risk-task",
   "task_contract_fingerprint": "…",
-  "state_fingerprint": null,
+  "state_fingerprint": "…",
+  "repository_identity": {"head_sha": "…", "head_tree_sha": "…"},
+  "review_change_fingerprint": "…",
+  "coverage_complete": true,
   "route": {"builder": "deep_builder", "reviewer": "independent_reviewer", "gate": "release_gate"}
 }
 ```
@@ -283,14 +291,29 @@ Each generated packet is written alongside machine-readable provenance in
 Freshness is:
 
 ```text
-contract + state (review packets only) + resolved route + content
+contract
+  + repository identity (review packets only)
+  + state (review packets only)
+  + coverage and change set (review packets only)
+  + resolved route
+  + content
 ```
 
 Recorded metadata is never trusted on its own. Each identity is recomputed from
 current state and compared:
 
 - **contract** — recomputed from the task;
+- **repository identity** — the exact `HEAD` commit and tree a review packet was
+  generated against, re-read from Git. Moving HEAD stales the packet even when
+  an empty commit leaves the tree and the working delta untouched, because the
+  reviewer inspected a different repository than the one now standing. Build
+  packets record identity as provenance but are *not* invalidated by it: a
+  builder committing its own implementation must not stale its own handoff;
 - **state** — the task/evidence/delta fingerprint a review packet embeds;
+- **coverage and change set** — whether the complete task change set could be
+  derived, plus a fingerprint over the committed-range endpoints, the whole
+  changed-path set, and each file's status, blob identity, sources, and patch
+  bytes. A displayed filename count is not relied upon;
 - **route** — the *currently* resolved lane, provider, and model for every stage
   this task requires, re-derived from task and configuration and re-hashed. The
   `route` object in provenance is diagnostics only; editing it changes nothing.
@@ -304,15 +327,21 @@ current state and compared:
 Validation is ordered, and every failure is a closed one:
 
 ```text
-missing -> unbound -> contract -> state -> route -> content -> current
+missing -> unbound -> contract -> head -> tree -> state
+        -> coverage -> change set -> route -> content -> current
 ```
 
 | Reason | Meaning |
 | --- | --- |
 | `packet_missing` | no packet has been generated |
 | `packet_unbound` | provenance absent, unparseable, or missing a required binding |
+| `packet_legacy_schema` | a 0.4.1 (version 2) packet, which binds no repository identity |
 | `packet_stale_contract` | the task contract changed after generation |
+| `packet_stale_head` | HEAD moved after the review packet was generated |
+| `packet_stale_head_tree` | the HEAD tree moved after the review packet was generated |
 | `packet_stale_state` | review packet's embedded diff/evidence state moved on |
+| `packet_coverage_incomplete` | the complete change set cannot be shown to be represented |
+| `packet_stale_change_set` | the represented change set moved |
 | `packet_stale_route` | the resolved route changed, or can no longer be resolved |
 | `packet_content_mismatch` | the packet bytes differ from what was generated |
 
@@ -322,7 +351,10 @@ invalidates the previous build packet, the previous review packet, and rewrites
 returning `dispatch_builder`, and the regenerated packet carries the current
 route rather than the superseded one.
 
-An unbound packet from an older SERA is never dispatchable as current.
+An unbound packet from an older SERA is never dispatchable as current. Packet
+provenance is at schema version 3; a 0.4.1 packet fails closed as
+`packet_legacy_schema` and must be regenerated, so it can never masquerade as an
+exact-head-bound 0.4.2 packet.
 
 ### Evidence follows the same rule
 
@@ -342,7 +374,22 @@ does.
 - run verification;
 - generate a review packet;
 - repeat stale review;
+- address a failed review;
 - seal the accepted tree.
+
+Required-review precedence is explicit, and a failed review is never skipped in
+favour of a later stage:
+
+```text
+stale required review
+  -> current failed required review
+  -> missing required review
+  -> seal
+```
+
+A current `fix-first` or `rethink` verdict therefore returns `fix_first` even
+when a later gate has not run yet. Dispatching a release gate for work the
+independent stage already refused is not a valid next step.
 
 `reduce_context` is returned only when the context selected for the **required
 next stage** exceeds the mode budget. A large ownership set alone never blocks
@@ -368,6 +415,24 @@ unbound, or built for a superseded contract yields `build_packet` or
  "build_packet": {"exists": true, "current": false, "reason": "packet_stale_contract"}}
 ```
 
+Currency is not coverage. A packet can be perfectly current and still not
+represent the whole change set, so the two are reported separately and
+`dispatch_review` requires both:
+
+```json
+{"state": "dispatch_review",
+ "review_packet": {"exists": true, "current": true, "reason": null},
+ "review_coverage": {"complete": true, "reason": null,
+                     "change_fingerprint": "…", "committed_range": ["…", "…"]}}
+```
+
+When the complete change set cannot be derived, `sera next` returns
+`review_coverage_incomplete` and `sera packet review` refuses to generate a
+packet at all rather than emit one that understates what changed.
+
+`sera next --json` also reports `review_states` and `stale_review_reasons` per
+stage, `failed_reviews`, `head_identity`, and `baseline_repository_identity`.
+
 Use `--json` when another AI controller is consuming the result.
 
 ## `sera resume`
@@ -388,14 +453,100 @@ sera inbox
 
 shows every local SERA task and the next required action. This is the first project-level control-plane view and is designed to grow into multi-task orchestration later.
 
+## Review identity
+
+A review is bound to the repository the reviewer actually inspected, not merely
+to the task state:
+
+```text
+review record = task/evidence/delta fingerprint + HEAD + HEAD tree
+```
+
+`sera review` never trusts a supplied commit SHA. The reviewer works from a
+review packet that already binds an exact HEAD, tree, and change set; acceptance
+re-validates that packet against the repository as it stands, and only then reads
+the identity from Git. If HEAD moved after generation, the verdict is refused
+until a fresh packet is generated and reviewed.
+
+Freshness then requires every applicable binding to match at once:
+
+| Reason | Meaning |
+| --- | --- |
+| `review_fingerprint_mismatch` | the task/evidence/delta state moved after review |
+| `review_head_mismatch` | HEAD moved after review |
+| `review_head_tree_mismatch` | the HEAD tree moved after review |
+| `review_repository_unbound` | a 0.4.1 record carrying no repository identity |
+
+An empty commit leaves the fingerprint and the tree untouched, so only the HEAD
+binding catches it — which is precisely the case a release gate must not be
+allowed to inherit. The gate is a review stage and binds identity identically.
+
+0.4.1 review records remain readable history. They report
+`review_repository_unbound`, cannot satisfy 0.4.2 exact-head acceptance, and are
+not deleted; repeat the review on 0.4.2 instead.
+
+## Committed change coverage
+
+Every task records `baseline_repository_identity` when it is created. Review
+change evidence spans that baseline commit through the current HEAD, unioned with
+task-relative working-tree changes:
+
+```text
+committed changes since the task baseline
+  UNION
+task-relative working changes since the task's dirty baseline
+```
+
+A task whose implementation is fully committed on a clean worktree therefore
+still reaches its reviewer with real patch material, and the committed range
+participates in scope checking — a file committed after the task began is a task
+change even with `git status --short` empty. Pre-existing dirty paths the task
+never touched remain outside task scope.
+
+Tasks created before 0.4.2 carry no baseline and report
+`review_baseline_unbound`; a baseline commit that no longer exists reports
+`review_baseline_unreachable`. Both fail closed rather than claiming complete
+coverage.
+
+## SERA runtime state versus tracked policy
+
+`.sera/**` holds two different kinds of file. These are generated runtime state
+and are never repository review content:
+
+```text
+.sera/cache/**
+.sera/tasks/**        capsules, packets, ledgers, seals
+.sera/latest-task
+```
+
+Everything else under `.sera/` — `.sera/config.json`, `.sera/POLICY.md`,
+`.sera/README.md`, any tracked policy file a team adds — is ordinary repository
+content, eligible for ownership, change detection, scope checking, and review
+evidence. Runtime state stays excluded even when a repository commits it by
+mistake, and owning a runtime path does not turn it into review content.
+
 ## Exact-head acceptance
 
-A 0.4.1 seal (schema version 2) binds acceptance to the exact reviewed repository
+A seal (schema version 2) binds acceptance to the exact reviewed repository
 identity:
 
 ```text
 task + evidence + reviews + HEAD + HEAD tree + working-tree delta + relevant untracked state
 ```
+
+A seal cannot be created unless every required review is `ship`,
+fingerprint-current, and bound to the current HEAD and tree, so a seal can never
+describe a commit nobody reviewed:
+
+```bash
+sera review --verdict ship ...       # reviewed at HEAD A
+git commit --allow-empty -m "b"      # HEAD moves to B
+sera seal                            # refused: reviews describe a different commit
+```
+
+Because the seal already binds the review ledger, and reviews now bind
+repository identity, a seal transitively binds the identity each review was
+taken at. The seal schema itself is unchanged at version 2.
 
 ### Review-ledger binding
 

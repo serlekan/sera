@@ -6,7 +6,7 @@ A token-efficient, model-neutral controller for AI-assisted software delivery.
 
 SERA is the layer between a product request and the coding agents that implement it. It maps a repository, turns intent into a bounded task, selects the cheapest adequate lane, records reproducible evidence, requires fresh review when risk demands it, and seals only the exact reviewed tree.
 
-Version **0.4.1** hardens the 0.4 controller for high-assurance repositories: project-defined risk policy, honored mode defaults, ownership separated from stage context, and acceptance bound to the exact Git commit.
+Version **0.4.2** binds review identity and change coverage: a review packet and an accepted review record are both bound to the exact `HEAD` commit and tree the reviewer inspected, review evidence covers what the task committed as well as what is still dirty, tracked SERA policy is reviewable while SERA runtime state stays out, and a failed review stops the workflow before any later gate. It builds on 0.4.1's project-defined risk policy, honored mode defaults, ownership separated from stage context, and seals bound to the exact Git commit.
 
 ```text
 You / AI controller
@@ -213,6 +213,90 @@ SERA now snapshots pre-existing dirty paths when a task starts.
 
 Existing user changes are treated as baseline. If they remain unchanged, they do not become task scope. If they change again during the task, SERA detects the mutation and applies ownership rules.
 
+## What 0.4.2 adds
+
+### Reviews are bound to the repository that was reviewed
+
+A review packet records the exact `HEAD` commit and tree it was generated
+against, and states them in the packet body. `sera review` refuses to record a
+verdict unless that packet is still current, then reads the reviewed identity
+from Git rather than accepting a caller-supplied SHA. Once HEAD moves — including
+by an empty commit that leaves the tree and the working delta untouched — the
+packet and the accepted review both go stale:
+
+```bash
+sera packet review          # bound to HEAD A
+git commit --allow-empty -m "anything"
+sera next                   # review: packet_stale_head
+sera seal                   # refused: reviews describe a different commit
+```
+
+The release gate is a review stage and obeys the same rule, so a gate can never
+inherit an independent review taken at a different commit. `sera seal` binds a
+seal only when every required review is `ship`, fingerprint-current, and bound to
+the current `HEAD` and tree.
+
+Downstream projects no longer need to implement a manual reviewed-HEAD
+comparison of their own: on 0.4.2 the controller enforces it natively. 0.4.1 and
+earlier did not — reviews recorded by those versions carry no repository
+identity, report `review_repository_unbound`, and fail closed until the review is
+repeated on 0.4.2.
+
+### Review evidence covers committed work
+
+Change evidence used to be built from staged and unstaged state alone, so a task
+whose implementation was committed reported "No task-relative changes to review"
+on a clean worktree. The change set now spans the task's baseline commit through
+the current `HEAD`, unioned with task-relative working-tree changes, with one
+canonical review block per file carrying its cumulative change:
+
+```text
+### `src/payments/gateway.py`
+- status: modified
+- location: committed+unstaged
+```
+
+Committed work is scope-checked too: a file committed after the task began is a
+task change even with a clean worktree, so committing an out-of-scope edit cannot
+hide it. Tasks created before 0.4.2 have no baseline commit recorded and cannot
+have their committed range derived; they report `review_baseline_unbound` and
+fail closed rather than claiming coverage they do not have.
+
+### Tracked SERA policy is reviewable; runtime state is not
+
+`.sera/**` holds two different kinds of file, and 0.4.1 excluded both. Now only
+generated runtime state is excluded — `.sera/cache/**`, `.sera/tasks/**`, and
+`.sera/latest-task`. Anything else a team tracks there, such as
+`.sera/config.json` or `.sera/POLICY.md`, is ordinary repository content eligible
+for ownership, change detection, scope checking, and review evidence. Task
+capsules, packets, ledgers, and seals still cannot reach a review packet, even if
+a repository commits them by mistake.
+
+### Currency and coverage are reported separately
+
+`current` means nothing was tampered with and nothing moved. It never meant "the
+reviewer is seeing everything", and it is no longer allowed to imply it:
+
+```json
+{ "state": "dispatch_review", "review_coverage": { "complete": true, "reason": null } }
+```
+
+A review packet is dispatchable only when it is current **and** its coverage is
+complete. If the whole change set cannot be derived, SERA refuses to emit the
+packet at all. If every changed file cannot fit the character budget, the
+existing `review_diff_budget_insufficient` failure is unchanged.
+
+### A failed review outranks a missing later gate
+
+`sera next` evaluated missing reviews before failed ones, so a task with a
+current `fix-first` independent review and no gate yet was told to run the
+release gate. Required-review precedence is now: stale review → current failed
+review → missing review → seal.
+
+```bash
+sera next   # fix_first: independent returned `fix-first`; address it first
+```
+
 ## Core principles
 
 1. **Repository state outranks agent narrative.**
@@ -366,7 +450,9 @@ The evidence ledger records command, exit code, summary, output hash, and size. 
 sera packet review
 ```
 
-Give that packet to the configured reviewer. Record the result:
+That packet is bound to the exact `HEAD` commit and tree it was generated
+against, and it carries every task change — committed, staged, and unstaged.
+Give it to the configured reviewer and record the result:
 
 ```bash
 sera review \
@@ -376,7 +462,13 @@ sera review \
   --reason "Scope and verification satisfy the contract"
 ```
 
-Assured/high-risk work also requires the configured gate.
+SERA refuses the verdict unless that packet is still current, then records the
+reviewed `HEAD` and tree from Git. If HEAD moved in between, regenerate the
+packet and repeat the review; the earlier verdict does not carry over.
+
+Assured/high-risk work also requires the configured gate, which binds identity
+the same way. A `fix-first` or `rethink` verdict stops the workflow immediately
+rather than letting a later gate be dispatched for rejected work.
 
 ### 5. Seal exact acceptance
 
@@ -387,8 +479,11 @@ sera check --require-seal
 
 A seal binds the task, evidence, working-tree delta, relevant untracked state,
 **the review ledger that justified acceptance**, and **the exact `HEAD` commit and
-tree**. Editing an accepted reviewer, rationale, or verdict afterwards makes the
-seal stale with `seal_review_mismatch`, and a seal whose `schema_version` is
+tree**. Since 0.4.2 the seal cannot be created at all unless every required
+review is `ship`, fingerprint-current, and bound to that same current `HEAD` and
+tree, so a seal can never describe a commit nobody reviewed. Editing an accepted
+reviewer, rationale, or verdict afterwards makes the seal stale with
+`seal_review_mismatch`, and a seal whose `schema_version` is
 missing, unknown, or inconsistent with its contents fails closed. A later code change makes the
 verdict and seal stale — and so does moving HEAD at all:
 
@@ -473,7 +568,7 @@ sera route                 Select configured lanes
 sera packet build          Generate implementation handoff
 sera verify                Run verification and record evidence
 sera packet review         Generate fresh-review handoff
-sera review                Record fingerprint-bound verdict
+sera review                Record a verdict bound to the reviewed HEAD and tree
 sera next                  Return the next state-machine action
 sera resume                Reconstruct active task from repository state
 sera inbox                 Show all local tasks
@@ -524,7 +619,9 @@ The project intentionally keeps the core dependency-free.
 
 ## Status
 
-Version `0.4.1` is an alpha controller release. The repository-state protocol is functional; provider-specific automatic dispatch remains adapter/controller-runtime work for later releases.
+Version `0.4.2` is an alpha controller release. The repository-state protocol is functional; provider-specific automatic dispatch remains adapter/controller-runtime work for later releases.
+
+The threat model is unchanged and remains local consistency: SHA-256 over local Git and file state detects drift and accidental or careless tampering with SERA's own records. It is not signing, HMAC, remote attestation, or a claim of adversarial authenticity.
 
 ## History and attribution
 
