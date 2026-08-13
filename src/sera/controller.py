@@ -224,6 +224,16 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             f"{stage_context['review_diff_required_chars']:,} characters of review diff, which exceeds "
             f"max_packet_chars. Raise max_packet_chars or split the task.",
         )
+    elif stage == "review" and not stage_context.get("review_coverage_complete", True):
+        # Currency is not completeness: refuse to dispatch a review that cannot
+        # be shown to represent the whole change set.
+        action, command, reason = (
+            "review_coverage_incomplete",
+            None,
+            f"{stage_context.get('review_coverage_reason')}: the complete task change set cannot be "
+            "derived, so a review packet would understate what changed. Create a task under this "
+            "version of SERA, or restore the baseline commit, before requesting review.",
+        )
     elif config.get("controller", {}).get("enforce_context_budget", True) and not stage_context["within_budget"]:
         # Budget is measured against the context selected for the required next
         # stage, never against the full ownership set.
@@ -251,15 +261,28 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     elif result["missing_verification"]:
         action, command, reason = "verify", "sera verify", "Required verification evidence is missing."
     elif result["stale_reviews"]:
-        action, command, reason = "review", "sera packet review", "One or more required reviews are stale for the current fingerprint."
+        action, command = "review", "sera packet review"
+        reasons = sorted({item for stage_reasons in result["stale_review_reasons"].values() for item in stage_reasons})
+        reason = (
+            "One or more required reviews no longer describe the current repository state "
+            f"({', '.join(reasons)}). Regenerate the review packet and repeat those stages."
+        )
+    # A current failed review outranks a missing later stage: never dispatch a
+    # release gate for an implementation the independent stage already refused.
+    elif result["failed_reviews"]:
+        action, command, reason = (
+            "fix_first",
+            None,
+            f"A current required review returned "
+            f"`{result['reviews'][result['failed_reviews'][0]]['verdict']}` at the "
+            f"{result['failed_reviews'][0]} stage. Address the findings before any later stage.",
+        )
     elif result["missing_reviews"]:
         if not review_packet_state["current"]:
             action, command = "review_packet", "sera packet review"
         else:
             action, command = "dispatch_review", None
         reason = f"Required review stage: {result['missing_reviews'][0]}."
-    elif result["failed_reviews"]:
-        action, command, reason = "fix_first", None, "A current required review did not return ship."
     elif result["ok"] and (not result["seal"] or result["seal_stale"]):
         action, command, reason = "seal", "sera seal", "Verification and required reviews pass; bind acceptance to this fingerprint."
     elif result["ok"] and result["seal"] and not result["seal_stale"]:
@@ -290,6 +313,16 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         "within_budget": stage_context["within_budget"],
         "fingerprint": result["fingerprint"],
         "head_identity": result["head_identity"],
+        "baseline_repository_identity": result["baseline_repository_identity"],
+        "review_states": result["review_states"],
+        "stale_review_reasons": result["stale_review_reasons"],
+        "failed_reviews": result["failed_reviews"],
+        "review_coverage": {
+            "complete": stage_context.get("review_coverage_complete", True),
+            "reason": stage_context.get("review_coverage_reason"),
+            "change_fingerprint": stage_context.get("review_change_fingerprint"),
+            "committed_range": stage_context.get("review_committed_range"),
+        },
         "seal_status": result["seal_status"],
         "seal_stale_reasons": result["seal_stale_reasons"],
         "seal_current": bool(result["seal"] and not result["seal_stale"]),
