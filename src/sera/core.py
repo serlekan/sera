@@ -246,6 +246,90 @@ def is_sera_runtime_path(path: str) -> bool:
     return remainder.split("/", 1)[0] in SERA_RUNTIME_DIRS or remainder in SERA_RUNTIME_FILES
 
 
+ZERO_SHA = "0" * 7
+
+
+def normalize_runtime_boundary(
+    record: dict[str, Any],
+    *,
+    is_copy: bool,
+    deleted_status: str,
+    added_status: str,
+) -> list[dict[str, Any]]:
+    """Apply SERA runtime-boundary semantics to one Git change record.
+
+    Runtime classification applies to each identity of a change *independently*.
+    Classifying a rename by its destination alone discards the other half of the
+    change: a project file renamed into `.sera/tasks/**` has genuinely
+    disappeared from project content, and a project file that appears out of
+    runtime state has genuinely been added. Excluding runtime state must never
+    be a way to make project changes invisible to scope and review.
+
+        project -> project   rename/copy   kept unchanged
+        project -> runtime   rename        => deletion of the project source
+        project -> runtime   copy          => nothing; the source still stands
+        runtime -> project   rename/copy   => addition of the project destination
+        runtime -> runtime   anything      => nothing
+
+    The runtime side is never turned into review content by any of these paths;
+    only the project-visible side of the change survives.
+    """
+    path = record["path"]
+    old_path = record.get("old_path")
+    destination_runtime = is_sera_runtime_path(path)
+    if not old_path:
+        return [] if destination_runtime else [record]
+
+    source_runtime = is_sera_runtime_path(old_path)
+    if source_runtime and destination_runtime:
+        return []
+    if not source_runtime and not destination_runtime:
+        return [record]
+
+    if destination_runtime:
+        if is_copy:
+            # A copy leaves its source in place, so synthesizing a deletion here
+            # would invent a change that never happened.
+            return []
+        removed = dict(record)
+        removed.update(
+            {
+                "status": deleted_status,
+                "path": old_path,
+                "old_path": None,
+                "new_sha": ZERO_SHA,
+                # Rendering must not re-pair this with its runtime counterpart,
+                # which would print the runtime path into review evidence.
+                "boundary": True,
+            }
+        )
+        return [removed]
+
+    added = dict(record)
+    added.update({"status": added_status, "old_path": None, "old_sha": ZERO_SHA, "boundary": True})
+    return [added]
+
+
+def project_visible_records(
+    records: list[dict[str, Any]],
+    *,
+    deleted_status: str,
+    added_status: str,
+) -> list[dict[str, Any]]:
+    """Normalize a batch of Git change records to their project-visible form."""
+    visible: list[dict[str, Any]] = []
+    for record in records:
+        visible.extend(
+            normalize_runtime_boundary(
+                record,
+                is_copy="C" in str(record.get("status", "")),
+                deleted_status=deleted_status,
+                added_status=added_status,
+            )
+        )
+    return visible
+
+
 def text_tokens(value: str) -> list[str]:
     """Split text into ordered lowercase alphanumeric tokens.
 
@@ -1301,30 +1385,52 @@ def lane_label(config: dict[str, Any], lane: str | None) -> str | None:
 
 
 
+def _parse_status_z(output: str) -> list[dict[str, Any]]:
+    """Parse `git status --porcelain=v1 -z` records, keeping both rename sides.
+
+    A rename or copy occupies two NUL-separated fields — destination first, then
+    source. Skipping the source loses half of the change, which matters as soon
+    as the two sides fall on opposite sides of the SERA runtime boundary.
+    """
+    items = [item for item in output.split("\0") if item]
+    records: list[dict[str, Any]] = []
+    index = 0
+    while index < len(items):
+        entry = items[index]
+        index += 1
+        status = entry[:2]
+        raw = entry[3:] if len(entry) >= 4 else entry
+        destination = raw.replace("\\", "/")
+        source: str | None = None
+        if "R" in status or "C" in status:
+            if index < len(items):
+                source = items[index].replace("\\", "/")
+                index += 1
+        records.append({"status": status, "path": destination, "old_path": source})
+    return records
+
+
+def _status_records(root: Path) -> list[dict[str, Any]]:
+    """Project-visible working-tree change records."""
+    return project_visible_records(
+        _parse_status_z(run_git(root, "status", "--porcelain=v1", "-z")),
+        deleted_status="D ",
+        added_status="A ",
+    )
+
+
 def working_tree_snapshot(root: Path) -> dict[str, str]:
     """Return a compact fingerprint per dirty path, including Git status.
 
     This lets tasks preserve an already-dirty worktree: unchanged pre-task edits
-    do not become task scope, while later mutations to those paths do.
+    do not become task scope, while later mutations to those paths do. Renames
+    across the runtime boundary keep their project-visible side, so moving a
+    project file into `.sera/tasks/**` still registers as that file changing.
     """
-    output = run_git(root, "status", "--porcelain=v1", "-z")
-    items = output.split("\0")
     snapshot: dict[str, str] = {}
-    skip_next_rename_source = False
-    for item in items:
-        if not item:
-            continue
-        if skip_next_rename_source:
-            skip_next_rename_source = False
-            continue
-        status = item[:2]
-        raw = item[3:] if len(item) >= 4 else item
-        if status.startswith("R") or status.endswith("R") or status.startswith("C") or status.endswith("C"):
-            skip_next_rename_source = True
-        normalized = raw.replace("\\", "/")
-        if is_sera_runtime_path(normalized):
-            continue
-        path = root / raw
+    for record in _status_records(root):
+        normalized = record["path"]
+        path = root / normalized
         if path.is_file():
             try:
                 content_hash = sha256_bytes(path.read_bytes())
@@ -1334,7 +1440,8 @@ def working_tree_snapshot(root: Path) -> dict[str, str]:
             content_hash = "non-file"
         else:
             content_hash = "deleted"
-        snapshot[normalized] = sha256_text(f"{status}\0{content_hash}")
+        identity = f"{record['status']}\0{record.get('old_path') or ''}\0{content_hash}"
+        snapshot[normalized] = sha256_text(identity)
     return snapshot
 
 
@@ -1352,24 +1459,12 @@ def task_working_changes(root: Path, task: dict[str, Any]) -> list[str]:
 
 
 def changed_files(root: Path) -> list[str]:
-    output = run_git(root, "status", "--porcelain=v1", "-z")
-    items = output.split("\0")
+    """Every project-visible path with working-tree changes."""
     paths: list[str] = []
-    skip_next_rename_source = False
-    for item in items:
-        if not item:
-            continue
-        if skip_next_rename_source:
-            skip_next_rename_source = False
-            continue
-        status = item[:2]
-        raw = item[3:] if len(item) >= 4 else item
-        if status.startswith("R") or status.endswith("R") or status.startswith("C") or status.endswith("C"):
-            skip_next_rename_source = True
-        normalized = raw.replace("\\", "/")
-        if is_sera_runtime_path(normalized):
-            continue
-        paths.append(normalized)
+    for record in _status_records(root):
+        paths.append(record["path"])
+        if record.get("old_path"):
+            paths.append(record["old_path"])
     return sorted(set(paths))
 
 
@@ -1485,7 +1580,10 @@ def committed_change_records(
     if paths:
         args = [*args, "--", *paths]
     records = _parse_raw_z(run_git(root, *args, check=False))
-    return [record for record in records if not is_sera_runtime_path(record["path"])]
+    # Normalize each identity independently: a rename out of project content
+    # into runtime state is still a project deletion, and one out of runtime
+    # state into project content is still a project addition.
+    return project_visible_records(records, deleted_status="D", added_status="A")
 
 
 def task_changed_files(root: Path, task: dict[str, Any]) -> list[str]:
@@ -1493,14 +1591,16 @@ def task_changed_files(root: Path, task: dict[str, Any]) -> list[str]:
 
     Repository state outranks builder narrative: a file committed after the task
     began is a task change even when the worktree is clean, so committing an
-    out-of-scope edit cannot hide it. Pre-existing dirty paths the task never
-    touched stay outside task scope.
+    out-of-scope edit cannot hide it — including by renaming it across the SERA
+    runtime boundary, where the project-visible side of the move survives.
+    Pre-existing dirty paths the task never touched stay outside task scope, and
+    runtime paths are never project content.
     """
     paths = set(task_working_changes(root, task))
     resolved = task_committed_range(root, task)
     for record in committed_change_records(root, resolved["range"]):
         paths.add(record["path"])
-        if record["old_path"] and not is_sera_runtime_path(record["old_path"]):
+        if record["old_path"]:
             paths.add(record["old_path"])
     return sorted(paths)
 
@@ -1514,12 +1614,18 @@ def _raw_diff_args(source: str, committed_range: tuple[str, str] | None) -> list
     return base
 
 
-def _patch_diff_args(source: str, committed_range: tuple[str, str] | None) -> list[str]:
-    base = ["diff", "--no-ext-diff", "--unified=3", "-M"]
+def _patch_diff_args(
+    source: str, committed_range: tuple[str, str] | None, no_renames: bool = False
+) -> list[str]:
+    # A change normalized across the runtime boundary is rendered without rename
+    # detection: pairing it again would print the runtime counterpart into review
+    # evidence, which is exactly what runtime exclusion exists to prevent.
+    detection = "--no-renames" if no_renames else "-M"
+    base = ["diff", "--no-ext-diff", "--unified=3", detection]
     if source == "committed":
         return [*base, committed_range[0], committed_range[1]]  # type: ignore[index]
     if source == "staged":
-        return ["diff", "--cached", "--no-ext-diff", "--unified=3", "-M"]
+        return ["diff", "--cached", "--no-ext-diff", "--unified=3", detection]
     return base
 
 
@@ -1547,9 +1653,8 @@ def _collect_changed_files(
     changes: dict[str, dict[str, Any]] = {}
     for source in sources:
         raw = run_git(root, *_raw_diff_args(source, committed_range), "--", *allowed_files, check=False)
-        for record in _parse_raw_z(raw):
-            if is_sera_runtime_path(record["path"]):
-                continue
+        visible = project_visible_records(_parse_raw_z(raw), deleted_status="D", added_status="A")
+        for record in visible:
             entry = changes.setdefault(
                 record["path"],
                 {
@@ -1578,7 +1683,10 @@ def _collect_changed_files(
                 entry["status"] = entry["sources"][source]["status"]
         sections: list[str] = []
         for source in present:
-            patch = run_git(root, *_patch_diff_args(source, committed_range), "--", path, check=False)
+            boundary = bool(entry["sources"][source].get("boundary"))
+            patch = run_git(
+                root, *_patch_diff_args(source, committed_range, boundary), "--", path, check=False
+            )
             if patch.strip():
                 sections.append(f"# {source}\n{patch}")
         entry["patch"] = "\n".join(sections)

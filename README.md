@@ -257,8 +257,22 @@ canonical review block per file carrying its cumulative change:
 ```
 
 Committed work is scope-checked too: a file committed after the task began is a
-task change even with a clean worktree, so committing an out-of-scope edit cannot
-hide it. Tasks created before 0.4.2 have no baseline commit recorded and cannot
+task change even with a clean worktree. Every **project-visible** side of a Git
+change is preserved for scope and review reasoning, including renames across the
+SERA runtime boundary:
+
+| Change | Preserved as |
+| --- | --- |
+| `src/app.py` → `src/new.py` | ordinary rename; both paths |
+| `src/app.py` → `.sera/tasks/x.py` | deletion of `src/app.py` |
+| `.sera/tasks/x.py` → `src/app.py` | addition of `src/app.py` |
+| `.sera/tasks/a` → `.sera/cache/b` | excluded entirely |
+
+Runtime state itself is never turned into review content by any of these — only
+the project-visible side of the move survives. A copy into runtime state
+synthesizes no deletion, because a copy leaves its source in place.
+
+Tasks created before 0.4.2 have no baseline commit recorded and cannot
 have their committed range derived; they report `review_baseline_unbound` and
 fail closed rather than claiming coverage they do not have.
 

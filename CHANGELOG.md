@@ -2,6 +2,30 @@
 
 ## 0.4.2 - unreleased
 
+### Second canonical-review correction
+
+Canonical review of the corrected candidate found one further defect class:
+cross-boundary rename and copy integrity.
+
+- **Runtime exclusion could erase project changes.** A change record was
+  classified by its destination path alone, so committing
+  `git mv app.py .sera/tasks/smuggled.py` discarded the entire record. `app.py`
+  vanished from `changed_files`, scope checking, coverage, and the change-set
+  fingerprint; `sera next` returned `dispatch_builder`; and a review packet was
+  emitted claiming "Change coverage: complete" while stating "No task-relative
+  changes to review". Runtime classification now applies to each identity of a
+  change independently, through one normalization helper used by the committed
+  range, the per-file evidence collector, `working_tree_snapshot`, and
+  `changed_files`: project → runtime renames survive as a deletion of the
+  project source, runtime → project renames survive as an addition of the
+  project destination, project → runtime *copies* synthesize nothing because a
+  copy leaves its source in place, and runtime → runtime is excluded entirely.
+  Ordinary project renames are unchanged. Runtime state is still never review
+  content — a normalized boundary change is rendered with rename detection
+  disabled so its runtime counterpart cannot be printed beside it, and owning a
+  runtime path does not make it reviewable. The porcelain parser now recovers
+  both sides of a rename instead of skipping the source.
+
 ### Canonical-review correction
 
 Canonical review of the first 0.4.2 candidate reproduced two blocking defects.
@@ -88,8 +112,9 @@ substantial commit.
   deterministic rendering, the exact character budget, and binary/rename
   handling are unchanged.
 - The committed range participates in scope checking: a file committed after the
-  task began is a task change even with a clean worktree, so committing an
-  out-of-scope edit cannot hide it.
+  task began is a task change even with a clean worktree. Every project-visible
+  side of a change is preserved, including renames across the SERA runtime
+  boundary (see the correction note above).
 - Dirty-worktree baseline safety is preserved. A pre-existing dirty path the
   task never touches is still not task scope; touching it again still is.
 - Tasks created before 0.4.2 have no baseline commit and cannot have their

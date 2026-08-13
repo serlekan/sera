@@ -512,6 +512,27 @@ participates in scope checking — a file committed after the task began is a ta
 change even with `git status --short` empty. Pre-existing dirty paths the task
 never touched remain outside task scope.
 
+### The SERA runtime boundary
+
+Runtime classification applies to each identity of a change independently.
+Classifying a rename by its destination alone would let runtime exclusion erase
+project changes: moving a project file into `.sera/tasks/**` would discard the
+whole record, and the file would silently leave scope and review.
+
+| Rename or copy | Project-visible result |
+| --- | --- |
+| project → project | kept unchanged, both identities |
+| project → runtime (rename) | deletion of the project source |
+| project → runtime (copy) | nothing; the source still stands |
+| runtime → project | addition of the project destination |
+| runtime → runtime | nothing |
+
+This holds for committed, staged, and working-tree changes alike, and feeds the
+authoritative change set, scope checking, coverage, the change-set fingerprint,
+and review evidence. The runtime side is never rendered: a normalized boundary
+change is diffed with rename detection disabled, so its runtime counterpart
+cannot be printed beside it. Owning a runtime path does not make it reviewable.
+
 Coverage is proven, not assumed. Review evidence is generated from the files a
 task *owns*, while the authoritative change set is the whole repository delta,
 so the two are compared explicitly:

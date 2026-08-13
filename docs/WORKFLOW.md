@@ -60,6 +60,10 @@ sera packet review   # refused: review_scope_unresolved
 Split or revert the out-of-scope work, or declare ownership of it deliberately.
 SERA does not widen ownership on its own.
 
+Renaming a project file into SERA runtime state does not remove it from scope:
+the project-visible side of the move is preserved as a deletion, while the
+runtime destination stays out of review content.
+
 The packet is bound to the exact `HEAD` commit and tree it was generated against,
 and states them in its body. `sera review` records a verdict only against a
 current packet, then reads the reviewed identity from Git:
