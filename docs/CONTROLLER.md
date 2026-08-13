@@ -423,12 +423,21 @@ represent the whole change set, so the two are reported separately and
 {"state": "dispatch_review",
  "review_packet": {"exists": true, "current": true, "reason": null},
  "review_coverage": {"complete": true, "reason": null,
-                     "change_fingerprint": "…", "committed_range": ["…", "…"]}}
+                     "change_fingerprint": "…", "committed_range": ["…", "…"],
+                     "out_of_scope_paths": [], "missing_evidence_paths": []}}
 ```
 
-When the complete change set cannot be derived, `sera next` returns
-`review_coverage_incomplete` and `sera packet review` refuses to generate a
-packet at all rather than emit one that understates what changed.
+`review_coverage.complete` is true only when the committed range resolved, diff
+budgeting succeeded, no task change lies outside declared ownership, and every
+authoritative changed path is represented by real evidence. When it is not,
+`sera packet review` refuses to generate a packet at all rather than emit one
+that understates what changed — including on direct invocation, not only via
+`sera next`.
+
+Unresolved scope is reported as `resolve_scope`, not as
+`review_coverage_incomplete`: it is both the root cause of the missing evidence
+and the thing an operator must act on. SERA never widens ownership automatically
+to resolve it.
 
 `sera next --json` also reports `review_states` and `stale_review_reasons` per
 stage, `failed_reviews`, `head_identity`, and `baseline_repository_identity`.
@@ -503,10 +512,48 @@ participates in scope checking — a file committed after the task began is a ta
 change even with `git status --short` empty. Pre-existing dirty paths the task
 never touched remain outside task scope.
 
+Coverage is proven, not assumed. Review evidence is generated from the files a
+task *owns*, while the authoritative change set is the whole repository delta,
+so the two are compared explicitly:
+
+```text
+authoritative = set(task_changed_files(root, task))
+represented   = {entry.path} UNION {entry.old_path where present}
+missing       = authoritative - represented
+```
+
+A rename or copy is one canonical destination block carrying its source in
+`old_path`, so that single block represents both identities. Coverage is
+complete only when `missing` is empty and no authoritative change is
+out-of-scope.
+
+| Reason | Meaning |
+| --- | --- |
+| `review_baseline_unbound` | the task predates baseline identity |
+| `review_baseline_unreachable` | the baseline commit no longer exists |
+| `review_scope_unresolved` | a task change lies outside declared ownership |
+| `review_diff_budget_insufficient` | the budget cannot represent every changed file |
+| `review_evidence_incomplete` | an authoritative changed path produced no evidence |
+
 Tasks created before 0.4.2 carry no baseline and report
 `review_baseline_unbound`; a baseline commit that no longer exists reports
-`review_baseline_unreachable`. Both fail closed rather than claiming complete
-coverage.
+`review_baseline_unreachable`. All of these fail closed rather than claiming
+complete coverage.
+
+### Unborn baselines
+
+A task created in a repository with no commits records the explicit sentinel
+`unborn` for both identity fields. Repository identity holds immutable Git
+object IDs or that sentinel — never a symbolic revision. `git rev-parse HEAD`
+exits non-zero on an unborn HEAD but still prints the literal string `HEAD`, so
+identity resolution treats Git's *exit status* as the authority; storing that
+string would let a baseline silently re-resolve to whatever HEAD became later
+and collapse the task's own committed range to nothing.
+
+An unborn baseline diffs against Git's empty tree, so the first commit and every
+commit after it remain reviewable as the net change from an empty repository. A
+commit that exists but cannot resolve its tree fails closed with a `SeraError`
+rather than being reported as an absent HEAD.
 
 ## SERA runtime state versus tracked policy
 
@@ -524,6 +571,12 @@ Everything else under `.sera/` — `.sera/config.json`, `.sera/POLICY.md`,
 content, eligible for ownership, change detection, scope checking, and review
 evidence. Runtime state stays excluded even when a repository commits it by
 mistake, and owning a runtime path does not turn it into review content.
+
+**Known limitation.** The compact repository map still excludes `.sera/**`
+entirely, so a tracked policy file is listed in packets as "not yet indexed in
+the repository map". This affects orientation and context ranking only —
+ownership, change detection, scope checking, and review evidence for those files
+are complete. It is a context-map limitation, not a review-coverage claim.
 
 ## Exact-head acceptance
 

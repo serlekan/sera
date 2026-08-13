@@ -103,11 +103,20 @@ without being invalidated by it.
 
 ## Task baseline and committed coverage
 
-A task records the repository identity it began at. The review change set is the
+A task records the repository identity it began at, as an immutable Git object ID
+or the explicit `unborn` sentinel — never a symbolic revision, which would
+re-resolve later and collapse the task's own range. The review change set is the
 union of the committed range from that baseline to the current HEAD and the
 task-relative working-tree delta, so review evidence and scope checking survive
-the implementation being committed. A task that cannot derive its baseline fails
-closed instead of reporting partial coverage as complete.
+the implementation being committed. An unborn baseline diffs against Git's empty
+tree, so a repository's first commits stay reviewable.
+
+Completeness is proven rather than assumed. Evidence is generated from the files
+a task owns, while the authoritative change set is the whole repository delta, so
+the two are compared explicitly and coverage is complete only when every
+authoritative path is represented and none lies outside ownership. A task that
+cannot derive its baseline, cannot fit its diff, or changed files it does not own
+fails closed instead of reporting partial coverage as complete.
 
 ## Derived-artifact freshness
 

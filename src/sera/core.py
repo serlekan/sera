@@ -52,9 +52,11 @@ REVIEW_FINGERPRINT_MISMATCH = "review_fingerprint_mismatch"
 REVIEW_HEAD_MISMATCH = "review_head_mismatch"
 REVIEW_HEAD_TREE_MISMATCH = "review_head_tree_mismatch"
 REVIEW_REPOSITORY_UNBOUND = "review_repository_unbound"
-# Why a task's cumulative change set cannot be derived completely.
+# Why a task's cumulative change set cannot be derived or represented completely.
 REVIEW_BASELINE_UNBOUND = "review_baseline_unbound"
 REVIEW_BASELINE_UNREACHABLE = "review_baseline_unreachable"
+REVIEW_SCOPE_UNRESOLVED = "review_scope_unresolved"
+REVIEW_EVIDENCE_INCOMPLETE = "review_evidence_incomplete"
 
 # Sources a single changed file's evidence can come from, oldest first.
 CHANGE_SOURCES = ("committed", "staged", "unstaged")
@@ -509,16 +511,48 @@ def find_repo_root(start: Path | None = None) -> Path:
         current = current.parent
 
 
+def _rev_parse_verified(root: Path, revision: str) -> str | None:
+    """Resolve a revision to an immutable object ID, or `None` if it cannot be.
+
+    Git's *exit status* is the authority here, not its stdout. `git rev-parse
+    HEAD` in a repository with no commits exits non-zero but still prints the
+    literal string `HEAD`, so trusting stdout stores a symbolic expression where
+    an object ID belongs — and that expression silently re-resolves to whatever
+    HEAD becomes later.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", revision],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    value = (result.stdout or "").strip()
+    if result.returncode != 0 or not value:
+        return None
+    return value
+
+
 def git_head_identity(root: Path) -> dict[str, str]:
     """Return the exact commit and tree identity acceptance is bound to.
 
-    A repository with no commits yet reports the sentinel `unborn` for both
-    fields so seal comparison stays total and never compares `None` to `None`
-    as if it were a real match.
+    Every value is either an immutable resolved Git object ID or the explicit
+    sentinel `unborn`. A symbolic revision is never stored: it would resolve
+    differently later and quietly collapse a task's baseline into its own
+    result. A repository with no commits yet reports `unborn` for both fields so
+    comparison stays total and never treats two absences as a match.
     """
-    head = run_git(root, "rev-parse", "HEAD", check=False).strip()
-    tree = run_git(root, "rev-parse", "HEAD^{tree}", check=False).strip()
-    return {"head_sha": head or UNBORN_HEAD, "head_tree_sha": tree or UNBORN_HEAD}
+    head = _rev_parse_verified(root, "HEAD^{commit}")
+    if head is None:
+        return {"head_sha": UNBORN_HEAD, "head_tree_sha": UNBORN_HEAD}
+    tree = _rev_parse_verified(root, f"{head}^{{tree}}")
+    if tree is None:
+        # A commit that cannot produce a tree means a damaged object store.
+        # Failing closed is the only safe answer; a sentinel here would be read
+        # as "no commits yet".
+        raise SeraError(f"Commit {head} exists but its tree cannot be resolved; the repository is damaged.")
+    return {"head_sha": head, "head_tree_sha": tree}
 
 
 def state_path(root: Path) -> Path:
@@ -742,7 +776,7 @@ def build_repo_map(root: Path, config: dict[str, Any] | None = None) -> dict[str
         "schema_version": 1,
         "generated_at": utc_now(),
         "repo_root": root.name,
-        "head_sha": run_git(root, "rev-parse", "HEAD", check=False).strip() or None,
+        "head_sha": _rev_parse_verified(root, "HEAD^{commit}"),
         "fingerprint": fingerprint,
         "file_count": len(entries),
         "total_bytes": sum(item["bytes"] for item in entries),
@@ -776,7 +810,7 @@ def update_repo_map(root: Path, config: dict[str, Any] | None = None) -> dict[st
     previous_index = {item["path"]: item for item in previous.get("files", [])}
     excludes = set(config.get("exclude_dirs", [])) | DEFAULT_EXCLUDES
     max_bytes = int(config.get("max_file_bytes", 300_000))
-    current_head = run_git(root, "rev-parse", "HEAD", check=False).strip() or None
+    current_head = _rev_parse_verified(root, "HEAD^{commit}")
     previous_head = previous.get("head_sha")
     forced: set[str] = set()
     if previous_head and current_head and previous_head != current_head:
@@ -1417,14 +1451,21 @@ def task_committed_range(root: Path, task: dict[str, Any]) -> dict[str, Any]:
         # Nothing is committed yet, so the committed range is empty by
         # construction rather than unresolvable.
         return {"ok": True, "reason": None, "range": None, "baseline": baseline, "head": head}
-    if not _commit_exists(root, start) and start != EMPTY_TREE_SHA:
-        return {
-            "ok": False,
-            "reason": REVIEW_BASELINE_UNREACHABLE,
-            "range": None,
-            "baseline": baseline,
-            "head": head,
-        }
+    unreachable = {
+        "ok": False,
+        "reason": REVIEW_BASELINE_UNREACHABLE,
+        "range": None,
+        "baseline": baseline,
+        "head": head,
+    }
+    if start == EMPTY_TREE_SHA:
+        # An unborn baseline diffs against Git's empty tree, which every Git
+        # implementation provides implicitly. Verify rather than assume: a
+        # silent failure here would render an empty diff and call it complete.
+        if _rev_parse_verified(root, f"{EMPTY_TREE_SHA}^{{tree}}") is None:
+            return unreachable
+    elif not _commit_exists(root, start):
+        return unreachable
     return {
         "ok": True,
         "reason": None,
@@ -1791,14 +1832,42 @@ def review_change_fingerprint(
     return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
+def evidence_represented_paths(entries: list[dict[str, Any]]) -> set[str]:
+    """Every repository path the rendered review evidence actually speaks for.
+
+    A rename or copy is one canonical destination block that truthfully carries
+    its source in `old_path`, so that block represents both identities. Nothing
+    else counts: listing a filename elsewhere in the packet is not evidence.
+    """
+    represented: set[str] = set()
+    for entry in entries:
+        represented.add(entry["path"])
+        if entry.get("old_path"):
+            represented.add(entry["old_path"])
+    return represented
+
+
 def task_review_coverage(root: Path, task: dict[str, Any], max_chars: int) -> dict[str, Any]:
     """The authoritative review change model for a task.
 
     Freshness and completeness are separate facts and are reported separately.
     A packet may be perfectly fresh and still not represent the whole change
-    set — for example when the task predates baseline identity, or its baseline
-    commit no longer exists. `coverage_complete` is the only field that claims
-    the reviewer is seeing everything; it is never inferred from `current`.
+    set. `coverage_complete` is the only field that claims the reviewer is
+    seeing everything, it is never inferred from `current`, and it is never
+    inferred from the owned-file diff having rendered successfully.
+
+    Completeness requires all four of:
+
+    1. the committed range resolved;
+    2. review diff budgeting succeeded;
+    3. no authoritative task change lies outside declared ownership;
+    4. every authoritative changed path is represented by real evidence.
+
+    Conditions 3 and 4 are the ones that matter when a task commits work it does
+    not own: evidence is generated from `allowed_files`, while the authoritative
+    change set is the whole repository delta, so without this check a packet
+    could name an out-of-scope file in its file list and still claim complete
+    coverage while carrying no patch for it.
     """
     resolved = task_committed_range(root, task)
     coverage = review_diff_coverage(
@@ -1808,12 +1877,27 @@ def task_review_coverage(root: Path, task: dict[str, Any], max_chars: int) -> di
         committed_range=resolved["range"] if resolved["ok"] else None,
     )
     changed_paths = task_changed_files(root, task)
+    allowed = set(task.get("allowed_files", []))
+    out_of_scope = sorted(path for path in changed_paths if path not in allowed)
+    missing_evidence = sorted(set(changed_paths) - evidence_represented_paths(coverage["entries"]))
+
     coverage["committed_range"] = list(resolved["range"]) if resolved["range"] else None
     coverage["baseline_identity"] = resolved["baseline"]
     coverage["head_identity"] = resolved["head"] or git_head_identity(root)
     coverage["changed_paths"] = changed_paths
-    coverage["coverage_complete"] = bool(resolved["ok"] and coverage["ok"])
-    coverage["coverage_reason"] = resolved["reason"] or coverage["reason"]
+    coverage["out_of_scope_paths"] = out_of_scope
+    coverage["missing_evidence_paths"] = missing_evidence
+    coverage["coverage_complete"] = bool(
+        resolved["ok"] and coverage["ok"] and not out_of_scope and not missing_evidence
+    )
+    # Report the root cause, not a downstream symptom: unresolved scope is what
+    # an operator must act on, and it is also why evidence is missing.
+    coverage["coverage_reason"] = (
+        resolved["reason"]
+        or (REVIEW_SCOPE_UNRESOLVED if out_of_scope else None)
+        or coverage["reason"]
+        or (REVIEW_EVIDENCE_INCOMPLETE if missing_evidence else None)
+    )
     coverage["change_fingerprint"] = review_change_fingerprint(
         root, task, resolved, coverage["entries"], changed_paths
     )
@@ -1896,10 +1980,22 @@ def generate_packet(
                 "SERA will not emit a review packet that hides changes."
             )
         if not coverage["coverage_complete"]:
+            reason = coverage["coverage_reason"]
+            if reason == REVIEW_SCOPE_UNRESOLVED:
+                detail = (
+                    f"this task changed {', '.join(coverage['out_of_scope_paths'])} outside its declared "
+                    "ownership, so review evidence cannot represent every change. Split or revert the "
+                    "out-of-scope work, or declare ownership of it deliberately."
+                )
+            elif reason == REVIEW_EVIDENCE_INCOMPLETE:
+                detail = (
+                    f"no review evidence was produced for {', '.join(coverage['missing_evidence_paths'])}, "
+                    "so the packet would understate what changed."
+                )
+            else:
+                detail = "the complete task change set cannot be derived, so the packet would understate what changed."
             raise SeraError(
-                f"{coverage['coverage_reason']}: the complete task change set cannot be derived, so this "
-                "review packet would understate what changed. SERA will not emit a review packet that "
-                "claims coverage it does not have."
+                f"{reason}: {detail} SERA will not emit a review packet that claims coverage it does not have."
             )
     file_index = {item["path"]: item for item in repo_map["files"]}
     owned_meta = [file_index[path] for path in task["allowed_files"] if path in file_index]

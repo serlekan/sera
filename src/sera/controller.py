@@ -215,6 +215,17 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         action, command, reason = "resolve_ownership", None, "No exact owned files are defined."
     elif controller.get("auto_drafted") and not controller.get("ownership_confirmed", False):
         action, command, reason = "confirm_ownership", "sera task confirm", "Auto-selected files are candidates until the controller confirms exact ownership."
+    # Unresolved scope outranks every review-stage report. It is both the root
+    # cause of incomplete review coverage and the thing an operator must act on,
+    # so surfacing `review_coverage_incomplete` here would name a symptom.
+    elif result["out_of_scope"]:
+        action, command, reason = (
+            "resolve_scope",
+            None,
+            f"This task changed {', '.join(result['out_of_scope'])} outside its declared ownership. "
+            "Split or revert the out-of-scope work, or declare ownership of it deliberately; "
+            "review coverage cannot be complete while it stands.",
+        )
     elif stage == "review" and not stage_context.get("review_diff_ok", True):
         # Fail closed rather than hand a reviewer a packet that hides changes.
         action, command, reason = (
@@ -256,8 +267,6 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             None,
             f"Dispatch {lane_label(config, decision.builder)} with packet-build.md; SERA core does not invoke providers directly.",
         )
-    elif result["out_of_scope"]:
-        action, command, reason = "resolve_scope", None, "Working-tree changes exceed declared ownership."
     elif result["missing_verification"]:
         action, command, reason = "verify", "sera verify", "Required verification evidence is missing."
     elif result["stale_reviews"]:
@@ -323,6 +332,8 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             "reason": stage_context.get("review_coverage_reason"),
             "change_fingerprint": stage_context.get("review_change_fingerprint"),
             "committed_range": stage_context.get("review_committed_range"),
+            "out_of_scope_paths": stage_context.get("review_out_of_scope_paths", []),
+            "missing_evidence_paths": stage_context.get("review_missing_evidence_paths", []),
         },
         "seal_status": result["seal_status"],
         "seal_stale_reasons": result["seal_stale_reasons"],

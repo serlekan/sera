@@ -47,9 +47,18 @@ fails with `review_diff_budget_insufficient` instead of quietly omitting one.
 
 The change set spans what the task committed since its baseline commit as well as
 what is still staged or unstaged, so a fully committed branch on a clean worktree
-still reaches the reviewer with real patch material. If the complete change set
-cannot be derived, generation fails rather than emitting a packet that
-understates what changed.
+still reaches the reviewer with real patch material. Generation fails rather than
+emitting a packet that understates what changed — including when the task
+committed work outside its declared ownership, since evidence is produced from
+owned files and could not represent that change:
+
+```bash
+sera next            # resolve_scope: src/unowned.py is outside declared ownership
+sera packet review   # refused: review_scope_unresolved
+```
+
+Split or revert the out-of-scope work, or declare ownership of it deliberately.
+SERA does not widen ownership on its own.
 
 The packet is bound to the exact `HEAD` commit and tree it was generated against,
 and states them in its body. `sera review` records a verdict only against a

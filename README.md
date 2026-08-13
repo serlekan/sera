@@ -262,6 +262,12 @@ hide it. Tasks created before 0.4.2 have no baseline commit recorded and cannot
 have their committed range derived; they report `review_baseline_unbound` and
 fail closed rather than claiming coverage they do not have.
 
+A task started in a repository with **no commits yet** records the explicit
+sentinel `unborn` for its baseline rather than a symbolic revision such as
+`HEAD`, which would silently re-resolve to whatever HEAD became later. Its first
+commit is diffed against Git's empty tree, so the whole first commit — and every
+commit after it — remains reviewable.
+
 ### Tracked SERA policy is reviewable; runtime state is not
 
 `.sera/**` holds two different kinds of file, and 0.4.1 excluded both. Now only
@@ -272,6 +278,12 @@ for ownership, change detection, scope checking, and review evidence. Task
 capsules, packets, ledgers, and seals still cannot reach a review packet, even if
 a repository commits them by mistake.
 
+**Known limitation.** The compact repository map still excludes `.sera/**`
+entirely, so a tracked policy file appears in packets as "not yet indexed in the
+repository map". That affects orientation and context ranking only. Ownership,
+change detection, scope checking, and review evidence for those files are
+complete; the limitation is not a review-coverage gap.
+
 ### Currency and coverage are reported separately
 
 `current` means nothing was tampered with and nothing moved. It never meant "the
@@ -281,10 +293,34 @@ reviewer is seeing everything", and it is no longer allowed to imply it:
 { "state": "dispatch_review", "review_coverage": { "complete": true, "reason": null } }
 ```
 
+`coverage_complete` is true only when **all four** of these hold:
+
+1. the committed range resolved;
+2. review diff budgeting succeeded;
+3. no task change lies outside declared ownership;
+4. every authoritative changed path is represented by real evidence.
+
+Conditions 3 and 4 matter because evidence is generated from the files a task
+*owns*, while the authoritative change set is the whole repository delta. A task
+owning `src/alpha.py` that commits both `src/alpha.py` and `src/unowned.py` has
+no evidence for the second file, so its coverage is not complete — regardless of
+the owned-file diff having rendered perfectly:
+
+```bash
+sera next            # resolve_scope: src/unowned.py is outside declared ownership
+sera packet review   # refused: review_scope_unresolved
+```
+
+`sera packet review` fails closed on that directly, not only through `sera next`,
+so a packet claiming "Change coverage: complete" can never be emitted while an
+out-of-scope task change stands. SERA does not silently widen ownership to make
+the problem go away; splitting, reverting, or deliberately declaring ownership is
+the operator's decision. `sera next --json` reports `out_of_scope_paths` and
+`missing_evidence_paths` under `review_coverage`.
+
 A review packet is dispatchable only when it is current **and** its coverage is
-complete. If the whole change set cannot be derived, SERA refuses to emit the
-packet at all. If every changed file cannot fit the character budget, the
-existing `review_diff_budget_insufficient` failure is unchanged.
+complete. If every changed file cannot fit the character budget, the existing
+`review_diff_budget_insufficient` failure is unchanged.
 
 ### A failed review outranks a missing later gate
 

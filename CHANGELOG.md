@@ -2,6 +2,42 @@
 
 ## 0.4.2 - unreleased
 
+### Canonical-review correction
+
+Canonical review of the first 0.4.2 candidate reproduced two blocking defects.
+Both are corrected here.
+
+- **Coverage completeness could be false.** Review evidence is generated from a
+  task's `allowed_files`, while the authoritative change set is the whole
+  repository delta, and nothing proved the two agreed. A task owning
+  `src/alpha.py` that committed both `src/alpha.py` and `src/unowned.py` on a
+  clean worktree reported `coverage_complete: true` and emitted a packet stating
+  "Change coverage: complete" while carrying no patch for `src/unowned.py`.
+  `coverage_complete` is now true only when the committed range resolved, diff
+  budgeting succeeded, no task change lies outside declared ownership, and every
+  authoritative changed path is represented by real evidence — a rename or copy
+  block representing both its destination and its `old_path`. New reasons
+  `review_scope_unresolved` and `review_evidence_incomplete`, with
+  `out_of_scope_paths` and `missing_evidence_paths` diagnostics. `sera packet
+  review` refuses on direct invocation, not only through `sera next`, and
+  unresolved scope is reported as `resolve_scope` because that is the root cause
+  an operator must act on. Ownership is never widened automatically. The
+  change-set fingerprint continues to bind the full authoritative path set, so
+  out-of-scope work appearing or disappearing still moves it.
+- **Unborn repository identity stored a symbolic revision.** `git rev-parse HEAD`
+  exits non-zero on a repository with no commits but still prints the literal
+  string `HEAD`, and identity resolution trusted stdout instead of exit status.
+  A task created before the first commit stored `head_sha: "HEAD"` and
+  `head_tree_sha: "HEAD^{tree}"`; after the first commit those expressions
+  re-resolved to the new commit, collapsing the baseline→HEAD range and losing
+  every committed change from review. Repository identity now holds immutable
+  Git object IDs or the explicit `unborn` sentinel, resolved through
+  `git rev-parse --verify` with exit status as the authority. An unborn baseline
+  diffs against Git's empty tree, so the first commit and every commit after it
+  remain reviewable as the net change from an empty repository. A commit that
+  cannot resolve its tree fails closed with a `SeraError` rather than being
+  reported as an absent HEAD.
+
 Review identity and coverage integrity. Three controller defects and one
 reporting weakness found by integrating 0.4.1 into a real high-assurance
 repository, fixed generically rather than downstream.

@@ -309,6 +309,8 @@ def select_task_context(
     coverage_reason: str | None = None
     change_fingerprint: str | None = None
     committed_range: list[str] | None = None
+    out_of_scope_paths: list[str] = []
+    missing_evidence_paths: list[str] = []
     if stage == "review":
         # Non-raising here: `sera next` must report an insufficient review-diff
         # budget or incomplete change coverage as controller states rather than
@@ -322,6 +324,8 @@ def select_task_context(
         coverage_reason = coverage["coverage_reason"]
         change_fingerprint = coverage["change_fingerprint"]
         committed_range = coverage["committed_range"]
+        out_of_scope_paths = coverage["out_of_scope_paths"]
+        missing_evidence_paths = coverage["missing_evidence_paths"]
         diff_tokens = estimate_tokens(coverage["text"]) if coverage["text"] else 0
         ledger = read_ledger(task_dir)
         evidence_tokens = estimate_tokens(json.dumps(ledger, sort_keys=True)) if ledger else 0
@@ -362,4 +366,6 @@ def select_task_context(
     report["review_coverage_reason"] = coverage_reason
     report["review_change_fingerprint"] = change_fingerprint
     report["review_committed_range"] = committed_range
+    report["review_out_of_scope_paths"] = out_of_scope_paths
+    report["review_missing_evidence_paths"] = missing_evidence_paths
     return report
