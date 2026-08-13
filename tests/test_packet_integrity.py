@@ -51,6 +51,11 @@ class PacketIntegrityTests(unittest.TestCase):
         git(self.root, "config", "user.email", "test@example.com")
         (self.root / "app.py").write_text("def answer():\n    return 1\n", encoding="utf-8")
         initialize(self.root)
+        # This fixture treats `.sera/` as local runtime configuration rather than
+        # committed policy, because `set_lane` here simulates an operator
+        # retargeting a lane, not a reviewed repository change. Tracked SERA
+        # policy is exercised as repository content in test_sera_policy_paths.
+        (self.root / ".gitignore").write_text(".sera/\n", encoding="utf-8")
         git(self.root, "add", ".")
         git(self.root, "commit", "-m", "baseline")
         build_repo_map(self.root)
@@ -253,13 +258,21 @@ class PacketIntegrityTests(unittest.TestCase):
 
     def test_regeneration_is_stable(self) -> None:
         task_dir = self.make_task()
-        build_packet(self.root, task_dir, "build")
+        packet_path, first_text = build_packet(self.root, task_dir, "build")
         first = self.provenance(task_dir)
-        build_packet(self.root, task_dir, "build")
+        _, second_text = build_packet(self.root, task_dir, "build")
         second = self.provenance(task_dir)
         self.assertEqual(first["route_fingerprint"], second["route_fingerprint"])
-        self.assertEqual(first["content_sha256"], second["content_sha256"])
         self.assertEqual(first["task_contract_fingerprint"], second["task_contract_fingerprint"])
+        self.assertEqual(first["repository_identity"], second["repository_identity"])
+        # The generation timestamp is the only input that legitimately moves
+        # between two regenerations, so it is normalized before comparing bytes
+        # rather than asserting an equality the design does not promise.
+        def normalize(text: str) -> str:
+            return re.sub(r"Packet (checksum|generated): `[^`]+`", "", text)
+
+        self.assertEqual(normalize(first_text), normalize(second_text))
+        self.assertEqual(second["content_sha256"], sha256_bytes(packet_path.read_bytes()))
 
     # --- H: review packets obey the same rules --------------------------------
     def test_review_packet_route_and_content_are_enforced(self) -> None:

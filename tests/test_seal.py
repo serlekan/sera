@@ -74,7 +74,10 @@ class SealRepository:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("def answer():\n    return 42\n", encoding="utf-8")
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "reviewer", "correct")
+        record_review(
+            task_dir, fingerprint, "ship", "reviewer", "correct",
+            repository_identity=git_head_identity(self.root),
+        )
         return task_dir, create_seal(self.root, task_dir)
 
 
@@ -257,7 +260,10 @@ class SealReviewBindingTests(SealRepository, unittest.TestCase):
     def test_appending_a_review_record_invalidates_the_seal(self) -> None:
         task_dir, _ = self.seal_task()
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "second-reviewer", "also fine", "supplementary")
+        record_review(
+            task_dir, fingerprint, "ship", "second-reviewer", "also fine", "supplementary",
+            repository_identity=git_head_identity(self.root),
+        )
         result = check_task(self.root, task_dir)
         self.assertTrue(result["seal_stale"])
         self.assertIn(SEAL_REVIEW_MISMATCH, result["seal_stale_reasons"])
@@ -269,8 +275,14 @@ class SealReviewBindingTests(SealRepository, unittest.TestCase):
         )
         (self.root / "src" / "app.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "independent-peer", "correct", "independent")
-        record_review(task_dir, fingerprint, "ship", "release-gate", "acceptable", "gate")
+        record_review(
+            task_dir, fingerprint, "ship", "independent-peer", "correct", "independent",
+            repository_identity=git_head_identity(self.root),
+        )
+        record_review(
+            task_dir, fingerprint, "ship", "release-gate", "acceptable", "gate",
+            repository_identity=git_head_identity(self.root),
+        )
         create_seal(self.root, task_dir)
         self.assertFalse(check_task(self.root, task_dir)["seal_stale"])
 
@@ -400,7 +412,12 @@ class RequireSealCliTests(unittest.TestCase):
             "--file", "app.py",
         )
         (self.root / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-        self.run_cli("review", "--verdict", "ship", "--reviewer", "peer", "--reason", "correct")
+        # 0.4.2 records a verdict only against a current review packet, so the
+        # reviewed HEAD and tree are derived from the repository rather than
+        # asserted by the caller.
+        self.run_cli("packet", "review")
+        reviewed = self.run_cli("review", "--verdict", "ship", "--reviewer", "peer", "--reason", "correct")
+        self.assertIn("Bound to HEAD", reviewed.stdout)
         sealed = self.run_cli("seal")
         self.assertIn("Bound to HEAD", sealed.stdout)
         self.run_cli("check", "--require-seal")

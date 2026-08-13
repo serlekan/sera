@@ -14,6 +14,11 @@ from typing import Any, Iterable
 from . import __version__
 
 STATE_DIR = ".sera"
+# `.sera/**` holds two different kinds of file. These subtrees and files are
+# machine-generated SERA runtime state; everything else under `.sera/` is
+# ordinary repository content, reviewed like any other tracked file.
+SERA_RUNTIME_DIRS = ("cache", "tasks")
+SERA_RUNTIME_FILES = ("latest-task",)
 VALID_MODES = ("fast", "standard", "assured")
 MODE_RANK = {"fast": 1, "standard": 2, "assured": 3}
 BUILTIN_DEFAULT_MODE = "standard"
@@ -32,6 +37,9 @@ SEAL_SCHEMA_INCONSISTENT = "seal_schema_inconsistent"
 SEAL_V2_REQUIRED_FIELDS = ("task_id", "sealed_at", "fingerprint", "repository_identity", "review_ledger_fingerprint")
 SEAL_V2_ONLY_FIELDS = ("repository_identity", "review_ledger_fingerprint")
 UNBORN_HEAD = "unborn"
+# Git's canonical empty tree. A task whose baseline predates the first commit
+# compares against this rather than inventing a commit that never existed.
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 REVIEW_DIFF_BUDGET_INSUFFICIENT = "review_diff_budget_insufficient"
 # Every changed file is guaranteed at least this many characters of real patch
@@ -39,11 +47,31 @@ REVIEW_DIFF_BUDGET_INSUFFICIENT = "review_diff_budget_insufficient"
 MIN_FILE_DIFF_CHARS = 320
 BLOCK_SEPARATOR = "\n\n"
 
-PACKET_SCHEMA_VERSION = 2
+# Why an accepted review no longer describes the current repository state.
+REVIEW_FINGERPRINT_MISMATCH = "review_fingerprint_mismatch"
+REVIEW_HEAD_MISMATCH = "review_head_mismatch"
+REVIEW_HEAD_TREE_MISMATCH = "review_head_tree_mismatch"
+REVIEW_REPOSITORY_UNBOUND = "review_repository_unbound"
+# Why a task's cumulative change set cannot be derived completely.
+REVIEW_BASELINE_UNBOUND = "review_baseline_unbound"
+REVIEW_BASELINE_UNREACHABLE = "review_baseline_unreachable"
+
+# Sources a single changed file's evidence can come from, oldest first.
+CHANGE_SOURCES = ("committed", "staged", "unstaged")
+
+PACKET_SCHEMA_VERSION = 3
+# 0.4.1 packets. They carry no repository identity and no change-set binding,
+# so they can never satisfy 0.4.2 exact-head review dispatch.
+PACKET_LEGACY_SCHEMA_VERSIONS = (2,)
 PACKET_MISSING = "packet_missing"
 PACKET_UNBOUND = "packet_unbound"
+PACKET_LEGACY_SCHEMA = "packet_legacy_schema"
 PACKET_STALE_CONTRACT = "packet_stale_contract"
+PACKET_STALE_HEAD = "packet_stale_head"
+PACKET_STALE_HEAD_TREE = "packet_stale_head_tree"
 PACKET_STALE_STATE = "packet_stale_state"
+PACKET_STALE_CHANGE_SET = "packet_stale_change_set"
+PACKET_COVERAGE_INCOMPLETE = "packet_coverage_incomplete"
 PACKET_STALE_ROUTE = "packet_stale_route"
 PACKET_CONTENT_MISMATCH = "packet_content_mismatch"
 # Semantic task-contract fields. Generated artifacts are bound to a hash of
@@ -192,6 +220,28 @@ def normalize_repo_path(value: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
+
+
+def is_sera_runtime_path(path: str) -> bool:
+    """True when a repository path is SERA runtime state rather than content.
+
+    Excluding all of `.sera/**` was too coarse: it hid a project's own reviewed
+    policy — `.sera/config.json`, `.sera/POLICY.md`, and anything else a team
+    chooses to track there — from ownership, change detection, scope checking,
+    and review evidence. Only generated runtime state is excluded now: the
+    repository-map cache, per-task capsules, packets, ledgers, seals, and the
+    latest-task pointer. Nothing under `.sera/tasks/**` or `.sera/cache/**` can
+    reach a review packet.
+    """
+    normalized = normalize_repo_path(path)
+    if normalized == STATE_DIR:
+        return True
+    if not normalized.startswith(f"{STATE_DIR}/"):
+        return False
+    remainder = normalized[len(STATE_DIR) + 1 :]
+    if not remainder:
+        return True
+    return remainder.split("/", 1)[0] in SERA_RUNTIME_DIRS or remainder in SERA_RUNTIME_FILES
 
 
 def text_tokens(value: str) -> list[str]:
@@ -888,6 +938,10 @@ def new_task(
         "builder_attempts": 0,
         "status": "specified",
         "baseline_changes": working_tree_snapshot(root),
+        # Engineering state established when the task begins. Committed review
+        # coverage is derived from this baseline, never re-inferred from a later
+        # HEAD, so a task cannot retroactively disown what it committed.
+        "baseline_repository_identity": git_head_identity(root),
     }
     (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     (task_dir / "ledger.jsonl").write_text("", encoding="utf-8")
@@ -945,6 +999,9 @@ def write_packet_provenance(
     state_fingerprint: str | None = None,
     route_identity_fingerprint: str | None = None,
     content_sha256: str | None = None,
+    repository_identity: dict[str, str] | None = None,
+    review_change_fingerprint: str | None = None,
+    coverage_complete: bool | None = None,
 ) -> dict[str, Any]:
     provenance = {
         "schema_version": PACKET_SCHEMA_VERSION,
@@ -954,6 +1011,12 @@ def write_packet_provenance(
         "state_fingerprint": state_fingerprint,
         "route_fingerprint": route_identity_fingerprint,
         "content_sha256": content_sha256,
+        # The exact repository the packet was generated against. Authoritative
+        # for review handoffs; recorded for build handoffs as provenance only,
+        # because a builder committing its own work must not stale its packet.
+        "repository_identity": repository_identity,
+        "review_change_fingerprint": review_change_fingerprint,
+        "coverage_complete": coverage_complete,
         # Diagnostics only. Freshness never trusts this object; the route is
         # independently re-resolved and re-fingerprinted at validation time.
         "route": route or {},
@@ -976,6 +1039,11 @@ def read_packet_provenance(task_dir: Path, stage: str) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _valid_identity(value: Any) -> bool:
+    """True when a stored repository identity carries both required fields."""
+    return isinstance(value, dict) and bool(value.get("head_sha")) and bool(value.get("head_tree_sha"))
+
+
 def packet_state(
     root: Path,
     task_dir: Path,
@@ -987,18 +1055,32 @@ def packet_state(
     """Decide whether a generated packet may still be dispatched.
 
     Existence is never sufficient, and recorded metadata is never trusted on its
-    own. The task contract, the resolved route, and the packet's own bytes are
-    all recomputed from current state and compared, so editing the stored route
-    strings, the embedded Markdown checksum, or the packet body cannot make a
-    stale packet look current. Validation is ordered and every failure is a
-    closed one:
+    own. The task contract, the repository identity, the represented change set,
+    the resolved route, and the packet's own bytes are all recomputed from
+    current state and compared, so editing the stored route strings, the
+    embedded Markdown checksum, or the packet body cannot make a stale packet
+    look current.
 
-        missing -> unbound -> contract -> state -> route -> content -> current
+    A review packet additionally binds the exact HEAD commit and tree it was
+    generated against. Moving HEAD — including by an empty commit that leaves
+    the tree and the working delta untouched — makes it stale, because the
+    reviewer inspected a different repository than the one now standing. Build
+    packets record identity but are not invalidated by it: committing an
+    implementation must not stale the handoff that produced it.
+
+    Validation is ordered and every failure is a closed one:
+
+        missing -> unbound -> contract -> head -> tree -> state
+                -> coverage -> change set -> route -> content -> current
     """
     packet = task_dir / f"packet-{stage}.md"
     if not packet.exists():
         return {"exists": False, "current": False, "reason": PACKET_MISSING}
     provenance = read_packet_provenance(task_dir, stage)
+    if provenance and provenance.get("schema_version") in PACKET_LEGACY_SCHEMA_VERSIONS:
+        # A 0.4.1 packet predates identity and change-set binding entirely. It
+        # must never be mistaken for an exact-head-bound 0.4.2 packet.
+        return {"exists": True, "current": False, "reason": PACKET_LEGACY_SCHEMA}
     if (
         not provenance
         or provenance.get("schema_version") != PACKET_SCHEMA_VERSION
@@ -1007,12 +1089,27 @@ def packet_state(
         or not provenance.get("task_contract_fingerprint")
         or not provenance.get("route_fingerprint")
         or not provenance.get("content_sha256")
+        or not _valid_identity(provenance.get("repository_identity"))
+        or (stage == "review" and not provenance.get("review_change_fingerprint"))
     ):
         return {"exists": True, "current": False, "reason": PACKET_UNBOUND}
     if provenance["task_contract_fingerprint"] != task_contract_fingerprint(task):
         return {"exists": True, "current": False, "reason": PACKET_STALE_CONTRACT}
+    if stage == "review":
+        bound = provenance["repository_identity"]
+        current = git_head_identity(root)
+        if bound.get("head_sha") != current.get("head_sha"):
+            return {"exists": True, "current": False, "reason": PACKET_STALE_HEAD}
+        if bound.get("head_tree_sha") != current.get("head_tree_sha"):
+            return {"exists": True, "current": False, "reason": PACKET_STALE_HEAD_TREE}
     if state_fingerprint is not None and provenance.get("state_fingerprint") != state_fingerprint:
         return {"exists": True, "current": False, "reason": PACKET_STALE_STATE}
+    if stage == "review":
+        coverage = task_review_coverage(root, task, int(load_config(root)["max_packet_chars"]))
+        if provenance.get("coverage_complete") is not True or not coverage["coverage_complete"]:
+            return {"exists": True, "current": False, "reason": PACKET_COVERAGE_INCOMPLETE}
+        if provenance["review_change_fingerprint"] != coverage["change_fingerprint"]:
+            return {"exists": True, "current": False, "reason": PACKET_STALE_CHANGE_SET}
     try:
         decision = decide_route(root, task, repo_map)
         current_route = route_fingerprint(load_config(root), decision)
@@ -1191,7 +1288,7 @@ def working_tree_snapshot(root: Path) -> dict[str, str]:
         if status.startswith("R") or status.endswith("R") or status.startswith("C") or status.endswith("C"):
             skip_next_rename_source = True
         normalized = raw.replace("\\", "/")
-        if normalized == STATE_DIR or normalized.startswith(f"{STATE_DIR}/"):
+        if is_sera_runtime_path(normalized):
             continue
         path = root / raw
         if path.is_file():
@@ -1207,12 +1304,18 @@ def working_tree_snapshot(root: Path) -> dict[str, str]:
     return snapshot
 
 
-def task_changed_files(root: Path, task: dict[str, Any]) -> list[str]:
+def task_working_changes(root: Path, task: dict[str, Any]) -> list[str]:
+    """Paths whose working-tree state differs from the task's dirty baseline.
+
+    A path that was already dirty when the task began and has not moved since
+    is not a task change; a path the task touched afterwards is.
+    """
     baseline = task.get("baseline_changes", {})
     current = working_tree_snapshot(root)
     if not isinstance(baseline, dict):
         return sorted(current)
     return sorted(path for path in set(baseline) | set(current) if baseline.get(path) != current.get(path))
+
 
 def changed_files(root: Path) -> list[str]:
     output = run_git(root, "status", "--porcelain=v1", "-z")
@@ -1230,7 +1333,7 @@ def changed_files(root: Path) -> list[str]:
         if status.startswith("R") or status.endswith("R") or status.startswith("C") or status.endswith("C"):
             skip_next_rename_source = True
         normalized = raw.replace("\\", "/")
-        if normalized == STATE_DIR or normalized.startswith(f"{STATE_DIR}/"):
+        if is_sera_runtime_path(normalized):
             continue
         paths.append(normalized)
     return sorted(set(paths))
@@ -1271,21 +1374,141 @@ def _parse_raw_z(output: str) -> list[dict[str, Any]]:
     return records
 
 
-def _collect_changed_files(root: Path, allowed_files: list[str]) -> list[dict[str, Any]]:
-    """Build one change record per changed owned file, staged and unstaged.
+def task_baseline_identity(task: dict[str, Any]) -> dict[str, str] | None:
+    """The repository identity recorded when the task was created, if any.
 
-    Records are keyed and returned by path so no file can be lost between the
-    beginning and end of a combined patch.
+    Tasks created before 0.4.2 have none. They are readable and auditable, but
+    their committed change range cannot be derived, so they fail closed rather
+    than claiming complete review coverage.
+    """
+    identity = task.get("baseline_repository_identity")
+    if not isinstance(identity, dict):
+        return None
+    head = identity.get("head_sha")
+    tree = identity.get("head_tree_sha")
+    if not isinstance(head, str) or not head or not isinstance(tree, str) or not tree:
+        return None
+    return {"head_sha": head, "head_tree_sha": tree}
+
+
+def _commit_exists(root: Path, sha: str) -> bool:
+    """True when `sha` still resolves to a commit object in this repository."""
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=root, capture_output=True
+    )
+    return result.returncode == 0
+
+
+def task_committed_range(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the commit range a task's committed changes live in.
+
+    The range runs from the task's baseline commit to the current HEAD. An
+    unborn baseline compares against Git's empty tree rather than pretending a
+    commit existed. When the range cannot be resolved at all — no baseline was
+    recorded, or the baseline commit is no longer present — this reports the
+    exact reason instead of silently degrading to working-tree-only coverage.
+    """
+    baseline = task_baseline_identity(task)
+    if baseline is None:
+        return {"ok": False, "reason": REVIEW_BASELINE_UNBOUND, "range": None, "baseline": None, "head": None}
+    head = git_head_identity(root)
+    start = EMPTY_TREE_SHA if baseline["head_sha"] == UNBORN_HEAD else baseline["head_sha"]
+    if head["head_sha"] == UNBORN_HEAD:
+        # Nothing is committed yet, so the committed range is empty by
+        # construction rather than unresolvable.
+        return {"ok": True, "reason": None, "range": None, "baseline": baseline, "head": head}
+    if not _commit_exists(root, start) and start != EMPTY_TREE_SHA:
+        return {
+            "ok": False,
+            "reason": REVIEW_BASELINE_UNREACHABLE,
+            "range": None,
+            "baseline": baseline,
+            "head": head,
+        }
+    return {
+        "ok": True,
+        "reason": None,
+        "range": (start, head["head_sha"]),
+        "baseline": baseline,
+        "head": head,
+    }
+
+
+def committed_change_records(
+    root: Path, committed_range: tuple[str, str] | None, paths: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Raw change records between two commits, excluding SERA runtime state."""
+    if committed_range is None or committed_range[0] == committed_range[1]:
+        return []
+    args = ["diff", "--no-ext-diff", "--raw", "-M", "-z", committed_range[0], committed_range[1]]
+    if paths:
+        args = [*args, "--", *paths]
+    records = _parse_raw_z(run_git(root, *args, check=False))
+    return [record for record in records if not is_sera_runtime_path(record["path"])]
+
+
+def task_changed_files(root: Path, task: dict[str, Any]) -> list[str]:
+    """Every path this task changed, committed or not.
+
+    Repository state outranks builder narrative: a file committed after the task
+    began is a task change even when the worktree is clean, so committing an
+    out-of-scope edit cannot hide it. Pre-existing dirty paths the task never
+    touched stay outside task scope.
+    """
+    paths = set(task_working_changes(root, task))
+    resolved = task_committed_range(root, task)
+    for record in committed_change_records(root, resolved["range"]):
+        paths.add(record["path"])
+        if record["old_path"] and not is_sera_runtime_path(record["old_path"]):
+            paths.add(record["old_path"])
+    return sorted(paths)
+
+
+def _raw_diff_args(source: str, committed_range: tuple[str, str] | None) -> list[str]:
+    base = ["diff", "--no-ext-diff", "--raw", "-M", "-z"]
+    if source == "committed":
+        return [*base, committed_range[0], committed_range[1]]  # type: ignore[index]
+    if source == "staged":
+        return ["diff", "--cached", "--no-ext-diff", "--raw", "-M", "-z"]
+    return base
+
+
+def _patch_diff_args(source: str, committed_range: tuple[str, str] | None) -> list[str]:
+    base = ["diff", "--no-ext-diff", "--unified=3", "-M"]
+    if source == "committed":
+        return [*base, committed_range[0], committed_range[1]]  # type: ignore[index]
+    if source == "staged":
+        return ["diff", "--cached", "--no-ext-diff", "--unified=3", "-M"]
+    return base
+
+
+def _collect_changed_files(
+    root: Path,
+    allowed_files: list[str],
+    committed_range: tuple[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build one change record per changed owned file across every source.
+
+    A file changes in up to three places — committed since the task baseline,
+    staged, and unstaged — and a reviewer needs all of them. Records are keyed
+    and returned by path so one file is always exactly one canonical review
+    block carrying its cumulative task-relative change, never several competing
+    blocks and never a file lost between the beginning and end of a combined
+    patch.
     """
     if not allowed_files:
         return []
+    sources = [
+        source
+        for source in CHANGE_SOURCES
+        if source != "committed" or (committed_range is not None and committed_range[0] != committed_range[1])
+    ]
     changes: dict[str, dict[str, Any]] = {}
-    for cached in (False, True):
-        args = ["diff", "--no-ext-diff", "--raw", "-M", "-z"]
-        if cached:
-            args.insert(1, "--cached")
-        raw = run_git(root, *args, "--", *allowed_files, check=False)
+    for source in sources:
+        raw = run_git(root, *_raw_diff_args(source, committed_range), "--", *allowed_files, check=False)
         for record in _parse_raw_z(raw):
+            if is_sera_runtime_path(record["path"]):
+                continue
             entry = changes.setdefault(
                 record["path"],
                 {
@@ -1294,36 +1517,44 @@ def _collect_changed_files(root: Path, allowed_files: list[str]) -> list[dict[st
                     "old_path": record["old_path"],
                     "old_sha": record["old_sha"],
                     "new_sha": record["new_sha"],
-                    "staged": False,
-                    "unstaged": False,
+                    "sources": {},
                     "patch": "",
                     "binary": False,
                 },
             )
-            entry["staged" if cached else "unstaged"] = True
-            if record["old_path"]:
-                entry["old_path"] = record["old_path"]
-                entry["status"] = record["status"]
+            entry["sources"][source] = record
 
     for path, entry in changes.items():
+        present = [source for source in CHANGE_SOURCES if source in entry["sources"]]
+        # Blob identity spans the whole task range: the oldest source supplies
+        # where the file started, the newest where it stands now.
+        entry["old_sha"] = entry["sources"][present[0]]["old_sha"]
+        entry["new_sha"] = entry["sources"][present[-1]]["new_sha"]
+        entry["status"] = entry["sources"][present[-1]]["status"]
+        for source in present:
+            if entry["sources"][source]["old_path"]:
+                entry["old_path"] = entry["sources"][source]["old_path"]
+                entry["status"] = entry["sources"][source]["status"]
         sections: list[str] = []
-        for cached in (False, True):
-            if not entry["staged" if cached else "unstaged"]:
-                continue
-            args = ["diff", "--no-ext-diff", "--unified=3", "-M"]
-            if cached:
-                args.insert(1, "--cached")
-            patch = run_git(root, *args, "--", path, check=False)
+        for source in present:
+            patch = run_git(root, *_patch_diff_args(source, committed_range), "--", path, check=False)
             if patch.strip():
-                label = "staged" if cached else "unstaged"
-                sections.append(f"# {label}\n{patch}")
+                sections.append(f"# {source}\n{patch}")
         entry["patch"] = "\n".join(sections)
         entry["binary"] = "Binary files" in entry["patch"] or "GIT binary patch" in entry["patch"]
+        entry["staged"] = "staged" in entry["sources"]
+        entry["unstaged"] = "unstaged" in entry["sources"]
+        entry["committed"] = "committed" in entry["sources"]
+        entry["sources"] = present
 
     tracked = set(run_git(root, "ls-files").splitlines())
     for relative in allowed_files:
         path = root / relative
         if relative in changes or relative in tracked or not path.is_file():
+            continue
+        if is_sera_runtime_path(relative):
+            # Owning a runtime path cannot turn generated state into review
+            # content; the untracked fallback obeys the same rule as Git's.
             continue
         try:
             data = path.read_bytes()
@@ -1340,6 +1571,8 @@ def _collect_changed_files(root: Path, allowed_files: list[str]) -> list[dict[st
             "old_path": None,
             "old_sha": "0" * 7,
             "new_sha": sha256_bytes(data)[:7],
+            "sources": ["unstaged"],
+            "committed": False,
             "staged": False,
             "unstaged": True,
             "patch": f"# untracked\n{body}",
@@ -1387,7 +1620,7 @@ def _render_change_block(entry: dict[str, Any], body_allowance: int) -> str:
     """
     body = _bound_patch(entry["patch"], body_allowance)
     status = _STATUS_LABELS.get(entry["status"][:1], entry["status"])
-    where = "+".join(part for part, flag in (("staged", entry["staged"]), ("unstaged", entry["unstaged"])) if flag)
+    where = "+".join(entry["sources"])
     lines = [
         f"### `{entry['path']}`",
         f"- status: {status}" + (f" (from `{entry['old_path']}`)" if entry.get("old_path") else ""),
@@ -1406,8 +1639,18 @@ def _render_change_blocks(entries: list[dict[str, Any]], allocations: list[int])
     )
 
 
-def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -> dict[str, Any]:
+def review_diff_coverage(
+    root: Path,
+    allowed_files: list[str],
+    max_chars: int,
+    *,
+    committed_range: tuple[str, str] | None = None,
+) -> dict[str, Any]:
     """Render a per-file review diff in which no changed file can be omitted.
+
+    `committed_range` extends the change set beyond the working tree to the
+    commits a task produced, so a fully committed, clean branch still reaches
+    the reviewer with real patch material.
 
     `max_chars` counts Python string characters (Unicode code points), matching
     `len(text)`; it is not a UTF-8 byte count.
@@ -1419,13 +1662,14 @@ def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -
     reported, `len(text) <= max_chars` holds exactly — there is no estimate and
     no tolerance.
     """
-    entries = _collect_changed_files(root, allowed_files)
+    entries = _collect_changed_files(root, allowed_files, committed_range)
     if not entries:
         return {
             "ok": True,
             "text": "No task-relative changes to review.",
             "files": [],
             "covered": [],
+            "entries": [],
             "required_chars": 0,
             "rendered_chars": 0,
             "reason": None,
@@ -1441,6 +1685,7 @@ def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -
             "text": "",
             "files": [entry["path"] for entry in entries],
             "covered": [],
+            "entries": entries,
             "required_chars": required,
             "rendered_chars": 0,
             "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
@@ -1483,6 +1728,7 @@ def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -
             "text": "",
             "files": [entry["path"] for entry in entries],
             "covered": [],
+            "entries": entries,
             "required_chars": required,
             "rendered_chars": len(text),
             "reason": REVIEW_DIFF_BUDGET_INSUFFICIENT,
@@ -1501,10 +1747,77 @@ def review_diff_coverage(root: Path, allowed_files: list[str], max_chars: int) -
         "text": text,
         "files": [entry["path"] for entry in entries],
         "covered": covered,
+        "entries": entries,
         "required_chars": required,
         "rendered_chars": len(text),
         "reason": None,
     }
+
+
+def review_change_fingerprint(
+    root: Path,
+    task: dict[str, Any],
+    resolved_range: dict[str, Any],
+    entries: list[dict[str, Any]],
+    changed_paths: list[str],
+) -> str:
+    """Deterministic identity of the exact change set a review packet represents.
+
+    Binds the range endpoints, the complete changed-path set, and each covered
+    file's status, blob identity, sources, and patch bytes. Anything that moves
+    the review target — a new commit in the range, a staged/unstaged edit, a
+    file appearing or disappearing, a patch changing under an unchanged name —
+    changes this value. A displayed filename count would not.
+    """
+    payload = {
+        "baseline": resolved_range.get("baseline"),
+        "head": resolved_range.get("head"),
+        "range": list(resolved_range["range"]) if resolved_range.get("range") else None,
+        "changed_paths": sorted(changed_paths),
+        "files": [
+            {
+                "path": entry["path"],
+                "status": entry["status"],
+                "old_path": entry.get("old_path"),
+                "old_sha": entry["old_sha"],
+                "new_sha": entry["new_sha"],
+                "sources": list(entry["sources"]),
+                "binary": bool(entry["binary"]),
+                "patch_sha256": sha256_text(entry["patch"]),
+            }
+            for entry in entries
+        ],
+    }
+    return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def task_review_coverage(root: Path, task: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """The authoritative review change model for a task.
+
+    Freshness and completeness are separate facts and are reported separately.
+    A packet may be perfectly fresh and still not represent the whole change
+    set — for example when the task predates baseline identity, or its baseline
+    commit no longer exists. `coverage_complete` is the only field that claims
+    the reviewer is seeing everything; it is never inferred from `current`.
+    """
+    resolved = task_committed_range(root, task)
+    coverage = review_diff_coverage(
+        root,
+        list(task.get("allowed_files", [])),
+        max_chars,
+        committed_range=resolved["range"] if resolved["ok"] else None,
+    )
+    changed_paths = task_changed_files(root, task)
+    coverage["committed_range"] = list(resolved["range"]) if resolved["range"] else None
+    coverage["baseline_identity"] = resolved["baseline"]
+    coverage["head_identity"] = resolved["head"] or git_head_identity(root)
+    coverage["changed_paths"] = changed_paths
+    coverage["coverage_complete"] = bool(resolved["ok"] and coverage["ok"])
+    coverage["coverage_reason"] = resolved["reason"] or coverage["reason"]
+    coverage["change_fingerprint"] = review_change_fingerprint(
+        root, task, resolved, coverage["entries"], changed_paths
+    )
+    return coverage
 
 
 def compact_diff(root: Path, allowed_files: list[str], max_chars: int) -> str:
@@ -1571,6 +1884,23 @@ def generate_packet(
     config = load_config(root)
     repo_map = build_repo_map(root)
     decision = decide_route(root, task, repo_map)
+    head_identity = git_head_identity(root)
+    coverage: dict[str, Any] | None = None
+    if stage == "review":
+        coverage = task_review_coverage(root, task, int(config["max_packet_chars"]))
+        if not coverage["ok"]:
+            raise SeraError(
+                f"{coverage['reason']}: reviewing {len(coverage['files'])} changed files needs at least "
+                f"{coverage['required_chars']:,} characters but max_packet_chars is "
+                f"{int(config['max_packet_chars']):,}. Raise max_packet_chars or split the task; "
+                "SERA will not emit a review packet that hides changes."
+            )
+        if not coverage["coverage_complete"]:
+            raise SeraError(
+                f"{coverage['coverage_reason']}: the complete task change set cannot be derived, so this "
+                "review packet would understate what changed. SERA will not emit a review packet that "
+                "claims coverage it does not have."
+            )
     file_index = {item["path"]: item for item in repo_map["files"]}
     owned_meta = [file_index[path] for path in task["allowed_files"] if path in file_index]
     owned_lines = []
@@ -1643,7 +1973,22 @@ def generate_packet(
         *([f"- `{item}`" for item in task["verification"]] or ["- Verification is unresolved. Stop before implementation."]),
     ]
     if stage == "review":
+        assert coverage is not None  # set above for every review packet
+        baseline = coverage["baseline_identity"] or {}
+        committed = coverage["committed_range"]
         packet.extend([
+            "",
+            "## Repository review identity",
+            "",
+            "This review is bound to the exact repository state below. If HEAD moves before the",
+            "verdict is recorded, this packet is stale and SERA will refuse the review.",
+            "",
+            f"- HEAD: `{head_identity['head_sha']}`",
+            f"- HEAD tree: `{head_identity['head_tree_sha']}`",
+            f"- Task baseline HEAD: `{baseline.get('head_sha', 'unrecorded')}`",
+            "- Committed range: " + (f"`{committed[0]}..{committed[1]}`" if committed else "none"),
+            f"- Change set fingerprint: `{coverage['change_fingerprint']}`",
+            "- Change coverage: complete",
             "",
             "## Evidence ledger",
             "",
@@ -1652,16 +1997,17 @@ def generate_packet(
             "## Changed files",
             "",
             "Every changed file is represented below and in the bounded diff, whether or not",
-            "its full contents were selected into review context.",
+            "its full contents were selected into review context. Changes committed since the",
+            "task baseline are included alongside staged and unstaged work.",
             "",
-            *([f"- `{item}`" for item in task_changed_files(root, task)] or ["- No task-relative working-tree changes detected."]),
+            *([f"- `{item}`" for item in coverage["changed_paths"]] or ["- No task-relative changes detected."]),
             "",
             "## Per-file change evidence",
             "",
             "Each changed file below carries bounded patch material of its own. If the budget",
             "could not cover every changed file, this packet would have failed instead.",
             "",
-            compact_diff(root, task["allowed_files"], int(config["max_packet_chars"])),
+            coverage["text"],
             "",
             "## Required verdict",
             "",
@@ -1692,6 +2038,9 @@ def generate_packet(
         state_fingerprint=task_fingerprint(root, task_dir) if stage == "review" else None,
         route_identity_fingerprint=route_fingerprint(config, decision),
         content_sha256=content_sha256,
+        repository_identity=head_identity,
+        review_change_fingerprint=coverage["change_fingerprint"] if coverage else None,
+        coverage_complete=True if coverage else None,
     )
     return path, text
 
@@ -1704,7 +2053,7 @@ def task_fingerprint(root: Path, task_dir: Path) -> str:
     untracked_parts: list[bytes] = []
     for relative in sorted(run_git(root, "ls-files", "--others", "--exclude-standard").splitlines()):
         normalized = relative.replace("\\", "/")
-        if normalized == STATE_DIR or normalized.startswith(f"{STATE_DIR}/"):
+        if is_sera_runtime_path(normalized):
             continue
         path = root / relative
         if path.is_file():
@@ -1956,39 +2305,56 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         required_review_stages.append("independent")
     if decision.gate:
         required_review_stages.append("gate")
+    head_identity = git_head_identity(root)
     reviews = read_reviews(task_dir)
     latest_by_stage: dict[str, dict[str, Any]] = {}
     for review in reviews:
         latest_by_stage[review["stage"]] = review
-    missing_reviews = [stage for stage in required_review_stages if stage not in latest_by_stage]
-    stale_reviews = [
-        stage
-        for stage in required_review_stages
-        if stage in latest_by_stage and latest_by_stage[stage].get("fingerprint") != fingerprint
-    ]
-    failed_reviews = [
-        stage
+    review_states = {
+        stage: evaluate_review_record(latest_by_stage[stage], fingerprint, head_identity)
         for stage in required_review_stages
         if stage in latest_by_stage
-        and latest_by_stage[stage].get("fingerprint") == fingerprint
-        and latest_by_stage[stage].get("verdict") != "ship"
+    }
+    missing_reviews = [stage for stage in required_review_stages if stage not in latest_by_stage]
+    stale_reviews = [stage for stage in review_states if not review_states[stage]["current"]]
+    failed_reviews = [
+        stage
+        for stage in review_states
+        if review_states[stage]["current"] and review_states[stage]["verdict"] != "ship"
     ]
+    stale_review_reasons = {stage: review_states[stage]["reasons"] for stage in stale_reviews}
     ok = not out_of_scope and not missing_verification and not missing_reviews and not stale_reviews and not failed_reviews
     if out_of_scope:
         next_action = "Split or revert out-of-scope files before continuing."
     elif missing_verification:
         next_action = "Run `sera verify` or record the missing verification evidence."
     elif stale_reviews:
-        next_action = "Regenerate the review packet and repeat stale review stages."
-    elif missing_reviews:
-        next_action = f"Obtain required review stage: {missing_reviews[0]}."
+        if any(REVIEW_REPOSITORY_UNBOUND in reasons for reasons in stale_review_reasons.values()):
+            next_action = (
+                "A required review predates exact-HEAD binding and cannot satisfy 0.4.2 acceptance. "
+                "Regenerate the review packet and repeat the review."
+            )
+        elif any(
+            REVIEW_HEAD_MISMATCH in reasons or REVIEW_HEAD_TREE_MISMATCH in reasons
+            for reasons in stale_review_reasons.values()
+        ):
+            next_action = (
+                "HEAD moved after review; the accepted reviews describe a different commit. "
+                "Regenerate the review packet and repeat the review at the current HEAD."
+            )
+        else:
+            next_action = "Regenerate the review packet and repeat stale review stages."
+    # A rejected implementation stops the workflow here. Asking for a later gate
+    # before the earlier stage's findings are addressed would dispatch a release
+    # review for work the independent stage already refused.
     elif failed_reviews:
         next_action = "Address reviewer findings, rerun verification, and review the new fingerprint."
+    elif missing_reviews:
+        next_action = f"Obtain required review stage: {missing_reviews[0]}."
     else:
         next_action = "The current tree satisfies the task contract; proceed to the separate commit decision."
     seal_path = task_dir / "seal.json"
     seal = json.loads(seal_path.read_text(encoding="utf-8")) if seal_path.exists() else None
-    head_identity = git_head_identity(root)
     review_fingerprint = review_ledger_fingerprint(task_dir)
     seal_state = evaluate_seal(seal, fingerprint, head_identity, review_fingerprint)
     seal_stale = seal_state["stale"]
@@ -2027,9 +2393,12 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         "review_ledger_fingerprint": review_fingerprint,
         "required_review_stages": required_review_stages,
         "reviews": latest_by_stage,
+        "review_states": review_states,
         "missing_reviews": missing_reviews,
         "stale_reviews": stale_reviews,
+        "stale_review_reasons": stale_review_reasons,
         "failed_reviews": failed_reviews,
+        "baseline_repository_identity": task_baseline_identity(task),
         "seal": seal,
         "seal_stale": seal_stale,
         "seal_status": seal_state["status"],
@@ -2045,12 +2414,21 @@ def record_review(
     reviewer: str,
     reason: str,
     stage: str = "independent",
+    repository_identity: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Append a review verdict to the ledger.
+
+    `repository_identity` is the exact HEAD and tree the reviewer inspected. It
+    is never a caller's free-form claim in normal use: `accept_review` derives
+    it from the repository after confirming the reviewer's packet is still
+    current. A record written without it stays readable for audit but cannot
+    satisfy 0.4.2 exact-head acceptance.
+    """
     if verdict not in {"ship", "fix-first", "rethink"}:
         raise SeraError("Verdict must be ship, fix-first, or rethink.")
     if stage not in {"independent", "gate", "supplementary"}:
         raise SeraError("Review stage must be independent, gate, or supplementary.")
-    review = {
+    review: dict[str, Any] = {
         "timestamp": utc_now(),
         "fingerprint": fingerprint,
         "stage": stage,
@@ -2058,6 +2436,79 @@ def record_review(
         "reviewer": reviewer,
         "reason": reason.strip(),
     }
+    if repository_identity is not None:
+        review["repository_identity"] = {
+            "head_sha": repository_identity["head_sha"],
+            "head_tree_sha": repository_identity["head_tree_sha"],
+        }
     with (task_dir / "reviews.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(review, sort_keys=True) + "\n")
     return review
+
+
+def accept_review(
+    root: Path,
+    task_dir: Path,
+    verdict: str,
+    reviewer: str,
+    reason: str,
+    stage: str = "independent",
+) -> dict[str, Any]:
+    """Record a review verdict bound to the repository the reviewer inspected.
+
+    SERA never trusts a supplied commit SHA. The reviewer works from a review
+    packet, that packet already binds an exact HEAD, tree, and change set, and
+    acceptance re-validates it against the repository as it stands right now.
+    Only then is the identity read from Git and written into the ledger. If
+    HEAD moved, or the change set moved, or coverage is no longer complete, the
+    verdict is refused until a fresh packet is generated and reviewed.
+    """
+    task = load_task(task_dir)
+    fingerprint = task_fingerprint(root, task_dir)
+    state = packet_state(root, task_dir, "review", task, fingerprint)
+    if not state["current"]:
+        raise SeraError(
+            f"{state['reason']}: the review packet is not current for this repository state, so a verdict "
+            "recorded now would not describe what was reviewed. Run `sera packet review`, review the fresh "
+            "packet, and record the verdict against it."
+        )
+    return record_review(
+        task_dir,
+        fingerprint,
+        verdict,
+        reviewer,
+        reason,
+        stage,
+        repository_identity=git_head_identity(root),
+    )
+
+
+def evaluate_review_record(
+    review: dict[str, Any], fingerprint: str, head_identity: dict[str, str]
+) -> dict[str, Any]:
+    """Decide whether an accepted review still describes the current state.
+
+    Freshness requires every applicable binding to match at once: the task,
+    evidence, and delta fingerprint the reviewer judged, plus the exact HEAD
+    commit and tree they judged it at. An empty commit leaves the fingerprint
+    and the tree untouched, so only the HEAD binding catches it — which is
+    precisely the case a release gate must not be allowed to inherit.
+    """
+    reasons: list[str] = []
+    if review.get("fingerprint") != fingerprint:
+        reasons.append(REVIEW_FINGERPRINT_MISMATCH)
+    identity = review.get("repository_identity")
+    if not _valid_identity(identity):
+        reasons.append(REVIEW_REPOSITORY_UNBOUND)
+    elif identity.get("head_sha") != head_identity.get("head_sha"):
+        reasons.append(REVIEW_HEAD_MISMATCH)
+    elif identity.get("head_tree_sha") != head_identity.get("head_tree_sha"):
+        reasons.append(REVIEW_HEAD_TREE_MISMATCH)
+    return {
+        "status": "stale" if reasons else "current",
+        "current": not reasons,
+        "reasons": reasons,
+        "verdict": review.get("verdict"),
+        "reviewer": review.get("reviewer"),
+        "stage": review.get("stage"),
+    }

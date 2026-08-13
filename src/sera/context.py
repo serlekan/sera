@@ -22,8 +22,7 @@ from .core import (
     normalize_repo_path,
     ownership_summary,
     read_ledger,
-    review_diff_coverage,
-    task_changed_files,
+    task_review_coverage,
     text_tokens,
     utc_now,
 )
@@ -303,14 +302,23 @@ def select_task_context(
     diff_ok = True
     diff_reason: str | None = None
     diff_required_chars = 0
+    coverage_complete = True
+    coverage_reason: str | None = None
+    change_fingerprint: str | None = None
+    committed_range: list[str] | None = None
     if stage == "review":
-        changed = task_changed_files(root, task)
         # Non-raising here: `sera next` must report an insufficient review-diff
-        # budget as a controller state rather than crashing.
-        coverage = review_diff_coverage(root, task["allowed_files"], int(config["max_packet_chars"]))
+        # budget or incomplete change coverage as controller states rather than
+        # crashing.
+        coverage = task_review_coverage(root, task, int(config["max_packet_chars"]))
+        changed = coverage["changed_paths"]
         diff_ok = coverage["ok"]
         diff_reason = coverage["reason"]
         diff_required_chars = coverage["required_chars"]
+        coverage_complete = coverage["coverage_complete"]
+        coverage_reason = coverage["coverage_reason"]
+        change_fingerprint = coverage["change_fingerprint"]
+        committed_range = coverage["committed_range"]
         diff_tokens = estimate_tokens(coverage["text"]) if coverage["text"] else 0
         ledger = read_ledger(task_dir)
         evidence_tokens = estimate_tokens(json.dumps(ledger, sort_keys=True)) if ledger else 0
@@ -345,4 +353,10 @@ def select_task_context(
     report["review_diff_ok"] = diff_ok
     report["review_diff_reason"] = diff_reason
     report["review_diff_required_chars"] = diff_required_chars
+    # Freshness and completeness are distinct facts. A packet can be perfectly
+    # current and still not represent the whole change set.
+    report["review_coverage_complete"] = coverage_complete
+    report["review_coverage_reason"] = coverage_reason
+    report["review_change_fingerprint"] = change_fingerprint
+    report["review_committed_range"] = committed_range
     return report

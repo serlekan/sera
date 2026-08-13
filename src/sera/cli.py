@@ -21,6 +21,7 @@ from .controller import (
 )
 from .core import (
     SeraError,
+    accept_review,
     build_repo_map,
     check_task,
     create_seal,
@@ -36,10 +37,8 @@ from .core import (
     load_task,
     new_task,
     record_evidence,
-    record_review,
     resolve_task_dir,
     run_verification,
-    task_fingerprint,
     update_repo_map,
 )
 
@@ -156,7 +155,10 @@ def parser() -> argparse.ArgumentParser:
     inbox = commands.add_parser("inbox", help="Show all local SERA tasks and their next actions.")
     _json_flag(inbox)
 
-    review = commands.add_parser("review", help="Record a review verdict bound to the exact task fingerprint.")
+    review = commands.add_parser(
+        "review",
+        help="Record a review verdict bound to the exact reviewed HEAD, tree, and task fingerprint.",
+    )
     review.add_argument("task", nargs="?")
     review.add_argument("--verdict", choices=["ship", "fix-first", "rethink"], required=True)
     review.add_argument("--reviewer", required=True)
@@ -435,9 +437,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Next: {report['next']['next_action']} — {report['next']['reason']}")
             return 0
         if args.command == "review":
-            fingerprint = task_fingerprint(root, task_dir)
-            record_review(task_dir, fingerprint, args.verdict, args.reviewer, args.reason, args.stage)
-            print(f"{args.stage} review recorded for fingerprint {fingerprint[:16]}")
+            review = accept_review(root, task_dir, args.verdict, args.reviewer, args.reason, args.stage)
+            print(f"{args.stage} review recorded for fingerprint {review['fingerprint'][:16]}")
+            print(f"Bound to HEAD {review['repository_identity']['head_sha']}")
+            print(f"Bound to HEAD tree {review['repository_identity']['head_tree_sha']}")
             return 0
         if args.command == "summary":
             path, output = generate_summary(root, task_dir)
@@ -478,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
                     for stage, review in result["reviews"].items():
                         freshness = "stale" if stage in result["stale_reviews"] else "current"
                         print(f"Review {stage}: {review['verdict']} by {review['reviewer']} ({freshness})")
+                        for stale_reason in result["stale_review_reasons"].get(stage, []):
+                            print(f"  {stale_reason}")
                 else:
                     print("Reviews: none")
                 print(f"Missing reviews: {', '.join(result['missing_reviews']) or 'none'}")

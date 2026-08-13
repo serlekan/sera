@@ -16,6 +16,7 @@ from sera.core import (
     PACKET_UNBOUND,
     build_repo_map,
     check_task,
+    git_head_identity,
     initialize,
     load_task,
     new_task,
@@ -265,7 +266,10 @@ class PacketFreshnessTests(unittest.TestCase):
         build_packet(self.root, task_dir, "build")
         (self.root / "docs" / "note.py").write_text("NOTE = 9\n", encoding="utf-8")
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "peer", "fine")
+        record_review(
+            task_dir, fingerprint, "ship", "peer", "fine",
+            repository_identity=git_head_identity(self.root),
+        )
         self.assertTrue(check_task(self.root, task_dir)["ok"])
 
 

@@ -15,6 +15,7 @@ from sera.core import (
     check_task,
     create_seal,
     decide_route,
+    git_head_identity,
     initialize,
     load_task,
     record_evidence,
@@ -77,8 +78,14 @@ class CrossFindingTests(unittest.TestCase):
         (self.root / "critical" / "secret.py").write_text("TOKEN = 'rotated'\n", encoding="utf-8")
         record_evidence(task_dir, "python -m unittest", 0, "tests passed")
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "independent-peer", "rotation is correct", "independent")
-        record_review(task_dir, fingerprint, "ship", "release-gate", "acceptable to release", "gate")
+        record_review(
+            task_dir, fingerprint, "ship", "independent-peer", "rotation is correct", "independent",
+            repository_identity=git_head_identity(self.root),
+        )
+        record_review(
+            task_dir, fingerprint, "ship", "release-gate", "acceptable to release", "gate",
+            repository_identity=git_head_identity(self.root),
+        )
 
         result = check_task(self.root, task_dir)
         self.assertTrue(result["ok"], msg=result["next_action"])
@@ -183,8 +190,14 @@ class PacketFreshnessAndBoundedReviewTests(unittest.TestCase):
         self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_review")
 
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "independent-peer", "bounded review", "independent")
-        record_review(task_dir, fingerprint, "ship", "release-gate", "acceptable", "gate")
+        record_review(
+            task_dir, fingerprint, "ship", "independent-peer", "bounded review", "independent",
+            repository_identity=git_head_identity(self.root),
+        )
+        record_review(
+            task_dir, fingerprint, "ship", "release-gate", "acceptable", "gate",
+            repository_identity=git_head_identity(self.root),
+        )
         result = check_task(self.root, task_dir)
         self.assertTrue(result["ok"], msg=result["next_action"])
 
