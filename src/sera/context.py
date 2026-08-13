@@ -302,7 +302,10 @@ def select_task_context(
     diff_ok = True
     diff_reason: str | None = None
     diff_required_chars = 0
-    coverage_complete = True
+    # `None`, not `True`: outside a review stage no coverage assessment was made,
+    # and reporting completeness that was never computed is the same overclaim
+    # this release exists to remove.
+    coverage_complete: bool | None = None
     coverage_reason: str | None = None
     change_fingerprint: str | None = None
     committed_range: list[str] | None = None

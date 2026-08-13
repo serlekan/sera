@@ -224,7 +224,7 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             f"{stage_context['review_diff_required_chars']:,} characters of review diff, which exceeds "
             f"max_packet_chars. Raise max_packet_chars or split the task.",
         )
-    elif stage == "review" and not stage_context.get("review_coverage_complete", True):
+    elif stage == "review" and stage_context.get("review_coverage_complete") is not True:
         # Currency is not completeness: refuse to dispatch a review that cannot
         # be shown to represent the whole change set.
         action, command, reason = (
@@ -317,8 +317,9 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         "review_states": result["review_states"],
         "stale_review_reasons": result["stale_review_reasons"],
         "failed_reviews": result["failed_reviews"],
+        # `complete` is null outside a review stage: no assessment was made.
         "review_coverage": {
-            "complete": stage_context.get("review_coverage_complete", True),
+            "complete": stage_context.get("review_coverage_complete"),
             "reason": stage_context.get("review_coverage_reason"),
             "change_fingerprint": stage_context.get("review_change_fingerprint"),
             "committed_range": stage_context.get("review_committed_range"),

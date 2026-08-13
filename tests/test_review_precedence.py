@@ -95,6 +95,13 @@ class ReviewCoverageTests(PrecedenceRepository, unittest.TestCase):
         self.assertEqual(report["state"], "dispatch_review")
         self.assertTrue(report["review_coverage"]["complete"])
 
+    def test_coverage_is_unassessed_rather_than_complete_outside_review(self) -> None:
+        task_dir = self.gated_task()
+        report = next_action(self.root, task_dir)
+        self.assertEqual(report["required_stage"], "build")
+        # Never report completeness that was not computed.
+        self.assertIsNone(report["review_coverage"]["complete"])
+
     # --- F23: fresh but incomplete coverage is refused ----------------------
     def test_incomplete_coverage_refuses_dispatch(self) -> None:
         task_dir = self.implemented_task()
