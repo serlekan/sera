@@ -1,5 +1,179 @@
 # Changelog
 
+## 0.4.2 - unreleased
+
+### Second canonical-review correction
+
+Canonical review of the corrected candidate found one further defect class:
+cross-boundary rename and copy integrity.
+
+- **Runtime exclusion could erase project changes.** A change record was
+  classified by its destination path alone, so committing
+  `git mv app.py .sera/tasks/smuggled.py` discarded the entire record. `app.py`
+  vanished from `changed_files`, scope checking, coverage, and the change-set
+  fingerprint; `sera next` returned `dispatch_builder`; and a review packet was
+  emitted claiming "Change coverage: complete" while stating "No task-relative
+  changes to review". Runtime classification now applies to each identity of a
+  change independently, through one normalization helper used by the committed
+  range, the per-file evidence collector, `working_tree_snapshot`, and
+  `changed_files`: project → runtime renames survive as a deletion of the
+  project source, runtime → project renames survive as an addition of the
+  project destination, project → runtime *copies* synthesize nothing because a
+  copy leaves its source in place, and runtime → runtime is excluded entirely.
+  Ordinary project renames are unchanged. Runtime state is still never review
+  content — a normalized boundary change is rendered with rename detection
+  disabled so its runtime counterpart cannot be printed beside it, and owning a
+  runtime path does not make it reviewable. The porcelain parser now recovers
+  both sides of a rename instead of skipping the source.
+
+### Canonical-review correction
+
+Canonical review of the first 0.4.2 candidate reproduced two blocking defects.
+Both are corrected here.
+
+- **Coverage completeness could be false.** Review evidence is generated from a
+  task's `allowed_files`, while the authoritative change set is the whole
+  repository delta, and nothing proved the two agreed. A task owning
+  `src/alpha.py` that committed both `src/alpha.py` and `src/unowned.py` on a
+  clean worktree reported `coverage_complete: true` and emitted a packet stating
+  "Change coverage: complete" while carrying no patch for `src/unowned.py`.
+  `coverage_complete` is now true only when the committed range resolved, diff
+  budgeting succeeded, no task change lies outside declared ownership, and every
+  authoritative changed path is represented by real evidence — a rename or copy
+  block representing both its destination and its `old_path`. New reasons
+  `review_scope_unresolved` and `review_evidence_incomplete`, with
+  `out_of_scope_paths` and `missing_evidence_paths` diagnostics. `sera packet
+  review` refuses on direct invocation, not only through `sera next`, and
+  unresolved scope is reported as `resolve_scope` because that is the root cause
+  an operator must act on. Ownership is never widened automatically. The
+  change-set fingerprint continues to bind the full authoritative path set, so
+  out-of-scope work appearing or disappearing still moves it.
+- **Unborn repository identity stored a symbolic revision.** `git rev-parse HEAD`
+  exits non-zero on a repository with no commits but still prints the literal
+  string `HEAD`, and identity resolution trusted stdout instead of exit status.
+  A task created before the first commit stored `head_sha: "HEAD"` and
+  `head_tree_sha: "HEAD^{tree}"`; after the first commit those expressions
+  re-resolved to the new commit, collapsing the baseline→HEAD range and losing
+  every committed change from review. Repository identity now holds immutable
+  Git object IDs or the explicit `unborn` sentinel, resolved through
+  `git rev-parse --verify` with exit status as the authority. An unborn baseline
+  diffs against Git's empty tree, so the first commit and every commit after it
+  remain reviewable as the net change from an empty repository. A commit that
+  cannot resolve its tree fails closed with a `SeraError` rather than being
+  reported as an absent HEAD.
+
+Review identity and coverage integrity. Three controller defects and one
+reporting weakness found by integrating 0.4.1 into a real high-assurance
+repository, fixed generically rather than downstream.
+
+### Reviews bind the exact repository identity (P0)
+
+A review recorded at HEAD A stayed `current` after HEAD moved to B: an empty
+commit leaves the tree and the working-tree delta untouched, so the
+task/evidence/delta fingerprint did not move, and `sera seal` could then bind B
+on the strength of a review of A.
+
+- Review packet provenance now records the exact `head_sha` and `head_tree_sha`
+  it was generated against, and the packet body states them for the human
+  reviewer. `packet_state` recomputes repository identity and reports
+  `packet_stale_head` or `packet_stale_head_tree` rather than dispatching.
+- `sera review` records a verdict only against a current review packet, and then
+  derives the reviewed identity from Git. A caller-supplied SHA is never
+  trusted. If HEAD moved after packet generation, the verdict is refused until a
+  fresh packet is generated and reviewed.
+- Accepted review records carry `repository_identity`. Review freshness now
+  requires the task/evidence/delta fingerprint **and** the exact HEAD **and** the
+  exact tree to match; `check_task` reports `review_fingerprint_mismatch`,
+  `review_head_mismatch`, `review_head_tree_mismatch`, or
+  `review_repository_unbound` per stage in `stale_review_reasons`.
+- The release gate is a review stage and binds identity identically, so a gate
+  can never inherit an independent review taken at a different commit.
+- `sera seal` refuses unless every required review is `ship`,
+  fingerprint-current, and bound to the current HEAD and tree. Post-seal
+  behaviour is unchanged: `sera check --require-seal` still fails with
+  `seal_head_mismatch` once HEAD moves.
+- Repository identity is bound where it is semantically required. Build packets
+  record it as provenance but are not invalidated by it, so a builder committing
+  its own implementation does not stale its own handoff.
+
+### Review evidence covers committed changes (P0)
+
+Change evidence was built from staged and unstaged state only, so once
+implementation was committed and the worktree went clean a review packet
+reported "No task-relative changes to review" for a task that had produced a
+substantial commit.
+
+- Tasks record `baseline_repository_identity` at creation. The review change set
+  spans that baseline commit through the current HEAD, unioned with
+  task-relative working-tree changes.
+- One file is exactly one canonical review block carrying its cumulative change
+  across `committed`, `staged`, and `unstaged` sources, with blob identity
+  spanning the whole range. Per-file budgeting, minimum patch guarantees,
+  deterministic rendering, the exact character budget, and binary/rename
+  handling are unchanged.
+- The committed range participates in scope checking: a file committed after the
+  task began is a task change even with a clean worktree. Every project-visible
+  side of a change is preserved, including renames across the SERA runtime
+  boundary (see the correction note above).
+- Dirty-worktree baseline safety is preserved. A pre-existing dirty path the
+  task never touches is still not task scope; touching it again still is.
+- Tasks created before 0.4.2 have no baseline commit and cannot have their
+  committed range derived. They report `review_baseline_unbound` and fail closed
+  rather than claiming complete coverage. A baseline commit that no longer
+  exists reports `review_baseline_unreachable`.
+
+### Tracked SERA policy is reviewable (P0)
+
+Excluding all of `.sera/**` was too coarse and hid a project's own reviewed
+policy from ownership, change detection, scope checking, and review evidence.
+
+- Only generated runtime state is excluded now: `.sera/cache/**`,
+  `.sera/tasks/**` (capsules, packets, ledgers, seals), and `.sera/latest-task`.
+- Everything else under `.sera/` — `.sera/config.json`, `.sera/POLICY.md`,
+  `.sera/README.md`, any tracked policy file — is ordinary repository content.
+- Runtime state cannot reach a review packet even when a repository commits it
+  by mistake, and owning a runtime path does not turn it into review content.
+
+### Coverage completeness is reported separately (P1)
+
+`current` never meant "the reviewer is seeing everything" and is no longer
+allowed to imply it.
+
+- `sera next` exposes `review_coverage` with `complete`, `reason`,
+  `change_fingerprint`, and `committed_range` alongside packet currency.
+- A review packet is dispatchable only when it is current **and** its coverage is
+  complete; otherwise the controller reports `review_coverage_incomplete`.
+  SERA refuses to generate a review packet whose coverage is incomplete.
+- Review provenance binds a `review_change_fingerprint` over the range
+  endpoints, the complete changed-path set, and each file's status, blob
+  identity, sources, and patch bytes. Any movement in the represented change set
+  yields `packet_stale_change_set`; a filename count is not relied upon.
+- `review_diff_budget_insufficient` behaviour is unchanged.
+
+### Failed reviews outrank missing later stages (P1)
+
+`sera next` evaluated missing reviews before failed ones, so an assured task with
+a current `fix-first` independent review and no gate yet was told to dispatch the
+release gate for work the independent stage had already refused.
+
+- Required-review precedence is now: stale review → current failed review →
+  missing review → seal, in both `sera next` and `check_task`.
+
+### Compatibility
+
+- Packet provenance schema is version 3. 0.4.1 packets (version 2) carry no
+  repository identity or change-set binding and fail closed as
+  `packet_legacy_schema`; regenerate them.
+- 0.4.1 review records remain readable history but report
+  `review_repository_unbound` and cannot satisfy 0.4.2 exact-head acceptance.
+  Repeat the review on 0.4.2.
+- Seal schema is unchanged at version 2. Because a seal already binds the review
+  ledger, and reviews now bind identity, seals transitively bind reviewed
+  identity.
+- No runtime dependencies added, no model-provider SDKs, no automatic provider
+  invocation, and no change to routing or risk policy. The threat model remains
+  local consistency via SHA-256 over local Git and file state.
+
 ## 0.4.1 - 2026-08-12
 
 High-assurance controller hardening. Corrections found by integrating 0.4.0 into a

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serlekan-sera"
-version = "0.4.1"
+version = "0.4.2"
 description = "SERA: a token-efficient Specify, Execute, Review, Accept protocol for multi-model software delivery."
 readme = "README.md"
 requires-python = ">=3.11"

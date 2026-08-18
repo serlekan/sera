@@ -13,6 +13,7 @@ from sera.core import (
     check_task,
     create_seal,
     decide_route,
+    git_head_identity,
     initialize,
     load_task,
     new_task,
@@ -109,7 +110,8 @@ class SeraCoreTests(unittest.TestCase):
         task_dir = self.make_task(verification=[])
         (self.root / "src" / "app.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "reviewer", "correct")
+        record_review(task_dir, fingerprint, "ship", "reviewer", "correct",
+                      repository_identity=git_head_identity(self.root))
         first = check_task(self.root, task_dir)
         self.assertEqual(first["stale_reviews"], [])
         self.assertTrue(first["ok"])
@@ -150,7 +152,8 @@ class SeraCoreTests(unittest.TestCase):
         new_file = self.root / "src" / "new_file.py"
         new_file.write_text("VALUE = 1\n", encoding="utf-8")
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "reviewer", "correct")
+        record_review(task_dir, fingerprint, "ship", "reviewer", "correct",
+                      repository_identity=git_head_identity(self.root))
         self.assertFalse(check_task(self.root, task_dir)["stale_reviews"])
         new_file.write_text("VALUE = 2\n", encoding="utf-8")
         self.assertIn("independent", check_task(self.root, task_dir)["stale_reviews"])
@@ -161,7 +164,8 @@ class SeraCoreTests(unittest.TestCase):
         with self.assertRaises(SeraError):
             create_seal(self.root, task_dir)
         fingerprint = task_fingerprint(self.root, task_dir)
-        record_review(task_dir, fingerprint, "ship", "reviewer", "correct")
+        record_review(task_dir, fingerprint, "ship", "reviewer", "correct",
+                      repository_identity=git_head_identity(self.root))
         seal = create_seal(self.root, task_dir)
         self.assertEqual(seal["fingerprint"], fingerprint)
         result = check_task(self.root, task_dir)

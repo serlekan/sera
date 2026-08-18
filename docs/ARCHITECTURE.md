@@ -42,7 +42,7 @@ Codex, Claude Code, or another runtime consumes SERA packets and performs actual
 
 ## Ownership versus context
 
-0.4.1 separates two things 0.4.0 conflated:
+SERA separates two things 0.4.0 conflated:
 
 - **ownership** — the files a task may modify; an authorization surface;
 - **selected context** — the files one stage reads; a token budget.
@@ -87,9 +87,36 @@ Task creation records fingerprints of pre-existing dirty paths. Scope checks com
 
 `sera map --update` reuses unchanged map entries and rescans changed files. It uses previous HEAD, Git dirty paths, size, and mtime to decide what must be reread.
 
-## Fingerprint-bound review
+## Identity-bound review
 
-Review validity still depends on the exact task, evidence, staged diff, unstaged diff, and relevant untracked content. Any later mutation makes a required verdict stale.
+Review validity depends on the exact task, evidence, staged diff, unstaged diff,
+and relevant untracked content — and, since 0.4.2, on the exact `HEAD` commit and
+tree the reviewer inspected. Any later mutation makes a required verdict stale,
+including an empty commit that leaves the fingerprint and the tree untouched.
+
+Repository identity is bound at the stage where it is semantically required
+rather than folded into every task fingerprint. Doing the latter would stale a
+builder's own handoff the moment it committed its implementation. Review packets,
+review records, required-review freshness, the release gate, and the seal all
+agree on one exact repository identity; build packets record it as provenance
+without being invalidated by it.
+
+## Task baseline and committed coverage
+
+A task records the repository identity it began at, as an immutable Git object ID
+or the explicit `unborn` sentinel — never a symbolic revision, which would
+re-resolve later and collapse the task's own range. The review change set is the
+union of the committed range from that baseline to the current HEAD and the
+task-relative working-tree delta, so review evidence and scope checking survive
+the implementation being committed. An unborn baseline diffs against Git's empty
+tree, so a repository's first commits stay reviewable.
+
+Completeness is proven rather than assumed. Evidence is generated from the files
+a task owns, while the authoritative change set is the whole repository delta, so
+the two are compared explicitly and coverage is complete only when every
+authoritative path is represented and none lies outside ownership. A task that
+cannot derive its baseline, cannot fit its diff, or changed files it does not own
+fails closed instead of reporting partial coverage as complete.
 
 ## Derived-artifact freshness
 
@@ -126,8 +153,17 @@ validated as current.
 
 ## Exact-head acceptance
 
-Seals additionally bind the exact `HEAD` commit and `HEAD` tree. Review
-fingerprints deliberately remain HEAD-independent so a reviewer's verdict is not
-invalidated by unrelated commit activity; acceptance is the step that must name a
-single commit. Seals are versioned, and a 0.4.0 seal without repository identity
-fails closed rather than being read as an exact-head acceptance.
+Seals bind the exact `HEAD` commit and `HEAD` tree, and cannot be created unless
+every required review is current for that same identity. 0.4.1 kept review
+fingerprints HEAD-independent so that a verdict survived unrelated commit
+activity; real use showed the cost — a review of HEAD A could be sealed at HEAD B
+without anything detecting it. 0.4.2 makes acceptance and review name the same
+commit. Seals are versioned, and a 0.4.0 seal without repository identity fails
+closed rather than being read as an exact-head acceptance.
+
+## Threat model
+
+Unchanged: local consistency. SHA-256 over local Git and file state detects
+drift and accidental or careless tampering with SERA's own records. There are no
+signatures, no HMAC, no remote attestation, no secret keys, and no claim of
+adversarial authenticity.

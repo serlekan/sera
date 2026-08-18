@@ -215,6 +215,17 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         action, command, reason = "resolve_ownership", None, "No exact owned files are defined."
     elif controller.get("auto_drafted") and not controller.get("ownership_confirmed", False):
         action, command, reason = "confirm_ownership", "sera task confirm", "Auto-selected files are candidates until the controller confirms exact ownership."
+    # Unresolved scope outranks every review-stage report. It is both the root
+    # cause of incomplete review coverage and the thing an operator must act on,
+    # so surfacing `review_coverage_incomplete` here would name a symptom.
+    elif result["out_of_scope"]:
+        action, command, reason = (
+            "resolve_scope",
+            None,
+            f"This task changed {', '.join(result['out_of_scope'])} outside its declared ownership. "
+            "Split or revert the out-of-scope work, or declare ownership of it deliberately; "
+            "review coverage cannot be complete while it stands.",
+        )
     elif stage == "review" and not stage_context.get("review_diff_ok", True):
         # Fail closed rather than hand a reviewer a packet that hides changes.
         action, command, reason = (
@@ -223,6 +234,16 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             f"Covering every changed file needs at least "
             f"{stage_context['review_diff_required_chars']:,} characters of review diff, which exceeds "
             f"max_packet_chars. Raise max_packet_chars or split the task.",
+        )
+    elif stage == "review" and stage_context.get("review_coverage_complete") is not True:
+        # Currency is not completeness: refuse to dispatch a review that cannot
+        # be shown to represent the whole change set.
+        action, command, reason = (
+            "review_coverage_incomplete",
+            None,
+            f"{stage_context.get('review_coverage_reason')}: the complete task change set cannot be "
+            "derived, so a review packet would understate what changed. Create a task under this "
+            "version of SERA, or restore the baseline commit, before requesting review.",
         )
     elif config.get("controller", {}).get("enforce_context_budget", True) and not stage_context["within_budget"]:
         # Budget is measured against the context selected for the required next
@@ -246,20 +267,31 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             None,
             f"Dispatch {lane_label(config, decision.builder)} with packet-build.md; SERA core does not invoke providers directly.",
         )
-    elif result["out_of_scope"]:
-        action, command, reason = "resolve_scope", None, "Working-tree changes exceed declared ownership."
     elif result["missing_verification"]:
         action, command, reason = "verify", "sera verify", "Required verification evidence is missing."
     elif result["stale_reviews"]:
-        action, command, reason = "review", "sera packet review", "One or more required reviews are stale for the current fingerprint."
+        action, command = "review", "sera packet review"
+        reasons = sorted({item for stage_reasons in result["stale_review_reasons"].values() for item in stage_reasons})
+        reason = (
+            "One or more required reviews no longer describe the current repository state "
+            f"({', '.join(reasons)}). Regenerate the review packet and repeat those stages."
+        )
+    # A current failed review outranks a missing later stage: never dispatch a
+    # release gate for an implementation the independent stage already refused.
+    elif result["failed_reviews"]:
+        action, command, reason = (
+            "fix_first",
+            None,
+            f"A current required review returned "
+            f"`{result['reviews'][result['failed_reviews'][0]]['verdict']}` at the "
+            f"{result['failed_reviews'][0]} stage. Address the findings before any later stage.",
+        )
     elif result["missing_reviews"]:
         if not review_packet_state["current"]:
             action, command = "review_packet", "sera packet review"
         else:
             action, command = "dispatch_review", None
         reason = f"Required review stage: {result['missing_reviews'][0]}."
-    elif result["failed_reviews"]:
-        action, command, reason = "fix_first", None, "A current required review did not return ship."
     elif result["ok"] and (not result["seal"] or result["seal_stale"]):
         action, command, reason = "seal", "sera seal", "Verification and required reviews pass; bind acceptance to this fingerprint."
     elif result["ok"] and result["seal"] and not result["seal_stale"]:
@@ -290,6 +322,19 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         "within_budget": stage_context["within_budget"],
         "fingerprint": result["fingerprint"],
         "head_identity": result["head_identity"],
+        "baseline_repository_identity": result["baseline_repository_identity"],
+        "review_states": result["review_states"],
+        "stale_review_reasons": result["stale_review_reasons"],
+        "failed_reviews": result["failed_reviews"],
+        # `complete` is null outside a review stage: no assessment was made.
+        "review_coverage": {
+            "complete": stage_context.get("review_coverage_complete"),
+            "reason": stage_context.get("review_coverage_reason"),
+            "change_fingerprint": stage_context.get("review_change_fingerprint"),
+            "committed_range": stage_context.get("review_committed_range"),
+            "out_of_scope_paths": stage_context.get("review_out_of_scope_paths", []),
+            "missing_evidence_paths": stage_context.get("review_missing_evidence_paths", []),
+        },
         "seal_status": result["seal_status"],
         "seal_stale_reasons": result["seal_stale_reasons"],
         "seal_current": bool(result["seal"] and not result["seal_stale"]),
