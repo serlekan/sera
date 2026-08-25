@@ -1289,7 +1289,7 @@ def bootstrap_exception_state(
         return result
     try:
         exception = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         result.update(applicable=True, reason=BOOTSTRAP_EXCEPTION_INVALID, validation_errors=["exception_unreadable"])
         return result
     if not isinstance(exception, dict):

@@ -195,6 +195,16 @@ class BootstrapExceptionTests(BootstrapExceptionRepository):
         self.assertEqual(state["reason"], "bootstrap_exception_invalid")
         self.assertEqual(state["validation_errors"], ["exception_unreadable"])
 
+    def test_invalid_utf8_exception_is_rejected(self) -> None:
+        task_dir = self.historical_task()
+        (task_dir / "bootstrap-exception.json").write_bytes(b"\xff\xfe\x80")
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertEqual(state["validation_errors"], ["exception_unreadable"])
+
     def test_exception_requires_a_current_review_packet_not_just_checkout_identity(self) -> None:
         task_dir = self.historical_task()
         self.write_exception(task_dir)
