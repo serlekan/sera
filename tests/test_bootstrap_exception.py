@@ -9,8 +9,11 @@ import unittest
 from pathlib import Path
 
 import sera.core as core
-from sera.controller import build_packet
+from sera.controller import build_packet, next_action
 from sera.core import (
+    PACKET_STALE_CONTRACT,
+    PACKET_UNBOUND,
+    accept_review,
     build_repo_map,
     git_head_identity,
     initialize,
@@ -67,6 +70,27 @@ class BootstrapExceptionRepository(unittest.TestCase):
         git(self.root, "add", "src/app.py")
         git(self.root, "commit", "-m", "implementation")
         build_packet(self.root, task_dir, "review")
+        return task_dir
+
+    def reviewed_historical_task(self) -> Path:
+        task_dir = self.historical_task()
+        accept_review(self.root, task_dir, "ship", "independent-peer", "correct", "independent")
+        return task_dir
+
+    def native_builder_task(self) -> Path:
+        task_dir = new_task(
+            self.root,
+            "native builder handoff",
+            "preserve the application",
+            "assured",
+            "high",
+            ["src/app.py"],
+            [],
+            [],
+            1,
+            "implementation",
+        )
+        build_packet(self.root, task_dir, "build")
         return task_dir
 
     def write_exception(
@@ -232,6 +256,82 @@ class BootstrapExceptionTests(BootstrapExceptionRepository):
         self.assertEqual(state["reason"], "bootstrap_exception_invalid")
         self.assertIn("builder_provenance_present", state["validation_errors"])
         self.assertFalse((task_dir / "packet-build.md").exists())
+
+
+class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
+    def test_accepted_exception_continues_to_existing_gate_dispatch(self) -> None:
+        task_dir = self.reviewed_historical_task()
+        self.write_exception(task_dir)
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "dispatch_review")
+        self.assertEqual(report["next_action"], "dispatch_review")
+        self.assertIn("gate", report["reason"])
+        self.assertTrue(report["bootstrap_exception"]["accepted"])
+
+    def test_identity_mismatch_fails_closed_in_controller(self) -> None:
+        task_dir = self.reviewed_historical_task()
+        self.write_exception(task_dir, implementation_tree_sha="0" * 40)
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "invalid")
+        self.assertEqual(report["next_action"], "bootstrap_exception_invalid")
+        self.assertEqual(report["reason"], "bootstrap_exception_invalid")
+
+    def test_false_no_fabricated_evidence_fails_closed_in_controller(self) -> None:
+        task_dir = self.reviewed_historical_task()
+        self.write_exception(task_dir, no_fabricated_evidence=False)
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "invalid")
+        self.assertEqual(report["next_action"], "bootstrap_exception_invalid")
+        self.assertEqual(report["reason"], "bootstrap_exception_invalid")
+
+    def test_no_exception_preserves_packet_missing_behavior(self) -> None:
+        task_dir = self.reviewed_historical_task()
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "build_packet")
+        self.assertEqual(report["next_action"], "build_packet")
+        self.assertEqual(report["build_packet"]["reason"], "packet_missing")
+        self.assertFalse(report["bootstrap_exception"]["exists"])
+
+    def test_native_builder_packet_outranks_exception(self) -> None:
+        task_dir = self.native_builder_task()
+        (task_dir / "bootstrap-exception.json").write_text("{}\n", encoding="utf-8")
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "dispatch_builder")
+        self.assertFalse(report["bootstrap_exception"]["accepted"])
+        self.assertEqual(report["bootstrap_exception"]["reason"], "bootstrap_exception_not_applicable")
+
+    def test_stale_or_unbound_builder_packet_outranks_exception(self) -> None:
+        stale_task = self.native_builder_task()
+        (stale_task / "bootstrap-exception.json").write_text("{}\n", encoding="utf-8")
+        stale_task_data = load_task(stale_task)
+        stale_task_data["verification"] = ["pytest"]
+        (stale_task / "task.json").write_text(json.dumps(stale_task_data, indent=2) + "\n", encoding="utf-8")
+
+        stale_report = next_action(self.root, stale_task)
+
+        self.assertEqual(stale_report["state"], "build_packet")
+        self.assertEqual(stale_report["build_packet"]["reason"], PACKET_STALE_CONTRACT)
+        self.assertEqual(stale_report["bootstrap_exception"]["reason"], "bootstrap_exception_not_applicable")
+
+        unbound_task = self.native_builder_task()
+        (unbound_task / "bootstrap-exception.json").write_text("{}\n", encoding="utf-8")
+        (unbound_task / "packet-build.provenance.json").write_text("{}\n", encoding="utf-8")
+
+        unbound_report = next_action(self.root, unbound_task)
+
+        self.assertEqual(unbound_report["state"], "build_packet")
+        self.assertEqual(unbound_report["build_packet"]["reason"], PACKET_UNBOUND)
+        self.assertEqual(unbound_report["bootstrap_exception"]["reason"], "bootstrap_exception_not_applicable")
 
 
 if __name__ == "__main__":
