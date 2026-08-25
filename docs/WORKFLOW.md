@@ -36,6 +36,16 @@ each stage selects only the context it needs; see
 
 `sera route` chooses the cheapest adequate configured lane. `sera packet build` creates the bounded handoff carrying stage-selected context. SERA does not call provider APIs; the surrounding controller/runtime dispatches the packet.
 
+### Historical workflow bootstrap exceptions
+
+An exception is available only for a pre-native historical task whose builder
+handoff history is unavailable. It preserves that history as missing and does
+not claim that the builder ran or fabricate a builder packet, provenance, log,
+or evidence. The exception does not remove the independent review, gate, or
+seal requirements: those stages still run and remain visible in the audit
+state. All future work must use the native full workflow, including the
+builder and packet stages.
+
 ## Review
 
 `sera verify` records reproducible evidence. A fresh reviewer receives the review packet, bounded diff, and evidence—not the builder conversation. It returns `ship`, `fix-first`, or `rethink`.
