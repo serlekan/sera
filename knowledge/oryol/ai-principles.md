@@ -1,4 +1,8 @@
-# Oryol AI Engineering & Privacy Principles
+# Oryol AI Engineering & Privacy Principles (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol AI Principles v1. For the current canonical centralized AI Gateway architecture, see [`knowledge/oryol/v2/ai-platform.md`](v2/ai-platform.md).
 
 Oryol Workspace incorporates native, edge-assisted artificial intelligence designed for high productivity without compromising enterprise privacy, multi-tenant boundaries, or user authorization.
 

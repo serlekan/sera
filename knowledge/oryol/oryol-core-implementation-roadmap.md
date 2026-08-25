@@ -1,9 +1,13 @@
-# Oryol Core — Implementation Roadmap & Engineering Plan
+# Oryol Core — Implementation Roadmap & Engineering Plan (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Core Implementation Roadmap v1. For the current canonical architecture baseline, see [`knowledge/oryol/v2/workspace-architecture.md`](v2/workspace-architecture.md) and [`knowledge/oryol/v2/sera-governance.md`](v2/sera-governance.md).
 
 **Repository**: `serlekan/oryol-core`  
 **Ecosystem**: Oryol Workspace Platform  
 **Target Runtime**: Cloudflare Edge Infrastructure (Workers + D1 + KV + Queues)  
-**Status**: Implementation Roadmap (Ready for Antigravity Execution)
+**Status**: Implementation Roadmap (v1 Baseline)
 
 ---
 

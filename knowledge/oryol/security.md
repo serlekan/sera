@@ -1,4 +1,8 @@
-# Oryol Workspace Security & Authorization Model
+# Oryol Workspace Security & Authorization Model (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Security Architecture v1. For the current canonical authorization, session security, and multi-tenancy specifications, see [`knowledge/oryol/v2/authorization-model.md`](v2/authorization-model.md), [`knowledge/oryol/v2/session-security.md`](v2/session-security.md), and [`knowledge/oryol/v2/multi-tenancy.md`](v2/multi-tenancy.md).
 
 Security in Oryol Workspace is built on zero-trust principles, strict tenant isolation, cryptographic verification, and non-bypassable permission enforcement.
 

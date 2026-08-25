@@ -1,9 +1,13 @@
-# Oryol Core — Phase 1 Engineering Specification
+# Oryol Core — Phase 1 Engineering Specification (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Core Phase 1 Engineering Specification v1. For the current canonical architecture baseline, see [`knowledge/oryol/v2/identity-model.md`](v2/identity-model.md), [`knowledge/oryol/v2/authorization-model.md`](v2/authorization-model.md), and [`knowledge/oryol/v2/session-security.md`](v2/session-security.md).
 
 **Target Repository**: `serlekan/oryol-core`  
 **Ecosystem**: Oryol Workspace Platform  
 **Target Runtime**: Cloudflare Edge Infrastructure (Workers + D1 + KV)  
-**Specification Stage**: Phase 1 MVP Implementation Baseline  
+**Specification Stage**: Phase 1 MVP Baseline (v1)  
 **Executor**: Google Antigravity & Pair Engineering Agents  
 
 ---

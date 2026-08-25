@@ -1,9 +1,13 @@
-# Oryol Core — Technical Architecture Specification
+# Oryol Core — Technical Architecture Specification (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Core Architecture v1. For the current canonical architecture baseline, see [`knowledge/oryol/v2/workspace-architecture.md`](v2/workspace-architecture.md) and [`knowledge/oryol/v2/core-boundaries.md`](v2/core-boundaries.md).
 
 **System**: `serlekan/oryol-core`  
 **Ecosystem**: Oryol Workspace Platform  
 **Target Runtime**: Cloudflare Edge Infrastructure (Workers + D1 + KV + R2 + Queues)  
-**Status**: Architecture Plan (Pre-Implementation Baseline)
+**Status**: Architecture Plan (v1 Baseline)
 
 ---
 

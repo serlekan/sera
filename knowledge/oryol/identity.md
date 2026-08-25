@@ -1,4 +1,8 @@
-# Oryol Identity, Authentication & Membership
+# Oryol Identity, Authentication & Membership (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Identity Architecture v1. For the current canonical architecture baseline with the Principal model, see [`knowledge/oryol/v2/identity-model.md`](v2/identity-model.md).
 
 Identity across Oryol Workspace is centralized, strictly partitioned by organization membership, and decoupled from individual application services.
 

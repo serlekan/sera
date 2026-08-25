@@ -1,4 +1,8 @@
-# Oryol Workspace Architecture & System Rules
+# Oryol Workspace Architecture & System Rules (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Architecture v1. For the current canonical architecture baseline, see [`knowledge/oryol/v2/workspace-architecture.md`](v2/workspace-architecture.md).
 
 Oryol Workspace is a unified, privacy-first enterprise productivity ecosystem designed to integrate business communication, customer relationships, scheduling, documents, and private intelligence under a single organization-centric multi-tenant model.
 

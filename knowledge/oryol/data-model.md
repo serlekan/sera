@@ -1,4 +1,8 @@
-# Oryol Global Data Model & Conventions
+# Oryol Global Data Model & Conventions (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Data Model v1. For the current canonical data model, lifecycle, and outbox event schemas, see [`knowledge/oryol/v2/identity-model.md`](v2/identity-model.md), [`knowledge/oryol/v2/data-lifecycle.md`](v2/data-lifecycle.md), and [`knowledge/oryol/v2/audit-and-events.md`](v2/audit-and-events.md).
 
 All Oryol Workspace applications share standard entity conventions, identifier formats, timestamps, and multi-tenant persistence schemas.
 

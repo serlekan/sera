@@ -1,4 +1,8 @@
-# Oryol Backend Architecture & Cloudflare Edge Services
+# Oryol Backend Architecture & Cloudflare Edge Services (v1)
+
+> [!WARNING]
+> **Status: SUPERSEDED**  
+> This document describes Oryol Backend Architecture v1. For the current canonical Cloudflare platform, session security, and outbox event specifications, see [`knowledge/oryol/v2/cloudflare-platform.md`](v2/cloudflare-platform.md), [`knowledge/oryol/v2/session-security.md`](v2/session-security.md), and [`knowledge/oryol/v2/audit-and-events.md`](v2/audit-and-events.md).
 
 The production backend architecture for Oryol Workspace is designed for low latency, zero cold starts, and global multi-tenant scalability leveraging Cloudflare Edge Infrastructure.
 
