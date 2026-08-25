@@ -38,15 +38,23 @@ each stage selects only the context it needs; see
 
 ### Historical workflow bootstrap exceptions
 
-An exception is available only for a pre-native historical task whose builder
-handoff history is unavailable and whose authoritative task change set contains
-an implementation change. Evaluation also requires a readable existing
-repository-map cache; it fails closed without rebuilding a missing or unreadable
-map. The exception preserves builder history as missing and does not claim that
-the builder ran or fabricate a builder packet, provenance, log, or evidence.
-It does not remove the independent review, gate, or seal requirements: those
-stages still run and remain visible in the audit state. All future work must use
-the native full workflow, including the builder and packet stages.
+An exception is available only for a pre-native historical task explicitly
+authorized by the tracked `historical_bootstrap_eligibility` registry in
+`.sera/config.json`. The registry defaults empty, is never populated by SERA,
+and must exactly bind the task ID, creation timestamp, baseline HEAD, and
+baseline tree. A `bootstrap-exception.json` record alone never authorizes a
+task, so current and future work must use the native full workflow, including
+the builder and packet stages.
+
+For a policy-authorized historical task, builder handoff history must be
+unavailable and the authoritative task change set must contain an implementation
+change. Evaluation also requires a readable existing repository-map cache; it
+fails closed without rebuilding a missing or unreadable map. The exception
+preserves builder history as missing and does not reconstruct or claim that the
+builder ran, or fabricate a builder packet, timestamp, provenance, log, or
+evidence. Either builder artifact beside an exception is rejected as
+contradictory. Independent review, gate, and seal requirements remain unchanged
+and visible in the audit state.
 
 ## Review
 
