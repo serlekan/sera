@@ -223,7 +223,11 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
 
     controller = task.get("controller", {})
     reported_next_action: str | None = None
-    if not task.get("allowed_files"):
+    if bootstrap_exception["exists"] and not bootstrap_exception["accepted"]:
+        action, command = "invalid", None
+        reported_next_action = BOOTSTRAP_EXCEPTION_INVALID
+        reason = BOOTSTRAP_EXCEPTION_INVALID
+    elif not task.get("allowed_files"):
         action, command, reason = "resolve_ownership", None, "No exact owned files are defined."
     elif controller.get("auto_drafted") and not controller.get("ownership_confirmed", False):
         action, command, reason = "confirm_ownership", "sera task confirm", "Auto-selected files are candidates until the controller confirms exact ownership."
@@ -267,18 +271,13 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             f"{stage_context['stage_budget_tokens']:,} budget; split the task or narrow the stage context.",
         )
     elif not build_packet_state["current"] and not builder_satisfied_by_exception:
-        if build_packet_state["reason"] == "packet_missing" and bootstrap_exception["exists"]:
-            action, command = "invalid", None
-            reported_next_action = BOOTSTRAP_EXCEPTION_INVALID
-            reason = BOOTSTRAP_EXCEPTION_INVALID
-        else:
-            action, command = "build_packet", "sera packet build"
-            reported_next_action = action
-            reason = {
-                "packet_missing": "The task is specified but no builder handoff exists.",
-                "packet_unbound": "The existing builder packet has no valid task binding and cannot be dispatched.",
-                "packet_stale_contract": "The task contract changed after this builder packet was generated; regenerate before dispatch.",
-            }.get(build_packet_state["reason"], "The builder packet is not current for this task contract.")
+        action, command = "build_packet", "sera packet build"
+        reported_next_action = action
+        reason = {
+            "packet_missing": "The task is specified but no builder handoff exists.",
+            "packet_unbound": "The existing builder packet has no valid task binding and cannot be dispatched.",
+            "packet_stale_contract": "The task contract changed after this builder packet was generated; regenerate before dispatch.",
+        }.get(build_packet_state["reason"], "The builder packet is not current for this task contract.")
     elif not result["changed_files"]:
         action, command, reason = (
             "dispatch_builder",

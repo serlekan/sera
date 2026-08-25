@@ -80,6 +80,9 @@ BOOTSTRAP_EXCEPTION_SCHEMA_VERSION = 1
 BOOTSTRAP_EXCEPTION_TYPE = "historical_workflow_bootstrap_exception"
 BOOTSTRAP_EXCEPTION_INVALID = "bootstrap_exception_invalid"
 BOOTSTRAP_EXCEPTION_NOT_APPLICABLE = "bootstrap_exception_not_applicable"
+HISTORICAL_BOOTSTRAP_ELIGIBILITY_SCHEMA_VERSION = 1
+HISTORICAL_BOOTSTRAP_ELIGIBILITY_TYPE = "historical_builder_handoff_gap"
+HISTORICAL_BOOTSTRAP_ELIGIBILITY_CONFIG = "historical_bootstrap_eligibility"
 BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW = (
     "builder",
     "packet",
@@ -88,9 +91,9 @@ BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW = (
     "seal",
 )
 BOOTSTRAP_EXCEPTION_AUDIT_MESSAGE = (
-    "Builder handoff history is unavailable and has been explicitly preserved as missing. "
-    "Workflow progression continues under a documented bootstrap exception. "
-    "This does not assert that the builder stage occurred."
+    "Historical eligibility confirmed by policy registry. "
+    "Bootstrap exception records missing historical builder evidence. "
+    "No builder stage is claimed to have occurred."
 )
 # Semantic task-contract fields. Generated artifacts are bound to a hash of
 # these, never to their own contents, so the binding cannot become circular.
@@ -1262,6 +1265,51 @@ def packet_state(
     return {"exists": True, "current": True, "reason": None}
 
 
+def _historical_bootstrap_eligibility_errors(config: dict[str, Any], task: dict[str, Any]) -> list[str]:
+    """Validate separate policy authorization for one historical task."""
+    registry = config.get(HISTORICAL_BOOTSTRAP_ELIGIBILITY_CONFIG, [])
+    if not isinstance(registry, list):
+        return ["historical_eligibility_registry_invalid"]
+    if not registry:
+        return ["historical_eligibility_missing"]
+
+    for entry in registry:
+        if (
+            not isinstance(entry, dict)
+            or type(entry.get("schema_version")) is not int
+            or entry.get("schema_version") != HISTORICAL_BOOTSTRAP_ELIGIBILITY_SCHEMA_VERSION
+            or entry.get("eligibility_type") != HISTORICAL_BOOTSTRAP_ELIGIBILITY_TYPE
+            or not isinstance(entry.get("task_id"), str)
+            or not entry["task_id"]
+            or not isinstance(entry.get("created_at"), str)
+            or not entry["created_at"]
+            or not isinstance(entry.get("baseline_head_sha"), str)
+            or not entry["baseline_head_sha"]
+            or not isinstance(entry.get("baseline_tree_sha"), str)
+            or not entry["baseline_tree_sha"]
+        ):
+            return ["historical_eligibility_registry_invalid"]
+
+    matches = [entry for entry in registry if entry["task_id"] == task.get("id")]
+    if not matches:
+        return ["historical_eligibility_missing"]
+    if len(matches) != 1:
+        return ["historical_eligibility_registry_invalid"]
+
+    baseline = task_baseline_identity(task)
+    entry = matches[0]
+    if (
+        not isinstance(task.get("created_at"), str)
+        or not task["created_at"]
+        or baseline is None
+        or entry["created_at"] != task["created_at"]
+        or entry["baseline_head_sha"] != baseline["head_sha"]
+        or entry["baseline_tree_sha"] != baseline["head_tree_sha"]
+    ):
+        return ["historical_eligibility_mismatch"]
+    return []
+
+
 def bootstrap_exception_state(
     root: Path,
     task_dir: Path,
@@ -1283,9 +1331,6 @@ def bootstrap_exception_state(
         "audit_message": None,
     }
     if not result["exists"]:
-        return result
-    if (task_dir / "packet-build.md").exists():
-        result.update(applicable=False, reason=BOOTSTRAP_EXCEPTION_NOT_APPLICABLE)
         return result
     try:
         exception = json.loads(path.read_text(encoding="utf-8"))
@@ -1315,6 +1360,12 @@ def bootstrap_exception_state(
         errors.append("implementation_tree_sha_invalid")
     if exception.get("future_workflow_required") != list(BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW):
         errors.append("future_workflow_required_invalid")
+    try:
+        errors.extend(_historical_bootstrap_eligibility_errors(load_config(root), task))
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("historical_eligibility_registry_invalid")
+    if (task_dir / "packet-build.md").exists():
+        errors.append("builder_packet_present")
     if packet_provenance_path(task_dir, "build").exists():
         errors.append("builder_provenance_present")
     try:

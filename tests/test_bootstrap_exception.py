@@ -52,7 +52,7 @@ class BootstrapExceptionRepository(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def historical_task(self) -> Path:
+    def historical_task(self, *, register: bool = True) -> Path:
         task_dir = new_task(
             self.root,
             "historical implementation",
@@ -65,6 +65,8 @@ class BootstrapExceptionRepository(unittest.TestCase):
             1,
             "implementation",
         )
+        if register:
+            self.register_historical_task(task_dir)
         self.answer += 1
         (self.root / "src" / "app.py").write_text(f"ANSWER = {self.answer}\n", encoding="utf-8")
         git(self.root, "add", "src/app.py")
@@ -90,6 +92,7 @@ class BootstrapExceptionRepository(unittest.TestCase):
             1,
             "implementation",
         )
+        self.register_historical_task(task_dir)
         build_packet(self.root, task_dir, "review")
         return task_dir
 
@@ -108,6 +111,29 @@ class BootstrapExceptionRepository(unittest.TestCase):
         )
         build_packet(self.root, task_dir, "build")
         return task_dir
+
+    def register_historical_task(self, task_dir: Path, **overrides: object) -> None:
+        task = load_task(task_dir)
+        baseline = task["baseline_repository_identity"]
+        entry = {
+            "task_id": task["id"],
+            "created_at": task["created_at"],
+            "baseline_head_sha": baseline["head_sha"],
+            "baseline_tree_sha": baseline["head_tree_sha"],
+            "eligibility_type": "historical_builder_handoff_gap",
+            "schema_version": 1,
+        }
+        entry.update(overrides)
+        path = self.root / ".sera" / "config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["historical_bootstrap_eligibility"] = [entry]
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    def write_registry(self, entries: object) -> None:
+        path = self.root / ".sera" / "config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["historical_bootstrap_eligibility"] = entries
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     def write_exception(
         self,
@@ -237,10 +263,81 @@ class BootstrapExceptionTests(BootstrapExceptionRepository):
         self.assertTrue(state["applicable"])
         self.assertTrue(state["accepted"])
         self.assertEqual(state["validation_errors"], [])
-        self.assertIn("explicitly preserved as missing", state["audit_message"])
+        self.assertEqual(
+            state["audit_message"],
+            "Historical eligibility confirmed by policy registry. Bootstrap exception records missing "
+            "historical builder evidence. No builder stage is claimed to have occurred.",
+        )
         self.assertFalse((task_dir / "packet-build.md").exists())
         self.assertFalse((task_dir / "packet-build.provenance.json").exists())
         self.assertEqual((task_dir / "context-ledger.jsonl").read_bytes(), before_context)
+
+    def test_current_task_cannot_self_authorize_with_a_valid_exception(self) -> None:
+        task_dir = self.historical_task(register=False)
+        self.write_exception(task_dir)
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertIn("historical_eligibility_missing", state["validation_errors"])
+
+    def test_empty_registry_rejects_every_unregistered_exception(self) -> None:
+        task_dir = self.historical_task(register=False)
+        self.write_exception(task_dir)
+        self.write_registry([])
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertIn("historical_eligibility_missing", state["validation_errors"])
+
+    def test_registry_must_match_the_exact_historical_task_identity(self) -> None:
+        cases = [
+            ("wrong task id", {"task_id": "different-task"}, "historical_eligibility_missing"),
+            ("wrong timestamp", {"created_at": "2000-01-01T00:00:00Z"}, "historical_eligibility_mismatch"),
+            ("wrong baseline head", {"baseline_head_sha": "0" * 40}, "historical_eligibility_mismatch"),
+            ("wrong baseline tree", {"baseline_tree_sha": "0" * 40}, "historical_eligibility_mismatch"),
+            ("wrong eligibility type", {"eligibility_type": "current_task"}, "historical_eligibility_registry_invalid"),
+            ("wrong schema", {"schema_version": 2}, "historical_eligibility_registry_invalid"),
+            ("boolean schema", {"schema_version": True}, "historical_eligibility_registry_invalid"),
+        ]
+        for name, override, expected_error in cases:
+            with self.subTest(name):
+                task_dir = self.historical_task()
+                self.register_historical_task(task_dir, **override)
+                self.write_exception(task_dir)
+
+                state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+                self.assertFalse(state["accepted"])
+                self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+                self.assertIn(expected_error, state["validation_errors"])
+
+    def test_malformed_or_duplicate_registry_fails_closed(self) -> None:
+        cases: list[object] = [None, {}, "eligible", [None]]
+        for registry in cases:
+            with self.subTest(registry=registry):
+                task_dir = self.historical_task(register=False)
+                self.write_exception(task_dir)
+                self.write_registry(registry)
+
+                state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+                self.assertFalse(state["accepted"])
+                self.assertIn("historical_eligibility_registry_invalid", state["validation_errors"])
+
+        task_dir = self.historical_task()
+        config = json.loads((self.root / ".sera" / "config.json").read_text(encoding="utf-8"))
+        entry = config["historical_bootstrap_eligibility"][0]
+        self.write_registry([entry, dict(entry)])
+        self.write_exception(task_dir)
+
+        duplicate = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(duplicate["accepted"])
+        self.assertIn("historical_eligibility_registry_invalid", duplicate["validation_errors"])
 
     def test_exception_requires_an_authoritative_implementation_change(self) -> None:
         task_dir = self.empty_historical_task()
@@ -438,7 +535,7 @@ class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
         )
 
     def test_no_exception_preserves_packet_missing_behavior(self) -> None:
-        task_dir = self.reviewed_historical_task()
+        task_dir = self.historical_task(register=False)
 
         report = next_action(self.root, task_dir)
 
@@ -447,17 +544,34 @@ class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
         self.assertEqual(report["build_packet"]["reason"], "packet_missing")
         self.assertFalse(report["bootstrap_exception"]["exists"])
 
-    def test_native_builder_packet_outranks_exception(self) -> None:
-        task_dir = self.native_builder_task()
-        (task_dir / "bootstrap-exception.json").write_text("{}\n", encoding="utf-8")
+    def test_future_task_cannot_bypass_builder_handoff(self) -> None:
+        task_dir = self.historical_task(register=False)
+        self.write_exception(task_dir)
 
         report = next_action(self.root, task_dir)
 
-        self.assertEqual(report["state"], "dispatch_builder")
+        self.assertEqual(report["state"], "invalid")
+        self.assertEqual(report["next_action"], "bootstrap_exception_invalid")
+        self.assertEqual(report["reason"], "bootstrap_exception_invalid")
         self.assertFalse(report["bootstrap_exception"]["accepted"])
-        self.assertEqual(report["bootstrap_exception"]["reason"], "bootstrap_exception_not_applicable")
+        self.assertFalse((task_dir / "packet-build.md").exists())
+        self.assertFalse((task_dir / "packet-build.provenance.json").exists())
 
-    def test_stale_or_unbound_builder_packet_outranks_exception(self) -> None:
+    def test_native_builder_packet_alongside_exception_is_invalid(self) -> None:
+        task_dir = self.historical_task()
+        build_packet(self.root, task_dir, "build")
+        self.write_exception(task_dir)
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "invalid")
+        self.assertEqual(report["next_action"], "bootstrap_exception_invalid")
+        self.assertFalse(report["bootstrap_exception"]["accepted"])
+        self.assertEqual(report["bootstrap_exception"]["reason"], "bootstrap_exception_invalid")
+        self.assertIn("builder_packet_present", report["bootstrap_exception"]["validation_errors"])
+        self.assertIn("builder_provenance_present", report["bootstrap_exception"]["validation_errors"])
+
+    def test_stale_or_unbound_builder_packet_alongside_exception_is_invalid(self) -> None:
         stale_task = self.native_builder_task()
         (stale_task / "bootstrap-exception.json").write_text("{}\n", encoding="utf-8")
         stale_task_data = load_task(stale_task)
@@ -466,9 +580,10 @@ class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
 
         stale_report = next_action(self.root, stale_task)
 
-        self.assertEqual(stale_report["state"], "build_packet")
+        self.assertEqual(stale_report["state"], "invalid")
+        self.assertEqual(stale_report["next_action"], "bootstrap_exception_invalid")
         self.assertEqual(stale_report["build_packet"]["reason"], PACKET_STALE_CONTRACT)
-        self.assertEqual(stale_report["bootstrap_exception"]["reason"], "bootstrap_exception_not_applicable")
+        self.assertEqual(stale_report["bootstrap_exception"]["reason"], "bootstrap_exception_invalid")
 
         unbound_task = self.native_builder_task()
         (unbound_task / "bootstrap-exception.json").write_text("{}\n", encoding="utf-8")
@@ -476,9 +591,10 @@ class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
 
         unbound_report = next_action(self.root, unbound_task)
 
-        self.assertEqual(unbound_report["state"], "build_packet")
+        self.assertEqual(unbound_report["state"], "invalid")
+        self.assertEqual(unbound_report["next_action"], "bootstrap_exception_invalid")
         self.assertEqual(unbound_report["build_packet"]["reason"], PACKET_UNBOUND)
-        self.assertEqual(unbound_report["bootstrap_exception"]["reason"], "bootstrap_exception_not_applicable")
+        self.assertEqual(unbound_report["bootstrap_exception"]["reason"], "bootstrap_exception_invalid")
 
 
 if __name__ == "__main__":
