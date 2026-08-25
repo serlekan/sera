@@ -480,7 +480,15 @@ and must match the current review packet's `repository_identity` (`head_sha`
 and `head_tree_sha`), whose packet state is itself recomputed against the
 existing checkout. A matching checkout alone is insufficient: the current
 review packet must be a current task-bound artifact with complete review
-coverage. Builder provenance without its packet is also rejected.
+coverage. The task must also have at least one authoritative implementation
+change according to `task_changed_files`; an empty change set is rejected with
+`implementation_change_missing`. Builder provenance without its packet is also
+rejected.
+
+Review-packet route validation uses the existing `.sera/cache/repo-map.json`
+only. The evaluator does not rebuild or persist a missing map, and a missing or
+unreadable cache fails closed without creating or modifying either repo-map
+cache artifact.
 
 The read-only `bootstrap_exception` audit state is included in every
 `next_action` response with this stable shape:

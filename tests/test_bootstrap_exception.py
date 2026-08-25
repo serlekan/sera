@@ -77,6 +77,22 @@ class BootstrapExceptionRepository(unittest.TestCase):
         accept_review(self.root, task_dir, "ship", "independent-peer", "correct", "independent")
         return task_dir
 
+    def empty_historical_task(self) -> Path:
+        task_dir = new_task(
+            self.root,
+            "empty historical implementation",
+            "update the application",
+            "assured",
+            "high",
+            ["src/app.py"],
+            [],
+            [],
+            1,
+            "implementation",
+        )
+        build_packet(self.root, task_dir, "review")
+        return task_dir
+
     def native_builder_task(self) -> Path:
         task_dir = new_task(
             self.root,
@@ -118,8 +134,63 @@ class BootstrapExceptionRepository(unittest.TestCase):
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return path
 
+    def filesystem_snapshot(self) -> dict[str, bytes | None]:
+        """Capture every non-Git filesystem entry without changing repository state."""
+        snapshot: dict[str, bytes | None] = {}
+        for path in sorted(self.root.rglob("*")):
+            relative = path.relative_to(self.root)
+            if ".git" in relative.parts:
+                continue
+            snapshot[relative.as_posix()] = None if path.is_dir() else path.read_bytes()
+        return snapshot
+
 
 class BootstrapExceptionTests(BootstrapExceptionRepository):
+    def test_missing_repo_map_fails_closed_without_mutating_repository_state(self) -> None:
+        task_dir = self.historical_task()
+        self.write_exception(task_dir)
+        cache = self.root / ".sera" / "cache"
+        (cache / "repo-map.json").unlink()
+        (cache / "repo-map.md").unlink()
+        before = self.filesystem_snapshot()
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertIn("review_packet_validation_failed", state["validation_errors"])
+        self.assertEqual(self.filesystem_snapshot(), before)
+        self.assertFalse((cache / "repo-map.json").exists())
+        self.assertFalse((cache / "repo-map.md").exists())
+
+    def test_unreadable_repo_map_fails_closed_without_mutating_repository_state(self) -> None:
+        task_dir = self.historical_task()
+        self.write_exception(task_dir)
+        repo_map = self.root / ".sera" / "cache" / "repo-map.json"
+        repo_map.write_text("{not json}\n", encoding="utf-8")
+        before = self.filesystem_snapshot()
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertIn("review_packet_validation_failed", state["validation_errors"])
+        self.assertEqual(self.filesystem_snapshot(), before)
+
+    def test_wrong_shaped_repo_map_fails_closed_without_mutating_repository_state(self) -> None:
+        task_dir = self.historical_task()
+        self.write_exception(task_dir)
+        repo_map = self.root / ".sera" / "cache" / "repo-map.json"
+        repo_map.write_text("[]\n", encoding="utf-8")
+        before = self.filesystem_snapshot()
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertIn("review_packet_validation_failed", state["validation_errors"])
+        self.assertEqual(self.filesystem_snapshot(), before)
+
     def test_valid_exception_is_accepted_and_preserves_missing_builder_history(self) -> None:
         task_dir = self.historical_task()
         self.write_exception(task_dir)
@@ -137,6 +208,16 @@ class BootstrapExceptionTests(BootstrapExceptionRepository):
         self.assertFalse((task_dir / "packet-build.md").exists())
         self.assertFalse((task_dir / "packet-build.provenance.json").exists())
         self.assertEqual((task_dir / "context-ledger.jsonl").read_bytes(), before_context)
+
+    def test_exception_requires_an_authoritative_implementation_change(self) -> None:
+        task_dir = self.empty_historical_task()
+        self.write_exception(task_dir)
+
+        state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+        self.assertFalse(state["accepted"])
+        self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+        self.assertEqual(state["validation_errors"], ["implementation_change_missing"])
 
     def test_exception_identity_must_match_review_packet_artifact(self) -> None:
         task_dir = self.historical_task()
@@ -179,6 +260,25 @@ class BootstrapExceptionTests(BootstrapExceptionRepository):
                 self.assertFalse(state["accepted"])
                 self.assertEqual(state["reason"], "bootstrap_exception_invalid")
                 self.assertIn(error, state["validation_errors"])
+
+    def test_schema_type_and_missing_stage_bindings_report_exact_errors(self) -> None:
+        cases = [
+            ("boolean schema version", {"schema_version": True}, (), "schema_version_invalid"),
+            ("wrong type", {"type": "other"}, (), "type_invalid"),
+            ("missing type", {}, ("type",), "type_invalid"),
+            ("wrong missing stage", {"missing_stage": "packet"}, (), "missing_stage_invalid"),
+            ("missing missing stage", {}, ("missing_stage",), "missing_stage_invalid"),
+        ]
+        for name, overrides, omit, expected_error in cases:
+            with self.subTest(name):
+                task_dir = self.historical_task()
+                self.write_exception(task_dir, omit=omit, **overrides)
+
+                state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+                self.assertFalse(state["accepted"])
+                self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+                self.assertEqual(state["validation_errors"], [expected_error])
 
     def test_future_workflow_must_be_the_exact_required_list(self) -> None:
         cases = [
@@ -289,6 +389,20 @@ class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
         self.assertEqual(report["state"], "invalid")
         self.assertEqual(report["next_action"], "bootstrap_exception_invalid")
         self.assertEqual(report["reason"], "bootstrap_exception_invalid")
+
+    def test_empty_change_exception_fails_closed_in_controller(self) -> None:
+        task_dir = self.empty_historical_task()
+        self.write_exception(task_dir)
+
+        report = next_action(self.root, task_dir)
+
+        self.assertEqual(report["state"], "invalid")
+        self.assertEqual(report["next_action"], "bootstrap_exception_invalid")
+        self.assertEqual(report["reason"], "bootstrap_exception_invalid")
+        self.assertEqual(
+            report["bootstrap_exception"]["validation_errors"],
+            ["implementation_change_missing"],
+        )
 
     def test_no_exception_preserves_packet_missing_behavior(self) -> None:
         task_dir = self.reviewed_historical_task()

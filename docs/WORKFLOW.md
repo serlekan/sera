@@ -39,12 +39,14 @@ each stage selects only the context it needs; see
 ### Historical workflow bootstrap exceptions
 
 An exception is available only for a pre-native historical task whose builder
-handoff history is unavailable. It preserves that history as missing and does
-not claim that the builder ran or fabricate a builder packet, provenance, log,
-or evidence. The exception does not remove the independent review, gate, or
-seal requirements: those stages still run and remain visible in the audit
-state. All future work must use the native full workflow, including the
-builder and packet stages.
+handoff history is unavailable and whose authoritative task change set contains
+an implementation change. Evaluation also requires a readable existing
+repository-map cache; it fails closed without rebuilding a missing or unreadable
+map. The exception preserves builder history as missing and does not claim that
+the builder ran or fabricate a builder packet, provenance, log, or evidence.
+It does not remove the independent review, gate, or seal requirements: those
+stages still run and remain visible in the audit state. All future work must use
+the native full workflow, including the builder and packet stages.
 
 ## Review
 

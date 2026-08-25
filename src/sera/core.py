@@ -1317,11 +1317,21 @@ def bootstrap_exception_state(
         errors.append("future_workflow_required_invalid")
     if packet_provenance_path(task_dir, "build").exists():
         errors.append("builder_provenance_present")
+    try:
+        if not task_changed_files(root, task):
+            errors.append("implementation_change_missing")
+    except (OSError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("implementation_change_validation_failed")
 
     review_packet: dict[str, Any] | None = None
     try:
         fingerprint = state_fingerprint if state_fingerprint is not None else task_fingerprint(root, task_dir)
-        packet = packet_state(root, task_dir, "review", task, fingerprint)
+        repo_map = load_repo_map(root, rebuild_if_missing=False)
+        if not isinstance(repo_map, dict) or not isinstance(repo_map.get("files"), list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in repo_map.get("files", [])
+        ):
+            raise SeraError("Repository map cache is invalid. Run `sera map`.")
+        packet = packet_state(root, task_dir, "review", task, fingerprint, repo_map=repo_map)
         review_packet = {
             "exists": bool(packet["exists"]),
             "current": bool(packet["current"]),
