@@ -50,7 +50,10 @@ Every displayed field is required. Validation is strict:
 - `no_fabricated_evidence` must be exactly the Boolean `true`; truthy values,
   `false`, and omission fail closed.
 - `implementation_head_sha` and `implementation_tree_sha` must exactly match
-  the repository's recomputed current HEAD and HEAD tree.
+  the task artifact identity recorded by the current review packet. Existing
+  review-packet validation separately proves that identity still matches the
+  repository checkout; the exception is never accepted merely because it
+  matches whatever HEAD happens to be open.
 - `future_workflow_required` must exactly equal the ordered sequence shown
   above.
 
@@ -77,6 +80,8 @@ state checks are true:
 3. A review packet exists and is current under the existing packet-integrity
    checks.
 4. Review coverage recomputes with `coverage_complete == true`.
+5. The exception identity matches the review packet's recorded implementation
+   HEAD and tree.
 
 The evaluator creates and modifies nothing. In particular, it never creates a
 builder packet, provenance, timestamp, context record, ledger entry, or other
@@ -90,7 +95,7 @@ The accepted audit message is:
 
 ## Controller Integration
 
-`sera next` evaluates the exception only when the existing builder packet is
+`sera next` evaluates the exception only when both builder artifacts are
 missing. Its precedence is:
 
 ```text
@@ -124,7 +129,9 @@ historical evidence.
 
 Builder packets that exist but are stale, unbound, or otherwise invalid retain
 their existing behavior. A bootstrap exception cannot override them because
-the exception requires all builder packet artifacts to be absent.
+the exception requires all builder packet artifacts to be absent. When a valid
+builder packet exists, an adjacent bootstrap-exception file is ignored for
+progression and the existing builder validation remains authoritative.
 
 ## Testing
 
@@ -144,6 +151,9 @@ coverage, and review APIs.
 5. Existing builder artifacts make an exception invalid, proving that the
    controller never treats fabricated or contradictory handoff artifacts as a
    historical gap.
+6. A valid existing builder packet plus any bootstrap-exception file follows
+   ordinary builder-packet progression and does not reinterpret the task as a
+   historical exception.
 
 The complete existing test suite must remain green. Final verification runs:
 
