@@ -1328,7 +1328,11 @@ def bootstrap_exception_state(
         fingerprint = state_fingerprint if state_fingerprint is not None else task_fingerprint(root, task_dir)
         repo_map = load_repo_map(root, rebuild_if_missing=False)
         if not isinstance(repo_map, dict) or not isinstance(repo_map.get("files"), list) or any(
-            not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in repo_map.get("files", [])
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
+            or type(item.get("bytes")) is not int
+            or item["bytes"] < 0
+            for item in repo_map.get("files", [])
         ):
             raise SeraError("Repository map cache is invalid. Run `sera map`.")
         packet = packet_state(root, task_dir, "review", task, fingerprint, repo_map=repo_map)
@@ -1339,7 +1343,7 @@ def bootstrap_exception_state(
         }
         if not review_packet["current"]:
             errors.append("review_packet_not_current")
-    except (OSError, json.JSONDecodeError, SeraError, KeyError, ValueError):
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
         review_packet = {"exists": False, "current": False, "reason": "validation_failed"}
         errors.append("review_packet_validation_failed")
 

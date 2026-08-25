@@ -191,6 +191,39 @@ class BootstrapExceptionTests(BootstrapExceptionRepository):
         self.assertIn("review_packet_validation_failed", state["validation_errors"])
         self.assertEqual(self.filesystem_snapshot(), before)
 
+    def test_invalid_repo_map_entry_bytes_fail_closed_without_mutating_repository_state(self) -> None:
+        cases = [
+            ("list", [], False),
+            ("string", "1", False),
+            ("float", 1.5, False),
+            ("negative integer", -1, False),
+            ("boolean", True, False),
+            ("null", None, False),
+            ("missing", None, True),
+            ("object", {"value": 1}, False),
+        ]
+        for name, bytes_value, omit in cases:
+            with self.subTest(name):
+                build_repo_map(self.root)
+                task_dir = self.historical_task()
+                self.write_exception(task_dir)
+                repo_map_path = self.root / ".sera" / "cache" / "repo-map.json"
+                repo_map = json.loads(repo_map_path.read_text(encoding="utf-8"))
+                entry = next(item for item in repo_map["files"] if item["path"] == "src/app.py")
+                if omit:
+                    entry.pop("bytes")
+                else:
+                    entry["bytes"] = bytes_value
+                repo_map_path.write_text(json.dumps(repo_map, indent=2) + "\n", encoding="utf-8")
+                before = self.filesystem_snapshot()
+
+                state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+
+                self.assertFalse(state["accepted"])
+                self.assertEqual(state["reason"], "bootstrap_exception_invalid")
+                self.assertIn("review_packet_validation_failed", state["validation_errors"])
+                self.assertEqual(self.filesystem_snapshot(), before)
+
     def test_valid_exception_is_accepted_and_preserves_missing_builder_history(self) -> None:
         task_dir = self.historical_task()
         self.write_exception(task_dir)
