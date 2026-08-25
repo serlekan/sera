@@ -420,3 +420,174 @@
   ```
 
   Preserve the unrelated untracked `sera-0.4.2-release-notes.md` file.
+
+---
+
+Tasks 1-3 above record the implementation rejected at
+`0e6939b2b9e5cbdec724c29aef2e08334d306b9d`. Task 4 is the approved correction
+and supersedes their audit-message, builder-artifact-precedence, and exception-
+applicability instructions wherever they conflict.
+
+### Task 4: Enforce policy-authorized historical eligibility
+
+**Files:**
+- Modify: `tests/test_bootstrap_exception.py`
+- Modify: `src/sera/core.py`
+- Modify: `src/sera/controller.py`
+
+**Interfaces:**
+- Consumes: `.sera/config.json`, `task["id"]`, `task["created_at"]`,
+  `task_baseline_identity(task)`, and the existing exception/packet validators.
+- Produces: config key `historical_bootstrap_eligibility: list[dict[str, Any]]`,
+  constants `HISTORICAL_BOOTSTRAP_ELIGIBILITY_SCHEMA_VERSION` and
+  `HISTORICAL_BOOTSTRAP_ELIGIBILITY_TYPE`, and fail-closed validation errors
+  `historical_eligibility_missing`, `historical_eligibility_registry_invalid`,
+  and `historical_eligibility_mismatch`.
+
+- [ ] **Step 1: Add failing eligibility and builder-conflict tests**
+
+Add a test helper that writes one explicit registry entry to the existing test
+repository's `.sera/config.json`:
+
+```python
+def register_historical_task(self, task_dir: Path, **overrides: object) -> None:
+    task = load_task(task_dir)
+    baseline = task["baseline_repository_identity"]
+    entry = {
+        "task_id": task["id"],
+        "created_at": task["created_at"],
+        "baseline_head_sha": baseline["head_sha"],
+        "baseline_tree_sha": baseline["head_tree_sha"],
+        "eligibility_type": "historical_builder_handoff_gap",
+        "schema_version": 1,
+    }
+    entry.update(overrides)
+    path = self.root / ".sera" / "config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["historical_bootstrap_eligibility"] = [entry]
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+```
+
+Cover these consumer-visible results with real temporary Git repositories:
+
+```python
+def test_registered_historical_task_is_accepted(self) -> None:
+    task_dir = self.historical_task(register=True)
+    self.write_exception(task_dir)
+    state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+    self.assertTrue(state["accepted"])
+
+def test_current_task_cannot_self_authorize_with_exception(self) -> None:
+    task_dir = self.historical_task(register=False)
+    self.write_exception(task_dir)
+    state = core.bootstrap_exception_state(self.root, task_dir, load_task(task_dir))
+    self.assertFalse(state["accepted"])
+    self.assertIn("historical_eligibility_missing", state["validation_errors"])
+```
+
+Add a separate controller regression proving a future/current task with a
+perfectly formed exception still returns `bootstrap_exception_invalid`, a
+table-driven registry mismatch test for task ID, creation timestamp, baseline
+HEAD, baseline tree, eligibility type, and schema version, an explicit empty
+registry test, and builder packet/provenance conflict tests that expect invalid
+instead of ordinary builder dispatch.
+
+- [ ] **Step 2: Run the new tests and verify RED**
+
+Run:
+
+```text
+PYTHONPATH=src pytest tests/test_bootstrap_exception.py -q
+```
+
+Expected: failures show unregistered exceptions are still accepted, registry
+identity is not checked, and an existing builder packet still dispatches.
+
+- [ ] **Step 3: Implement exact registry matching and invalid precedence**
+
+In `src/sera/core.py`, add strict registry constants and a read-only helper that
+loads `config.get("historical_bootstrap_eligibility", [])`. The helper must
+reject non-list registries, malformed entries, Boolean or wrong schema
+versions, wrong eligibility types, duplicate matching task IDs, missing task
+IDs, and any mismatch against the task's exact ID, creation timestamp, or
+baseline HEAD/tree.
+
+`bootstrap_exception_state` must call it after exception schema validation,
+reject either builder artifact, retain all existing review packet and coverage
+validation, and emit this exact accepted audit message:
+
+```text
+Historical eligibility confirmed by policy registry. Bootstrap exception records missing historical builder evidence. No builder stage is claimed to have occurred.
+```
+
+In `src/sera/controller.py`, make every present invalid exception return
+`state: invalid`, `next_action: bootstrap_exception_invalid`, and
+`reason: bootstrap_exception_invalid` before ordinary packet routing. Leave the
+no-exception state machine unchanged.
+
+- [ ] **Step 4: Run focused tests and verify GREEN**
+
+Run:
+
+```text
+PYTHONPATH=src pytest tests/test_bootstrap_exception.py -q
+```
+
+Expected: all focused tests pass with no builder artifact, timestamp, log,
+provenance, context, or ledger creation.
+
+- [ ] **Step 5: Commit the correction**
+
+```bash
+git add src/sera/core.py src/sera/controller.py tests/test_bootstrap_exception.py
+git commit -m "fix: authorize historical bootstrap exceptions by policy"
+```
+
+### Task 5: Document the authorization boundary and verify the exact tree
+
+**Files:**
+- Modify: `docs/CONTROLLER.md`
+- Modify: `docs/WORKFLOW.md`
+
+**Interfaces:**
+- Consumes: the `historical_bootstrap_eligibility` config schema and accepted
+  audit message implemented in Task 4.
+- Produces: operator instructions that distinguish policy authorization from
+  the exception's missing-evidence record.
+
+- [ ] **Step 1: Update operator documentation**
+
+Document the default-empty registry, its exact entry schema, exact task-identity
+binding, no automatic authorization writes, builder-artifact conflict behavior,
+and the rule that missing builder history remains missing rather than being
+reconstructed or claimed.
+
+- [ ] **Step 2: Run final verification**
+
+```text
+PYTHONPATH=src pytest tests/test_bootstrap_exception.py -q
+PYTHONPATH=src pytest -q
+python -m ruff check .
+git diff --check 0e6939b2b9e5cbdec724c29aef2e08334d306b9d..HEAD
+```
+
+Expected: focused and full suites pass, Ruff reports `All checks passed!`, and
+`git diff --check` exits zero without output.
+
+- [ ] **Step 3: Commit documentation**
+
+```bash
+git add docs/CONTROLLER.md docs/WORKFLOW.md
+git commit -m "docs: define historical bootstrap authorization registry"
+```
+
+- [ ] **Step 4: Capture exact review identity**
+
+```bash
+git rev-parse HEAD
+git rev-parse 'HEAD^{tree}'
+git status --short --branch
+```
+
+Expected: a clean feature branch with exact commit and tree values ready for a
+new independent review.
