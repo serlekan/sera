@@ -76,6 +76,22 @@ PACKET_STALE_CHANGE_SET = "packet_stale_change_set"
 PACKET_COVERAGE_INCOMPLETE = "packet_coverage_incomplete"
 PACKET_STALE_ROUTE = "packet_stale_route"
 PACKET_CONTENT_MISMATCH = "packet_content_mismatch"
+BOOTSTRAP_EXCEPTION_SCHEMA_VERSION = 1
+BOOTSTRAP_EXCEPTION_TYPE = "historical_workflow_bootstrap_exception"
+BOOTSTRAP_EXCEPTION_INVALID = "bootstrap_exception_invalid"
+BOOTSTRAP_EXCEPTION_NOT_APPLICABLE = "bootstrap_exception_not_applicable"
+BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW = (
+    "builder",
+    "packet",
+    "independent_review",
+    "gate",
+    "seal",
+)
+BOOTSTRAP_EXCEPTION_AUDIT_MESSAGE = (
+    "Builder handoff history is unavailable and has been explicitly preserved as missing. "
+    "Workflow progression continues under a documented bootstrap exception. "
+    "This does not assert that the builder stage occurred."
+)
 # Semantic task-contract fields. Generated artifacts are bound to a hash of
 # these, never to their own contents, so the binding cannot become circular.
 TASK_CONTRACT_FIELDS = (
@@ -1244,6 +1260,119 @@ def packet_state(
     if provenance["content_sha256"] != sha256_bytes(content):
         return {"exists": True, "current": False, "reason": PACKET_CONTENT_MISMATCH}
     return {"exists": True, "current": True, "reason": None}
+
+
+def bootstrap_exception_state(
+    root: Path,
+    task_dir: Path,
+    task: dict[str, Any],
+    state_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Return the read-only state of a historical builder-handoff exception."""
+    path = task_dir / "bootstrap-exception.json"
+    result: dict[str, Any] = {
+        "exists": path.exists(),
+        "applicable": False,
+        "accepted": False,
+        "reason": None,
+        "validation_errors": [],
+        "missing_stage": None,
+        "implementation_identity": {"head_sha": None, "head_tree_sha": None},
+        "review_packet": None,
+        "coverage_complete": None,
+        "audit_message": None,
+    }
+    if not result["exists"]:
+        return result
+    if (task_dir / "packet-build.md").exists():
+        result.update(applicable=False, reason=BOOTSTRAP_EXCEPTION_NOT_APPLICABLE)
+        return result
+    try:
+        exception = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        result.update(applicable=True, reason=BOOTSTRAP_EXCEPTION_INVALID, validation_errors=["exception_unreadable"])
+        return result
+    if not isinstance(exception, dict):
+        result.update(applicable=True, reason=BOOTSTRAP_EXCEPTION_INVALID, validation_errors=["exception_unreadable"])
+        return result
+    errors: list[str] = []
+    if (
+        type(exception.get("schema_version")) is not int
+        or exception.get("schema_version") != BOOTSTRAP_EXCEPTION_SCHEMA_VERSION
+    ):
+        errors.append("schema_version_invalid")
+    if exception.get("type") != BOOTSTRAP_EXCEPTION_TYPE:
+        errors.append("type_invalid")
+    if not isinstance(exception.get("reason"), str) or not exception["reason"].strip():
+        errors.append("reason_invalid")
+    if exception.get("missing_stage") != "builder_handoff":
+        errors.append("missing_stage_invalid")
+    if exception.get("no_fabricated_evidence") is not True:
+        errors.append("no_fabricated_evidence_invalid")
+    if not isinstance(exception.get("implementation_head_sha"), str) or not exception["implementation_head_sha"]:
+        errors.append("implementation_head_sha_invalid")
+    if not isinstance(exception.get("implementation_tree_sha"), str) or not exception["implementation_tree_sha"]:
+        errors.append("implementation_tree_sha_invalid")
+    if exception.get("future_workflow_required") != list(BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW):
+        errors.append("future_workflow_required_invalid")
+    if packet_provenance_path(task_dir, "build").exists():
+        errors.append("builder_provenance_present")
+
+    review_packet: dict[str, Any] | None = None
+    try:
+        fingerprint = state_fingerprint if state_fingerprint is not None else task_fingerprint(root, task_dir)
+        packet = packet_state(root, task_dir, "review", task, fingerprint)
+        review_packet = {
+            "exists": bool(packet["exists"]),
+            "current": bool(packet["current"]),
+            "reason": packet["reason"],
+        }
+        if not review_packet["current"]:
+            errors.append("review_packet_not_current")
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, ValueError):
+        review_packet = {"exists": False, "current": False, "reason": "validation_failed"}
+        errors.append("review_packet_validation_failed")
+
+    coverage_complete: bool | None = None
+    try:
+        coverage = task_review_coverage(root, task, int(load_config(root)["max_packet_chars"]))
+        coverage_complete = coverage.get("coverage_complete") is True
+        if coverage_complete is not True:
+            errors.append("coverage_incomplete")
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("coverage_validation_failed")
+
+    try:
+        provenance = read_packet_provenance(task_dir, "review")
+        identity = provenance.get("repository_identity") if provenance else None
+        if not _valid_identity(identity):
+            errors.append("review_packet_identity_invalid")
+        else:
+            if exception.get("implementation_head_sha") != identity["head_sha"]:
+                errors.append("implementation_head_mismatch")
+            if exception.get("implementation_tree_sha") != identity["head_tree_sha"]:
+                errors.append("implementation_tree_mismatch")
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("review_packet_identity_invalid")
+    result.update(
+        applicable=True,
+        accepted=not errors,
+        reason=BOOTSTRAP_EXCEPTION_INVALID if errors else None,
+        validation_errors=errors,
+        missing_stage=exception.get("missing_stage"),
+        implementation_identity={
+            "head_sha": exception.get("implementation_head_sha")
+            if isinstance(exception.get("implementation_head_sha"), str)
+            else None,
+            "head_tree_sha": exception.get("implementation_tree_sha")
+            if isinstance(exception.get("implementation_tree_sha"), str)
+            else None,
+        },
+        review_packet=review_packet,
+        coverage_complete=coverage_complete,
+        audit_message=BOOTSTRAP_EXCEPTION_AUDIT_MESSAGE if not errors else None,
+    )
+    return result
 
 
 def write_task_capsule(task_dir: Path, task: dict[str, Any]) -> Path:
