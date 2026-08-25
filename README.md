@@ -648,6 +648,7 @@ This keeps SERA usable with Codex, Claude Code, local agents, CI, and future pro
 
 ## Documentation
 
+- [Oryol Workspace Specialization](docs/ORYOL.md)
 - [Controller](docs/CONTROLLER.md)
 - [Token efficiency](docs/TOKEN-EFFICIENCY.md)
 - [Workflow](docs/WORKFLOW.md)
