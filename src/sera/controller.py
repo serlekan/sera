@@ -12,11 +12,13 @@ from .context import (
     select_task_context,
 )
 from .core import (
+    BOOTSTRAP_EXCEPTION_INVALID,
     HIGH_RISK_TERMS,
     MEDIUM_RISK_TERMS,
     SeraError,
     apply_task_policy,
     assess_risk,
+    bootstrap_exception_state,
     budget_report,
     check_task,
     decide_route,
@@ -207,11 +209,25 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     result = check_task(root, task_dir)
     build_packet_state = packet_state(root, task_dir, "build", task)
     review_packet_state = packet_state(root, task_dir, "review", task, result["fingerprint"])
+    bootstrap_exception = bootstrap_exception_state(
+        root,
+        task_dir,
+        task,
+        state_fingerprint=result["fingerprint"],
+    )
+    builder_satisfied_by_exception = (
+        build_packet_state["reason"] == "packet_missing" and bootstrap_exception["accepted"]
+    )
     stage = required_stage(result)
     stage_context = context_report(root, task_dir, stage=stage, record=False)
 
     controller = task.get("controller", {})
-    if not task.get("allowed_files"):
+    reported_next_action: str | None = None
+    if bootstrap_exception["exists"] and not bootstrap_exception["accepted"]:
+        action, command = "invalid", None
+        reported_next_action = BOOTSTRAP_EXCEPTION_INVALID
+        reason = BOOTSTRAP_EXCEPTION_INVALID
+    elif not task.get("allowed_files"):
         action, command, reason = "resolve_ownership", None, "No exact owned files are defined."
     elif controller.get("auto_drafted") and not controller.get("ownership_confirmed", False):
         action, command, reason = "confirm_ownership", "sera task confirm", "Auto-selected files are candidates until the controller confirms exact ownership."
@@ -254,8 +270,9 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
             f"Selected {stage} context is {stage_context['estimated_context_tokens']:,} tokens against a "
             f"{stage_context['stage_budget_tokens']:,} budget; split the task or narrow the stage context.",
         )
-    elif not build_packet_state["current"]:
+    elif not build_packet_state["current"] and not builder_satisfied_by_exception:
         action, command = "build_packet", "sera packet build"
+        reported_next_action = action
         reason = {
             "packet_missing": "The task is specified but no builder handoff exists.",
             "packet_unbound": "The existing builder packet has no valid task binding and cannot be dispatched.",
@@ -302,7 +319,7 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     return {
         "task_id": task["id"],
         "state": action,
-        "next_action": action,
+        "next_action": reported_next_action or action,
         "command": command,
         "reason": reason,
         "mode": task["mode"],
@@ -316,6 +333,7 @@ def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
         "required_stage": stage,
         "build_packet": build_packet_state,
         "review_packet": review_packet_state,
+        "bootstrap_exception": bootstrap_exception,
         "ownership": stage_context["ownership"],
         "selected_context": stage_context["selected_context"],
         "stage_budget_tokens": stage_context["stage_budget_tokens"],

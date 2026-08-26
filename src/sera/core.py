@@ -76,6 +76,25 @@ PACKET_STALE_CHANGE_SET = "packet_stale_change_set"
 PACKET_COVERAGE_INCOMPLETE = "packet_coverage_incomplete"
 PACKET_STALE_ROUTE = "packet_stale_route"
 PACKET_CONTENT_MISMATCH = "packet_content_mismatch"
+BOOTSTRAP_EXCEPTION_SCHEMA_VERSION = 1
+BOOTSTRAP_EXCEPTION_TYPE = "historical_workflow_bootstrap_exception"
+BOOTSTRAP_EXCEPTION_INVALID = "bootstrap_exception_invalid"
+BOOTSTRAP_EXCEPTION_NOT_APPLICABLE = "bootstrap_exception_not_applicable"
+HISTORICAL_BOOTSTRAP_ELIGIBILITY_SCHEMA_VERSION = 1
+HISTORICAL_BOOTSTRAP_ELIGIBILITY_TYPE = "historical_builder_handoff_gap"
+HISTORICAL_BOOTSTRAP_ELIGIBILITY_CONFIG = "historical_bootstrap_eligibility"
+BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW = (
+    "builder",
+    "packet",
+    "independent_review",
+    "gate",
+    "seal",
+)
+BOOTSTRAP_EXCEPTION_AUDIT_MESSAGE = (
+    "Historical eligibility confirmed by policy registry. "
+    "Bootstrap exception records missing historical builder evidence. "
+    "No builder stage is claimed to have occurred."
+)
 # Semantic task-contract fields. Generated artifacts are bound to a hash of
 # these, never to their own contents, so the binding cannot become circular.
 TASK_CONTRACT_FIELDS = (
@@ -1244,6 +1263,181 @@ def packet_state(
     if provenance["content_sha256"] != sha256_bytes(content):
         return {"exists": True, "current": False, "reason": PACKET_CONTENT_MISMATCH}
     return {"exists": True, "current": True, "reason": None}
+
+
+def _historical_bootstrap_eligibility_errors(config: dict[str, Any], task: dict[str, Any]) -> list[str]:
+    """Validate separate policy authorization for one historical task."""
+    registry = config.get(HISTORICAL_BOOTSTRAP_ELIGIBILITY_CONFIG, [])
+    if not isinstance(registry, list):
+        return ["historical_eligibility_registry_invalid"]
+    if not registry:
+        return ["historical_eligibility_missing"]
+
+    for entry in registry:
+        if (
+            not isinstance(entry, dict)
+            or type(entry.get("schema_version")) is not int
+            or entry.get("schema_version") != HISTORICAL_BOOTSTRAP_ELIGIBILITY_SCHEMA_VERSION
+            or entry.get("eligibility_type") != HISTORICAL_BOOTSTRAP_ELIGIBILITY_TYPE
+            or not isinstance(entry.get("task_id"), str)
+            or not entry["task_id"]
+            or not isinstance(entry.get("created_at"), str)
+            or not entry["created_at"]
+            or not isinstance(entry.get("baseline_head_sha"), str)
+            or not entry["baseline_head_sha"]
+            or not isinstance(entry.get("baseline_tree_sha"), str)
+            or not entry["baseline_tree_sha"]
+        ):
+            return ["historical_eligibility_registry_invalid"]
+
+    matches = [entry for entry in registry if entry["task_id"] == task.get("id")]
+    if not matches:
+        return ["historical_eligibility_missing"]
+    if len(matches) != 1:
+        return ["historical_eligibility_registry_invalid"]
+
+    baseline = task_baseline_identity(task)
+    entry = matches[0]
+    if (
+        not isinstance(task.get("created_at"), str)
+        or not task["created_at"]
+        or baseline is None
+        or entry["created_at"] != task["created_at"]
+        or entry["baseline_head_sha"] != baseline["head_sha"]
+        or entry["baseline_tree_sha"] != baseline["head_tree_sha"]
+    ):
+        return ["historical_eligibility_mismatch"]
+    return []
+
+
+def bootstrap_exception_state(
+    root: Path,
+    task_dir: Path,
+    task: dict[str, Any],
+    state_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Return the read-only state of a historical builder-handoff exception."""
+    path = task_dir / "bootstrap-exception.json"
+    result: dict[str, Any] = {
+        "exists": path.exists(),
+        "applicable": False,
+        "accepted": False,
+        "reason": None,
+        "validation_errors": [],
+        "missing_stage": None,
+        "implementation_identity": {"head_sha": None, "head_tree_sha": None},
+        "review_packet": None,
+        "coverage_complete": None,
+        "audit_message": None,
+    }
+    if not result["exists"]:
+        return result
+    try:
+        exception = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        result.update(applicable=True, reason=BOOTSTRAP_EXCEPTION_INVALID, validation_errors=["exception_unreadable"])
+        return result
+    if not isinstance(exception, dict):
+        result.update(applicable=True, reason=BOOTSTRAP_EXCEPTION_INVALID, validation_errors=["exception_unreadable"])
+        return result
+    errors: list[str] = []
+    if (
+        type(exception.get("schema_version")) is not int
+        or exception.get("schema_version") != BOOTSTRAP_EXCEPTION_SCHEMA_VERSION
+    ):
+        errors.append("schema_version_invalid")
+    if exception.get("type") != BOOTSTRAP_EXCEPTION_TYPE:
+        errors.append("type_invalid")
+    if not isinstance(exception.get("reason"), str) or not exception["reason"].strip():
+        errors.append("reason_invalid")
+    if exception.get("missing_stage") != "builder_handoff":
+        errors.append("missing_stage_invalid")
+    if exception.get("no_fabricated_evidence") is not True:
+        errors.append("no_fabricated_evidence_invalid")
+    if not isinstance(exception.get("implementation_head_sha"), str) or not exception["implementation_head_sha"]:
+        errors.append("implementation_head_sha_invalid")
+    if not isinstance(exception.get("implementation_tree_sha"), str) or not exception["implementation_tree_sha"]:
+        errors.append("implementation_tree_sha_invalid")
+    if exception.get("future_workflow_required") != list(BOOTSTRAP_EXCEPTION_REQUIRED_WORKFLOW):
+        errors.append("future_workflow_required_invalid")
+    try:
+        errors.extend(_historical_bootstrap_eligibility_errors(load_config(root), task))
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("historical_eligibility_registry_invalid")
+    if (task_dir / "packet-build.md").exists():
+        errors.append("builder_packet_present")
+    if packet_provenance_path(task_dir, "build").exists():
+        errors.append("builder_provenance_present")
+    try:
+        if not task_changed_files(root, task):
+            errors.append("implementation_change_missing")
+    except (OSError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("implementation_change_validation_failed")
+
+    review_packet: dict[str, Any] | None = None
+    try:
+        fingerprint = state_fingerprint if state_fingerprint is not None else task_fingerprint(root, task_dir)
+        repo_map = load_repo_map(root, rebuild_if_missing=False)
+        if not isinstance(repo_map, dict) or not isinstance(repo_map.get("files"), list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
+            or type(item.get("bytes")) is not int
+            or item["bytes"] < 0
+            for item in repo_map.get("files", [])
+        ):
+            raise SeraError("Repository map cache is invalid. Run `sera map`.")
+        packet = packet_state(root, task_dir, "review", task, fingerprint, repo_map=repo_map)
+        review_packet = {
+            "exists": bool(packet["exists"]),
+            "current": bool(packet["current"]),
+            "reason": packet["reason"],
+        }
+        if not review_packet["current"]:
+            errors.append("review_packet_not_current")
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        review_packet = {"exists": False, "current": False, "reason": "validation_failed"}
+        errors.append("review_packet_validation_failed")
+
+    coverage_complete: bool | None = None
+    try:
+        coverage = task_review_coverage(root, task, int(load_config(root)["max_packet_chars"]))
+        coverage_complete = coverage.get("coverage_complete") is True
+        if coverage_complete is not True:
+            errors.append("coverage_incomplete")
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("coverage_validation_failed")
+
+    try:
+        provenance = read_packet_provenance(task_dir, "review")
+        identity = provenance.get("repository_identity") if provenance else None
+        if not _valid_identity(identity):
+            errors.append("review_packet_identity_invalid")
+        else:
+            if exception.get("implementation_head_sha") != identity["head_sha"]:
+                errors.append("implementation_head_mismatch")
+            if exception.get("implementation_tree_sha") != identity["head_tree_sha"]:
+                errors.append("implementation_tree_mismatch")
+    except (OSError, json.JSONDecodeError, SeraError, KeyError, TypeError, ValueError):
+        errors.append("review_packet_identity_invalid")
+    result.update(
+        applicable=True,
+        accepted=not errors,
+        reason=BOOTSTRAP_EXCEPTION_INVALID if errors else None,
+        validation_errors=errors,
+        missing_stage=exception.get("missing_stage"),
+        implementation_identity={
+            "head_sha": exception.get("implementation_head_sha")
+            if isinstance(exception.get("implementation_head_sha"), str)
+            else None,
+            "head_tree_sha": exception.get("implementation_tree_sha")
+            if isinstance(exception.get("implementation_tree_sha"), str)
+            else None,
+        },
+        review_packet=review_packet,
+        coverage_complete=coverage_complete,
+        audit_message=BOOTSTRAP_EXCEPTION_AUDIT_MESSAGE if not errors else None,
+    )
+    return result
 
 
 def write_task_capsule(task_dir: Path, task: dict[str, Any]) -> Path:
@@ -2470,6 +2664,9 @@ def evaluate_seal(
 
 def create_seal(root: Path, task_dir: Path) -> dict[str, Any]:
     result = check_task(root, task_dir)
+    bootstrap_exception = result["bootstrap_exception"]
+    if bootstrap_exception["exists"] and not bootstrap_exception["accepted"]:
+        raise SeraError(f"Task cannot be sealed: {BOOTSTRAP_EXCEPTION_INVALID}")
     if not result["ok"]:
         raise SeraError(f"Task cannot be sealed: {result['next_action']}")
     task = load_task(task_dir)
@@ -2503,6 +2700,15 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
     }
     missing_verification = [command for command in task["verification"] if command not in successful]
     fingerprint = task_fingerprint(root, task_dir)
+    bootstrap_exception = bootstrap_exception_state(
+        root,
+        task_dir,
+        task,
+        state_fingerprint=fingerprint,
+    )
+    bootstrap_exception_invalid = (
+        bootstrap_exception["exists"] and not bootstrap_exception["accepted"]
+    )
     decision = decide_route(root, task)
     required_review_stages: list[str] = []
     if decision.reviewer:
@@ -2527,8 +2733,17 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         if review_states[stage]["current"] and review_states[stage]["verdict"] != "ship"
     ]
     stale_review_reasons = {stage: review_states[stage]["reasons"] for stage in stale_reviews}
-    ok = not out_of_scope and not missing_verification and not missing_reviews and not stale_reviews and not failed_reviews
-    if out_of_scope:
+    ok = (
+        not bootstrap_exception_invalid
+        and not out_of_scope
+        and not missing_verification
+        and not missing_reviews
+        and not stale_reviews
+        and not failed_reviews
+    )
+    if bootstrap_exception_invalid:
+        next_action = BOOTSTRAP_EXCEPTION_INVALID
+    elif out_of_scope:
         next_action = "Split or revert out-of-scope files before continuing."
     elif missing_verification:
         next_action = "Run `sera verify` or record the missing verification evidence."
@@ -2592,6 +2807,7 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         "changed_files": changed,
         "out_of_scope": out_of_scope,
         "missing_verification": missing_verification,
+        "bootstrap_exception": bootstrap_exception,
         "fingerprint": fingerprint,
         "head_identity": head_identity,
         "review_ledger_fingerprint": review_fingerprint,
