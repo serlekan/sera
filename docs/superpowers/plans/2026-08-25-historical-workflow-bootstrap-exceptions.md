@@ -591,3 +591,116 @@ git status --short --branch
 
 Expected: a clean feature branch with exact commit and tree values ready for a
 new independent review.
+
+### Task 6: Enforce bootstrap authorization at release boundaries
+
+**Files:**
+- Modify: `tests/test_bootstrap_exception.py`
+- Modify: `src/sera/core.py`
+- Modify: `docs/superpowers/specs/2026-08-25-historical-workflow-bootstrap-exceptions-design.md`
+- Modify: `docs/superpowers/plans/2026-08-25-historical-workflow-bootstrap-exceptions.md`
+
+**Interfaces:**
+- Consumes: `bootstrap_exception_state(root, task_dir, task, state_fingerprint)` and the existing `check_task()` result used by `create_seal()`.
+- Produces: `check_task()["bootstrap_exception"]`; fail-closed `ok == False` and `next_action == "bootstrap_exception_invalid"` for a present unaccepted exception; sealing refusal before any `seal.json` write.
+
+- [ ] **Step 1: Add release-boundary regressions before production changes**
+
+  Extend the existing real-Git bootstrap fixture. Import `check_task`,
+  `create_seal`, and `SeraError`. Add a helper that records both required ship
+  reviews against the current fingerprint, without manually writing review or
+  seal files:
+
+  ```python
+  def record_required_reviews(self, task_dir: Path) -> None:
+      accept_review(self.root, task_dir, "ship", "independent-peer", "correct", "independent")
+      accept_review(self.root, task_dir, "ship", "release-gate", "ready", "gate")
+  ```
+
+  Add tests that assert these observable boundaries:
+
+  ```python
+  def test_unregistered_exception_blocks_check_and_seal(self) -> None:
+      task_dir = self.historical_task(register=False)
+      self.write_exception(task_dir)
+      self.record_required_reviews(task_dir)
+
+      result = check_task(self.root, task_dir)
+
+      self.assertFalse(result["ok"])
+      self.assertEqual(result["next_action"], "bootstrap_exception_invalid")
+      self.assertFalse(result["bootstrap_exception"]["accepted"])
+      with self.assertRaisesRegex(SeraError, "bootstrap_exception_invalid"):
+          create_seal(self.root, task_dir)
+      self.assertFalse((task_dir / "seal.json").exists())
+  ```
+
+  Add a CLI `check --require-seal --json` assertion with exit code `2`; a
+  registered historical task that remains blocked until independent and gate
+  reviews exist, then seals and passes require-seal; a post-seal registry or
+  exception corruption case that returns `ok == False`; a no-exception native
+  task showing existing check/seal behavior; and a HEAD-move case showing the
+  existing exact-identity review/seal failures remain authoritative.
+
+- [ ] **Step 2: Verify RED**
+
+  Run:
+
+  ```text
+  PYTHONPATH=src pytest tests/test_bootstrap_exception.py -v
+  ```
+
+  Expected: the new unregistered and post-seal corruption tests fail because
+  `check_task()` currently omits bootstrap state and `create_seal()` currently
+  trusts reviews without evaluating exception authorization.
+
+- [ ] **Step 3: Implement the minimal shared enforcement**
+
+  In `check_task()`, after computing the current task fingerprint, call the
+  existing authoritative validator once:
+
+  ```python
+  bootstrap_exception = bootstrap_exception_state(
+      root,
+      task_dir,
+      task,
+      state_fingerprint=fingerprint,
+  )
+  bootstrap_exception_invalid = (
+      bootstrap_exception["exists"] and not bootstrap_exception["accepted"]
+  )
+  ```
+
+  Include `not bootstrap_exception_invalid` in `ok`, give it fail-closed
+  precedence in `next_action`, and return the state as `bootstrap_exception`.
+  In `create_seal()`, inspect that returned state first and raise
+  `SeraError("Task cannot be sealed: bootstrap_exception_invalid")` for a
+  present unaccepted exception before writing the seal. Do not duplicate any
+  validator logic.
+
+- [ ] **Step 4: Verify GREEN and adjacent assurance behavior**
+
+  Run:
+
+  ```text
+  PYTHONPATH=src pytest tests/test_bootstrap_exception.py -v
+  PYTHONPATH=src pytest tests/test_seal.py tests/test_review_identity.py tests/test_end_to_end.py -q
+  ```
+
+  Expected: all new boundary cases and existing seal/identity tests pass.
+
+- [ ] **Step 5: Run complete verification and commit**
+
+  Run:
+
+  ```text
+  PYTHONPATH=src pytest -q
+  python -m ruff check .
+  git diff --check
+  ```
+
+  Commit only the owned source, tests, specification, and plan. Do not add
+  `.sera/tasks` artifacts or rewrite the existing rejected review. Capture the
+  new HEAD/tree, regenerate the verification task packet only according to
+  normal freshness rules, and obtain a new independent exact-head review
+  before any gate or seal attempt.

@@ -207,3 +207,24 @@ unchanged.
 
 The mechanism preserves the fact that history is missing; it never claims the
 missing stage occurred.
+
+## Release-Boundary Invariant
+
+Bootstrap authorization is an assurance invariant, not only a controller
+routing decision. `check_task()` evaluates `bootstrap_exception_state()` for
+the current task fingerprint and exposes that complete state in its result.
+When an exception file exists but is not accepted, `ok` is false and
+`next_action` is `bootstrap_exception_invalid`, even if verification, reviews,
+and an older seal would otherwise be current.
+
+`create_seal()` consumes the same `check_task()` result and explicitly refuses
+an existing, unaccepted exception before writing `seal.json`. It does not
+reimplement schema, registry, identity, builder-artifact, review-packet, or
+coverage validation. This keeps `sera next`, `sera check`, `sera seal`, and
+`sera check --require-seal` on one authoritative authorization decision.
+
+An accepted registered historical exception continues through the existing
+independent-review, gate, exact-HEAD, and seal requirements. With no exception,
+normal behavior is unchanged. Corrupting or deauthorizing an exception after
+sealing makes the current check fail closed; an existing seal cannot mask the
+invalid authorization state.
