@@ -2664,6 +2664,9 @@ def evaluate_seal(
 
 def create_seal(root: Path, task_dir: Path) -> dict[str, Any]:
     result = check_task(root, task_dir)
+    bootstrap_exception = result["bootstrap_exception"]
+    if bootstrap_exception["exists"] and not bootstrap_exception["accepted"]:
+        raise SeraError(f"Task cannot be sealed: {BOOTSTRAP_EXCEPTION_INVALID}")
     if not result["ok"]:
         raise SeraError(f"Task cannot be sealed: {result['next_action']}")
     task = load_task(task_dir)
@@ -2697,6 +2700,15 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
     }
     missing_verification = [command for command in task["verification"] if command not in successful]
     fingerprint = task_fingerprint(root, task_dir)
+    bootstrap_exception = bootstrap_exception_state(
+        root,
+        task_dir,
+        task,
+        state_fingerprint=fingerprint,
+    )
+    bootstrap_exception_invalid = (
+        bootstrap_exception["exists"] and not bootstrap_exception["accepted"]
+    )
     decision = decide_route(root, task)
     required_review_stages: list[str] = []
     if decision.reviewer:
@@ -2721,8 +2733,17 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         if review_states[stage]["current"] and review_states[stage]["verdict"] != "ship"
     ]
     stale_review_reasons = {stage: review_states[stage]["reasons"] for stage in stale_reviews}
-    ok = not out_of_scope and not missing_verification and not missing_reviews and not stale_reviews and not failed_reviews
-    if out_of_scope:
+    ok = (
+        not bootstrap_exception_invalid
+        and not out_of_scope
+        and not missing_verification
+        and not missing_reviews
+        and not stale_reviews
+        and not failed_reviews
+    )
+    if bootstrap_exception_invalid:
+        next_action = BOOTSTRAP_EXCEPTION_INVALID
+    elif out_of_scope:
         next_action = "Split or revert out-of-scope files before continuing."
     elif missing_verification:
         next_action = "Run `sera verify` or record the missing verification evidence."
@@ -2786,6 +2807,7 @@ def check_task(root: Path, task_dir: Path) -> dict[str, Any]:
         "changed_files": changed,
         "out_of_scope": out_of_scope,
         "missing_verification": missing_verification,
+        "bootstrap_exception": bootstrap_exception,
         "fingerprint": fingerprint,
         "head_identity": head_identity,
         "review_ledger_fingerprint": review_fingerprint,

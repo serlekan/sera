@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,8 +15,13 @@ from sera.controller import build_packet, next_action
 from sera.core import (
     PACKET_STALE_CONTRACT,
     PACKET_UNBOUND,
+    REVIEW_HEAD_MISMATCH,
+    SEAL_HEAD_MISMATCH,
+    SeraError,
     accept_review,
     build_repo_map,
+    check_task,
+    create_seal,
     git_head_identity,
     initialize,
     load_task,
@@ -111,6 +118,48 @@ class BootstrapExceptionRepository(unittest.TestCase):
         )
         build_packet(self.root, task_dir, "build")
         return task_dir
+
+    def reviewed_native_task(self) -> Path:
+        task_dir = self.native_builder_task()
+        self.answer += 1
+        (self.root / "src" / "app.py").write_text(f"ANSWER = {self.answer}\n", encoding="utf-8")
+        git(self.root, "add", "src/app.py")
+        git(self.root, "commit", "-m", "native implementation")
+        build_packet(self.root, task_dir, "review")
+        self.record_required_reviews(task_dir)
+        return task_dir
+
+    def record_required_reviews(self, task_dir: Path) -> None:
+        accept_review(
+            self.root,
+            task_dir,
+            "ship",
+            "independent-peer",
+            "correct",
+            "independent",
+        )
+        accept_review(
+            self.root,
+            task_dir,
+            "ship",
+            "release-gate",
+            "ready",
+            "gate",
+        )
+
+    def run_cli(self, task_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        source_root = str(Path(core.__file__).resolve().parents[1])
+        env["PYTHONPATH"] = os.pathsep.join(
+            value for value in (source_root, env.get("PYTHONPATH", "")) if value
+        )
+        return subprocess.run(
+            [sys.executable, "-m", "sera", *args, task_dir.name],
+            cwd=self.root,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
 
     def register_historical_task(self, task_dir: Path, **overrides: object) -> None:
         task = load_task(task_dir)
@@ -595,6 +644,135 @@ class BootstrapExceptionControllerTests(BootstrapExceptionRepository):
         self.assertEqual(unbound_report["next_action"], "bootstrap_exception_invalid")
         self.assertEqual(unbound_report["build_packet"]["reason"], PACKET_UNBOUND)
         self.assertEqual(unbound_report["bootstrap_exception"]["reason"], "bootstrap_exception_invalid")
+
+
+class BootstrapExceptionReleaseBoundaryTests(BootstrapExceptionRepository):
+    def test_unregistered_exception_blocks_check_and_seal(self) -> None:
+        task_dir = self.historical_task(register=False)
+        self.record_required_reviews(task_dir)
+        self.write_exception(task_dir)
+
+        routed = next_action(self.root, task_dir)
+        result = check_task(self.root, task_dir)
+
+        self.assertEqual(routed["next_action"], "bootstrap_exception_invalid")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["next_action"], "bootstrap_exception_invalid")
+        self.assertFalse(result["bootstrap_exception"]["accepted"])
+        self.assertIn(
+            "historical_eligibility_missing",
+            result["bootstrap_exception"]["validation_errors"],
+        )
+        with self.assertRaisesRegex(SeraError, "bootstrap_exception_invalid"):
+            create_seal(self.root, task_dir)
+        self.assertFalse((task_dir / "seal.json").exists())
+
+    def test_require_seal_cli_reports_invalid_unregistered_exception(self) -> None:
+        task_dir = self.historical_task(register=False)
+        self.record_required_reviews(task_dir)
+        self.write_exception(task_dir)
+
+        completed = self.run_cli(task_dir, "check", "--require-seal", "--json")
+        payload = json.loads(completed.stdout)
+
+        self.assertEqual(completed.returncode, 2, msg=completed.stderr + completed.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["next_action"], "bootstrap_exception_invalid")
+        self.assertFalse(payload["bootstrap_exception"]["accepted"])
+
+    def test_registered_exception_preserves_review_gate_and_seal_requirements(self) -> None:
+        task_dir = self.historical_task()
+        self.write_exception(task_dir)
+
+        before_review = check_task(self.root, task_dir)
+        self.assertFalse(before_review["ok"])
+        self.assertTrue(before_review["bootstrap_exception"]["accepted"])
+        self.assertEqual(before_review["missing_reviews"], ["independent", "gate"])
+
+        accept_review(
+            self.root,
+            task_dir,
+            "ship",
+            "independent-peer",
+            "correct",
+            "independent",
+        )
+        before_gate = check_task(self.root, task_dir)
+        self.assertFalse(before_gate["ok"])
+        self.assertEqual(before_gate["missing_reviews"], ["gate"])
+
+        accept_review(
+            self.root,
+            task_dir,
+            "ship",
+            "release-gate",
+            "ready",
+            "gate",
+        )
+        ready = check_task(self.root, task_dir)
+        self.assertTrue(ready["ok"])
+        seal = create_seal(self.root, task_dir)
+        self.assertEqual(seal["task_id"], task_dir.name)
+
+        completed = self.run_cli(task_dir, "check", "--require-seal", "--json")
+        payload = json.loads(completed.stdout)
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr + completed.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["bootstrap_exception"]["accepted"])
+        self.assertEqual(payload["seal_status"], "current")
+
+    def test_corrupted_exception_after_seal_fails_closed_without_rewriting_seal(self) -> None:
+        task_dir = self.historical_task()
+        self.write_exception(task_dir)
+        self.record_required_reviews(task_dir)
+        create_seal(self.root, task_dir)
+        seal_path = task_dir / "seal.json"
+        sealed = seal_path.read_bytes()
+
+        self.write_registry([])
+
+        result = check_task(self.root, task_dir)
+        completed = self.run_cli(task_dir, "check", "--require-seal", "--json")
+        payload = json.loads(completed.stdout)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["next_action"], "bootstrap_exception_invalid")
+        self.assertFalse(result["bootstrap_exception"]["accepted"])
+        self.assertEqual(completed.returncode, 2, msg=completed.stderr + completed.stdout)
+        self.assertFalse(payload["ok"])
+        with self.assertRaisesRegex(SeraError, "bootstrap_exception_invalid"):
+            create_seal(self.root, task_dir)
+        self.assertEqual(seal_path.read_bytes(), sealed)
+
+    def test_no_exception_preserves_native_check_and_seal_behavior(self) -> None:
+        task_dir = self.reviewed_native_task()
+
+        ready = check_task(self.root, task_dir)
+        seal = create_seal(self.root, task_dir)
+        accepted = check_task(self.root, task_dir)
+
+        self.assertTrue(ready["ok"])
+        self.assertFalse(ready["bootstrap_exception"]["exists"])
+        self.assertEqual(seal["task_id"], task_dir.name)
+        self.assertTrue(accepted["ok"])
+        self.assertEqual(accepted["seal_status"], "current")
+
+    def test_head_move_invalidates_exception_reviews_and_seal(self) -> None:
+        task_dir = self.historical_task()
+        self.write_exception(task_dir)
+        self.record_required_reviews(task_dir)
+        create_seal(self.root, task_dir)
+
+        git(self.root, "commit", "--allow-empty", "-m", "move exact head")
+        result = check_task(self.root, task_dir)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["bootstrap_exception"]["accepted"])
+        self.assertIn("review_packet_not_current", result["bootstrap_exception"]["validation_errors"])
+        self.assertIn("independent", result["stale_reviews"])
+        self.assertIn(REVIEW_HEAD_MISMATCH, result["stale_review_reasons"]["independent"])
+        self.assertTrue(result["seal_stale"])
+        self.assertIn(SEAL_HEAD_MISMATCH, result["seal_stale_reasons"])
 
 
 if __name__ == "__main__":
