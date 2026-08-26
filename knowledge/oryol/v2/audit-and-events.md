@@ -1,7 +1,7 @@
 # Oryol Audit, Outbox & Event Ingestion Architecture v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: Expired Lease Recovery, Aggregate Ordering, Atomic Inbox Semantics, Legal Holds & Phase 1 Permanent Retention
+**P0 Remediation**: Append-Only Privacy Overlays, Non-Blocking Legal Holds, Expired Lease Recovery & Atomic Security Mutations
 
 ---
 
@@ -9,7 +9,7 @@
 
 | Subsystem | Primary Purpose | Storage | Cascade on Org Delete | Mutability |
 |---|---|---|---|---|
-| **Compliance Audit Log** (`audit_events`) | Forensics, legal compliance, "Who did what and when?" | Cloudflare D1 + R2 cold archive | **NEVER** (Preserved under permanent Phase 1 retention) | **Strictly Append-Only (No Physical Purge in Phase 1)** |
+| **Compliance Audit Log** (`audit_events`) | Forensics, legal compliance, "Who did what and when?" | Cloudflare D1 + R2 cold archive | **NEVER** (Preserved under permanent Phase 1 retention) | **Strictly Append-Only (No Physical Purge / No In-Place Updates)** |
 | **Transactional Outbox** (`outbox_events`) | Reliable asynchronous integration & domain state broadcasts | Cloudflare D1 (Temporary buffer) | **NEVER cascade pending tombstones** (drained to completion) | Mutated by Dispatcher (Lease/Status) |
 | **Observability & Metrics** | System health, query latency, error rates, token usage | Cloudflare Analytics / Tail Workers | Transient TTL | Aggregated metrics |
 
@@ -125,33 +125,45 @@ CREATE TABLE inbox_events (
 
 ---
 
-## 6. Phase 1 Permanent Audit Retention & Legal Holds
+## 6. Phase 1 Permanent Audit Retention, Privacy Overlays & Legal Holds
 
-### 6.1 Phase 1 Permanent Retention Policy
+### 6.1 Phase 1 Permanent Retention & Zero In-Place Updates
 > [!IMPORTANT]
-> **No Physical Audit Purge in Phase 1**:  
-> In Phase 1, `audit_events` are **permanently append-only**. There is **no normal physical audit purge** in Phase 1.  
-> Organization deletion, account termination, and user erasure requests **never** physically delete audit records. User privacy requests pseudonymize permitted PII fields (`Deleted User <prn_id>`) or append redaction markers while preserving historical audit log integrity.
+> **Zero In-Place Updates / No Physical Purge in Phase 1**:  
+> In Phase 1, `audit_events` are **permanently immutable**. The database engine strictly prohibits both `UPDATE` and `DELETE` on `audit_events`.  
+> When a user exercises GDPR/privacy erasure rights, the audit table is **never updated in place**. Instead, an append-only privacy overlay record is inserted into `audit_redactions`. Read and export queries dynamically apply the overlay to mask PII without altering the stored raw audit event bytes.
 
 ```sql
--- 1. Legal Holds Contract
+-- 1. Append-Only Privacy Redaction Overlay
+CREATE TABLE audit_redactions (
+    id TEXT PRIMARY KEY,                       -- red_<ulid>
+    organization_id TEXT NOT NULL,
+    subject_principal_id TEXT NOT NULL,
+    replacement_label TEXT NOT NULL,           -- e.g. 'Deleted User prn_01H8Z7...'
+    reason TEXT NOT NULL,                      -- e.g. 'GDPR Right to Erasure'
+    effective_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_by_principal_id TEXT NOT NULL,
+    legal_hold_checked_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Legal Holds Contract (Survives Membership and Organization Deletion)
 CREATE TABLE audit_legal_holds (
     id TEXT PRIMARY KEY,                       -- hld_<ulid>
-    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+    organization_id TEXT NOT NULL,             -- org_<ulid> (Preserved permanently)
     scope_type TEXT NOT NULL CHECK(scope_type IN ('organization', 'principal', 'mailbox', 'deal')),
     scope_id TEXT,                             -- NULL for entire org, or specific entity ID
     reason TEXT NOT NULL,
     legal_authority TEXT NOT NULL,             -- Subpoena / court order / regulator ref
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'released')),
     placed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    placed_by_membership_id TEXT NOT NULL,
+    placed_by_principal_id TEXT NOT NULL,
+    placed_by_actor_metadata TEXT NOT NULL,    -- JSON snapshot of placer membership/role/name
     released_at DATETIME,
-    released_by_membership_id TEXT,
-    FOREIGN KEY (organization_id, placed_by_membership_id) REFERENCES memberships(organization_id, id),
-    FOREIGN KEY (organization_id, released_by_membership_id) REFERENCES memberships(organization_id, id)
+    released_by_principal_id TEXT,
+    released_by_actor_metadata TEXT            -- JSON snapshot of releaser membership/role/name
 );
 
--- 2. Compliance Audit Events (Append-Only)
+-- 3. Compliance Audit Events (Permanently Immutable)
 CREATE TABLE audit_events (
     id TEXT PRIMARY KEY,                       -- aud_<ulid>
     organization_id TEXT NOT NULL,             -- org_<ulid> (NEVER cascade-deleted)
@@ -171,7 +183,7 @@ CREATE TABLE audit_events (
 
 ### 6.2 Legal Hold Governance & Required Permissions
 Legal holds govern:
-- Whether pseudonymization/redaction is permitted on audit records.
+- Whether privacy redaction overlays are permitted to mask records.
 - Mandatory retention guarantees during legal discovery.
 - Cold-archive preservation and eDiscovery export restrictions.
 

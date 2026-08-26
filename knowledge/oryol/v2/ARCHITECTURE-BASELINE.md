@@ -1,11 +1,11 @@
 # Oryol Workspace Architecture Baseline v2.2
 
 **Version**: 2.2  
-**Status**: CANDIDATE FOR FINAL FOUR-ITEM DELTA REVIEW  
+**Status**: CANDIDATE FOR FINAL THREE-ITEM DELTA REVIEW  
 **Date**: 2026-08-26  
 **Ecosystem**: Oryol Workspace Platform (`serlekan/serlekan-sera`, `serlekan/oryol-mail`, `serlekan/oryol-core`)  
 **SERA Governance Version**: `0.4.2`  
-**Previous Specification Commit**: `7939b9737a0e2ea7bffac0de29f5b4529a17e4c4`  
+**Previous Specification Commit**: `cb27ed6bce596b256688203f5fa517ecd4dbcf50`  
 **Architecture Specification Commit**: `pending_delta_commit`  
 
 ---

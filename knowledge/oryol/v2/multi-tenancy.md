@@ -55,8 +55,18 @@ CREATE TABLE team_memberships (
     UNIQUE(team_id, membership_id)
 );
 
--- 5. Role Definitions: Organization-Scoped Custom Roles & Immutable System Role Templates
--- System roles (e.g. 'owner', 'admin', 'member') are immutable templates instantiated or bound per-tenant.
+-- 5. Canonical Active Organization Permission Registry Binding
+CREATE TABLE organization_permission_registries (
+    organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+    registry_version INTEGER NOT NULL,
+    activated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    activated_by_membership_id TEXT NOT NULL,
+    previous_registry_version INTEGER,
+    FOREIGN KEY (registry_version) REFERENCES permission_registry_versions(version) ON DELETE RESTRICT,
+    FOREIGN KEY (organization_id, activated_by_membership_id) REFERENCES memberships(organization_id, id)
+);
+
+-- 6. Role Definitions: Organization-Scoped Custom Roles & Immutable System Role Templates
 CREATE TABLE role_definitions (
     id TEXT PRIMARY KEY,                       -- rol_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -68,7 +78,7 @@ CREATE TABLE role_definitions (
     UNIQUE(organization_id, name)
 );
 
--- 6. Role Permissions Mapping: Bound to Organization Role & Immutable Registry Version
+-- 7. Role Permissions Mapping: Bound to Organization Role & Immutable Registry Version
 CREATE TABLE role_permissions (
     organization_id TEXT NOT NULL,
     role_id TEXT NOT NULL,
@@ -80,7 +90,7 @@ CREATE TABLE role_permissions (
     FOREIGN KEY (registry_version, permission_name) REFERENCES permission_definitions(registry_version, name) ON DELETE RESTRICT
 );
 
--- 7. Membership Role Assignments: Structurally Bound to Organization & Organization-Scoped Role
+-- 8. Membership Role Assignments: Structurally Bound to Organization & Organization-Scoped Role
 CREATE TABLE membership_role_assignments (
     id TEXT PRIMARY KEY,                       -- mra_<ulid>
     organization_id TEXT NOT NULL,
@@ -92,7 +102,7 @@ CREATE TABLE membership_role_assignments (
     UNIQUE(organization_id, membership_id, role_id)
 );
 
--- 8. Invitations: Structurally Bound to Organization & Organization-Scoped Role
+-- 9. Invitations: Structurally Bound to Organization & Organization-Scoped Role
 CREATE TABLE invitations (
     id TEXT PRIMARY KEY,                       -- inv_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -107,7 +117,39 @@ CREATE TABLE invitations (
     FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE
 );
 
--- 8. Canonical Generic Resource Reference Registry
+-- 10. Organization Service Principals: Explicit Tenant-Bound Service Accounts
+CREATE TABLE organization_service_principals (
+    id TEXT PRIMARY KEY,                       -- osp_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, principal_id),
+    UNIQUE(organization_id, id)
+);
+
+-- 11. Canonical Structurally-Typed Authorization Subjects for Explicit Deny
+CREATE TABLE authorization_subjects (
+    id TEXT PRIMARY KEY,                       -- asb_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('membership', 'team', 'service_principal')),
+    membership_id TEXT,
+    team_id TEXT,
+    organization_service_principal_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, team_id) REFERENCES teams(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
+    UNIQUE(organization_id, id),
+    CHECK (
+        (subject_type = 'membership' AND membership_id IS NOT NULL AND team_id IS NULL AND organization_service_principal_id IS NULL) OR
+        (subject_type = 'team' AND team_id IS NOT NULL AND membership_id IS NULL AND organization_service_principal_id IS NULL) OR
+        (subject_type = 'service_principal' AND organization_service_principal_id IS NOT NULL AND membership_id IS NULL AND team_id IS NULL)
+    )
+);
+
+-- 12. Canonical Generic Resource Reference Registry
 -- Owning applications (OryolMail, CRM, Drive, Virel) own business data; Core projects authorization references.
 CREATE TABLE resource_registry (
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
@@ -122,7 +164,7 @@ CREATE TABLE resource_registry (
     FOREIGN KEY (organization_id, owner_membership_id) REFERENCES memberships(organization_id, id)
 );
 
--- 9. Resource ACL Grants: Structurally Bound to Organization and Authoritative Resource Reference
+-- 13. Resource ACL Grants: Structurally Bound to Organization and Authoritative Resource Reference
 CREATE TABLE resource_grants (
     id TEXT PRIMARY KEY,                       -- rgr_<ulid>
     organization_id TEXT NOT NULL,
@@ -136,7 +178,7 @@ CREATE TABLE resource_grants (
     UNIQUE(organization_id, subject_membership_id, resource_type, resource_id, permission)
 );
 
--- 10. Application Installations: Organization-Scoped Entitlements
+-- 14. Application Installations: Organization-Scoped Entitlements
 CREATE TABLE application_installations (
     id TEXT PRIMARY KEY,                       -- appi_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
@@ -146,7 +188,7 @@ CREATE TABLE application_installations (
     UNIQUE(organization_id, application_id)
 );
 
--- 11. Delegated Authority: Both Grantor and Delegate Must Belong to Organization
+-- 15. Delegated Authority: Both Grantor and Delegate Must Belong to Organization
 CREATE TABLE delegated_authority (
     id TEXT PRIMARY KEY,                       -- del_<ulid>
     organization_id TEXT NOT NULL,
@@ -201,7 +243,7 @@ CREATE TABLE cross_org_grants (
 | Entity Scope | Conceptual Tables | Access & Governance Rules |
 |---|---|---|
 | **Platform-Scoped** | `principals`, `users`, `credentials`, `identity_provider_bindings`, `recovery_methods`, `organizations`, `organization_placement`, `permission_registry_versions` | Owned solely by Oryol Identity Core. Cannot be queried by product applications directly. |
-| **Organization-Scoped** | `memberships`, `teams`, `team_memberships`, `role_definitions`, `membership_role_assignments`, `resource_registry`, `resource_grants`, `explicit_denies`, `application_installations`, `delegated_authority`, `cross_org_grants` | Strictly isolated per tenant. All queries include `WHERE organization_id = ?`. |
+| **Organization-Scoped** | `memberships`, `teams`, `team_memberships`, `organization_permission_registries`, `role_definitions`, `role_permissions`, `membership_role_assignments`, `organization_service_principals`, `authorization_subjects`, `resource_registry`, `resource_grants`, `explicit_denies`, `application_installations`, `delegated_authority`, `cross_org_grants`, `audit_redactions` | Strictly isolated per tenant. All queries include `WHERE organization_id = ?`. |
 | **Product Domain Scoped** | Mailboxes (`oryol-mail`), Contacts (`oryol-crm`), Assets (`oryol-drive`), Wallets (`virel`) | Owned by product D1 database, partitioned by `organization_id`. |
 
 ---

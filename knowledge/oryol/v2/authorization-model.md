@@ -1,7 +1,7 @@
 # Oryol Authorization Policy Algebra v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: Published Permission Registry Binding, Structurally Typed Authorization Subjects & Clean Request Model
+**P0 Remediation**: Active Permission Registry Binding, Exact Organization Deny Subjects & Clean Request Model
 
 ---
 
@@ -11,7 +11,7 @@ All authorization decisions in Oryol Workspace are executed through the standard
 
 > [!IMPORTANT]
 > **Server-Resolved Privilege Invariant**:  
-> The `membership` object in `AuthorizationRequest` contains **only structural identifiers and status**. Roles and permissions are resolved **strictly server-side** from `membership_role_assignments`, `role_permissions`, and the active immutable permission registry version. Client-supplied role claims are never accepted or processed.
+> The `membership` object in `AuthorizationRequest` contains **only structural identifiers and status**. Roles and permissions are resolved **strictly server-side** from `membership_role_assignments`, `role_permissions`, and the single active immutable permission registry version bound to the organization. Client-supplied role claims are never accepted or processed.
 
 ```typescript
 export interface AuthorizationRequest {
@@ -73,7 +73,18 @@ CREATE TABLE permission_definitions (
     PRIMARY KEY(registry_version, name)
 );
 
--- 3. Role Definitions: Organization-Scoped with System Templates
+-- 3. Canonical Active Organization Permission Registry Binding
+CREATE TABLE organization_permission_registries (
+    organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+    registry_version INTEGER NOT NULL,
+    activated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    activated_by_membership_id TEXT NOT NULL,
+    previous_registry_version INTEGER,
+    FOREIGN KEY (registry_version) REFERENCES permission_registry_versions(version) ON DELETE RESTRICT,
+    FOREIGN KEY (organization_id, activated_by_membership_id) REFERENCES memberships(organization_id, id)
+);
+
+-- 4. Role Definitions: Organization-Scoped with System Templates
 CREATE TABLE role_definitions (
     id TEXT PRIMARY KEY,                       -- rol_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -85,7 +96,7 @@ CREATE TABLE role_definitions (
     UNIQUE(organization_id, name)
 );
 
--- 4. Role Permissions Mapping: Structurally Bound to Organization Role and Immutable Registry Version
+-- 5. Role Permissions Mapping: Structurally Bound to Organization Role and Immutable Registry Version
 CREATE TABLE role_permissions (
     organization_id TEXT NOT NULL,
     role_id TEXT NOT NULL,
@@ -97,26 +108,39 @@ CREATE TABLE role_permissions (
     FOREIGN KEY (registry_version, permission_name) REFERENCES permission_definitions(registry_version, name) ON DELETE RESTRICT
 );
 
--- 5. Canonical Structurally-Typed Authorization Subjects for Explicit Deny
+-- 6. Organization Service Principals: Explicit Tenant-Bound Service Accounts
+CREATE TABLE organization_service_principals (
+    id TEXT PRIMARY KEY,                       -- osp_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, principal_id),
+    UNIQUE(organization_id, id)
+);
+
+-- 7. Canonical Structurally-Typed Authorization Subjects for Explicit Deny
 CREATE TABLE authorization_subjects (
     id TEXT PRIMARY KEY,                       -- asb_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    subject_type TEXT NOT NULL CHECK(subject_type IN ('membership', 'team', 'principal')),
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('membership', 'team', 'service_principal')),
     membership_id TEXT,
     team_id TEXT,
-    principal_id TEXT REFERENCES principals(id),
+    organization_service_principal_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, team_id) REFERENCES teams(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
     UNIQUE(organization_id, id),
     CHECK (
-        (subject_type = 'membership' AND membership_id IS NOT NULL AND team_id IS NULL AND principal_id IS NULL) OR
-        (subject_type = 'team' AND team_id IS NOT NULL AND membership_id IS NULL AND principal_id IS NULL) OR
-        (subject_type = 'principal' AND principal_id IS NOT NULL AND membership_id IS NULL AND team_id IS NULL)
+        (subject_type = 'membership' AND membership_id IS NOT NULL AND team_id IS NULL AND organization_service_principal_id IS NULL) OR
+        (subject_type = 'team' AND team_id IS NOT NULL AND membership_id IS NULL AND organization_service_principal_id IS NULL) OR
+        (subject_type = 'service_principal' AND organization_service_principal_id IS NOT NULL AND membership_id IS NULL AND team_id IS NULL)
     )
 );
 
--- 6. Explicit Deny Rules (Precedence over All Grants; Structurally Bound to Organization)
+-- 8. Explicit Deny Rules (Precedence over All Grants; Structurally Bound to Organization)
 CREATE TABLE explicit_denies (
     id TEXT PRIMARY KEY,                       -- dny_<ulid>
     organization_id TEXT NOT NULL,
@@ -129,7 +153,7 @@ CREATE TABLE explicit_denies (
     FOREIGN KEY (organization_id, resource_type, resource_id) REFERENCES resource_registry(organization_id, resource_type, resource_id) ON DELETE CASCADE
 );
 
--- 7. Monotonic Authorization Version Tracking
+-- 9. Monotonic Authorization Version Tracking
 CREATE TABLE authorization_versions (
     organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
     version INTEGER NOT NULL DEFAULT 1,        -- Monotonically incremented on membership/role changes
@@ -137,17 +161,28 @@ CREATE TABLE authorization_versions (
 );
 ```
 
-### Active Registry & Migration Semantics
-- **Single Active Registry per Decision**: In Phase 1, each organization's authorization policy resolves against **exactly one active published registry version** compatible with the deployed Core software.
-- **Immutable Vocabulary**: Published `permission_registry_versions` rows are immutable. When new vocabulary is introduced:
-  1. Core publishes a new `permission_registry_versions` record and child `permission_definitions`.
-  2. Organization authorization bindings migrate to the new registry version.
-  3. `authorization_versions` is incremented to invalidate stale cached permissions.
-- **Principal Deny Organization Relevance**: A global principal can only be bound as a `principal`-type authorization subject in an organization if they have an authoritative relationship to that tenant (such as an existing membership or explicit tenant service binding).
+---
+
+## 3. Active Registry Invariant & Migration Semantics
+
+### 3.1 Single Active Registry per Authorization Decision
+- Every organization authorization evaluation resolves against **exactly one active published registry version** via `organization_permission_registries`.
+- `role_permissions` are evaluated **strictly where `role_permissions.registry_version == organization_permission_registries.registry_version`**.
+- Roles **cannot contribute permissions from mixed registry versions** to a single authorization decision.
+
+### 3.2 Registry Migration Flow
+1. Core publishes a new immutable `permission_registry_versions` row and child `permission_definitions`.
+2. Core validates organization compatibility.
+3. Transaction atomically switches `organization_permission_registries.registry_version` and increments `authorization_versions`.
+4. Stale edge access tokens are rejected at high-risk endpoints or refresh cycles according to policy.
+
+### 3.3 Exact Phase 1 Deny Subject Scoping
+- **Human Principals**: Organization-level explicit deny is modeled **exclusively through `membership` subjects**. Direct global-principal deny subjects for humans are prohibited.
+- **Service Principals**: Explicitly bound via `organization_service_principals`. No unconstrained global principal can ever be inserted as a tenant deny subject.
 
 ---
 
-## 3. Service-to-Application Entitlement Mapping
+## 4. Service-to-Application Entitlement Mapping
 
 When evaluating Step 3 (`Validate Application Entitlement`), the `action.service` is mapped deterministically to application installations:
 
@@ -162,7 +197,7 @@ When evaluating Step 3 (`Validate Application Entitlement`), the `action.service
 
 ---
 
-## 4. Mandatory 8-Step Evaluation Algebra
+## 5. Mandatory 8-Step Evaluation Algebra
 
 Every evaluation executes in strict linear order:
 
@@ -188,10 +223,12 @@ Every evaluation executes in strict linear order:
          └─► If absent or expired ──► DENY(CROSS_TENANT_VIOLATION)
 
 5. Apply Explicit Deny Rules
-   └─► If matching `explicit_denies` rule exists for subject ──► DENY(EXPLICIT_DENY)
+   └─► Query `explicit_denies` matching subject (membership, team, service_principal).
+   └─► If matching deny rule found ──► DENY(EXPLICIT_DENY)
 
 6. Resolve Coarse RBAC Capability
-   └─► Resolve assigned roles for membership from `membership_role_assignments` and `role_permissions`.
+   └─► Query `organization_permission_registries` for active `registry_version`.
+   └─► Resolve assigned roles for membership from `membership_role_assignments` and `role_permissions` WHERE `registry_version == active_registry_version`.
    └─► Note: Brokered cross-org grants require the user to hold the coarse capability (e.g. `drive.documents.read`) in their own organization.
    └─► If permission is NOT present in any active role ──► DENY(RBAC_DENIED)
 
@@ -205,7 +242,7 @@ Every evaluation executes in strict linear order:
 
 ---
 
-## 5. Hierarchy, Inheritance & Context Invariants
+## 6. Hierarchy, Inheritance & Context Invariants
 
 1. **Role Inheritance (Phase 1 Invariant)**:
    Arbitrary recursive role inheritance is **disallowed** in Phase 1. Role-permission mappings are flat and direct.
