@@ -1,4 +1,4 @@
-# SERA Specialization for Oryol Workspace
+# SERA Specialization for Oryol Workspace (Architecture v2.1)
 
 SERA is the official engineering intelligence, task boundary, and review controller across the **Oryol Workspace** ecosystem.
 
@@ -6,71 +6,61 @@ SERA is the official engineering intelligence, task boundary, and review control
 
 ## 1. Overview
 
-SERA provides deep knowledge of Oryol Workspace architecture, multi-tenant organization boundaries, security invariants, and coding standards to all coding agents (Claude Code, OpenAI Codex, Google Antigravity).
+SERA provides deep knowledge of Oryol Workspace architecture, multi-tenant organization boundaries, security invariants, and coding standards to pair engineering agents (Google Antigravity, Claude Code, OpenAI Codex).
 
 ```text
-Oryol Product Repositories (oryol-mail, oryol-crm, oryol-calendar, oryol-drive, virel)
+Oryol Product Repositories (oryol-core, oryol-mail, oryol-crm, oryol-calendar, oryol-drive, virel)
                                 │
                                 ▼
                        SERA Knowledge Layer
-                   (knowledge/oryol/*.md)
+                     (knowledge/oryol/v2/*.md)
                                 │
             ┌───────────────────┴───────────────────┐
             ▼                                       ▼
     Task Contract & Bounds                  PR Review Intelligence
-  - Organization boundaries               - Tenant isolation checks
-  - High-risk term escalation             - Permission verification
-  - Context & ownership budgeting         - Exact-HEAD review sealing
+  - Two-tier platform hierarchy           - Structural tenant isolation
+  - Principal identity taxonomy           - 8-step authorization algebra
+  - Fail-closed policy loading            - D1 session & token families
+  - Context & ownership budgeting         - Transactional outbox & inbox
 ```
 
 ---
 
-## 2. Oryol Knowledge Base Structure
+## 2. Canonical Architecture v2.1 Knowledge Base (`knowledge/oryol/v2/`)
 
 ```
-knowledge/
- └── oryol/
-     ├── workspace.md         # Permanent 7 Architecture Rules & multi-tenant model
-     ├── identity.md          # Centralized auth, user accounts & memberships
-     ├── security.md          # Zero-trust, permission system & audit logs
-     ├── data-model.md        # Entity conventions, ID prefixes & schemas
-     ├── ai-principles.md     # Permission-aware AI & zero-retention rules
-     ├── coding-standards.md  # TypeScript strictness & feature structure
-     ├── frontend.md          # React 19, Tailwind CSS v4, Geist design system
-     ├── backend.md           # Cloudflare Workers, D1, KV, R2 edge topology
-     ├── testing.md           # Typecheck, Vitest, Playwright E2E standards
-     ├── workflow.md          # 8-stage engineering lifecycle from Idea to Merge
-     └── products/
-         ├── oryol-mail.md    # OryolMail domain model, rules & roadmap
-         ├── oryol-crm.md     # Oryol CRM contacts, deals & timeline
-         ├── oryol-calendar.md# Oryol Calendar events, availability & invites
-         ├── oryol-drive.md   # Oryol Drive assets, versions & R2 storage
-         └── virel.md         # Virel AI synthesis & workflow automation
+knowledge/oryol/v2/
+├── ARCHITECTURE-BASELINE.md   # Version 2.1 Candidate Baseline & Gate Declaration
+├── workspace-architecture.md  # Two-tier hierarchy (Platform -> Core -> Apps) & 7 rules
+├── core-boundaries.md         # Platform capabilities vs. Application business domains
+├── multi-tenancy.md           # Structural tenant isolation & organization_placement sharding
+├── identity-model.md          # Principal taxonomy (Human/Service), credentials, IdP bindings
+├── authorization-model.md     # 8-step authorize() algebra & 3-part permission namespace
+├── session-security.md        # D1 authoritative sessions, refresh token families & 10m SLA
+├── audit-and-events.md        # Audit vs. Outbox separation, Transactional Outbox & Inbox
+├── cloudflare-platform.md     # Cloudflare edge primitives (Workers, D1, KV, R2, Queues)
+├── data-lifecycle.md          # Deletion pipeline, D1 Time Travel reality & multi-storage purge
+├── ai-platform.md             # Centralized Oryol AI Gateway & zero-retention enforcement
+├── search-platform.md         # Search contract: derived index & live authorization post-filtering
+├── product-integration.md     # Application integration contracts across Workspace
+└── sera-governance.md         # Standardized repository layout & fail-closed pipeline
 ```
 
 ---
 
-## 3. How to Connect a New Oryol Product Repository
+## 3. Standardized Oryol Repository Layout (`.sera/`)
 
-When onboarding a new repository (e.g. `oryol-crm` or `oryol-calendar`):
+Every codebase repository in the Oryol ecosystem must contain the canonical 5-file `.sera/` directory:
 
-1. **Create `.sera/config.json`** in the repository root:
-   - Configure project `risk_policy` with domain-specific high-risk terms and paths.
-   - Configure `verification` test commands.
-2. **Add `.sera/architecture-rules.md`**:
-   - Link back to the 7 Permanent Oryol Workspace Rules.
-   - Specify product-specific entity definitions.
-3. **Add `.sera/review-rules.md`**:
-   - Define PR review criteria covering tenant isolation, permissions, data scoping, AI safety, and UX.
-4. **Register Product Knowledge**:
-   - Add `knowledge/oryol/products/<product-name>.md` inside SERA with core entities, permissions, and cross-product integration hooks.
+```
+<repository-root>/
+└── .sera/
+    ├── config.json            # Machine-readable SERA config (verification list of strings)
+    ├── context.md             # Repository domain context, tech stack, and conventions
+    ├── architecture.md        # Permanent Oryol Workspace architecture rules & boundaries
+    ├── review-rules.md        # Exact-HEAD review checklist
+    └── verification.md        # Automated verification matrix
+```
 
----
-
-## 4. How Coding Agents Consume Oryol Knowledge
-
-When an agent initiates a task on any Oryol repository:
-1. `sera run "<objective>"` analyzes repository changes and consults the Oryol risk policy.
-2. SERA generates `packet-build.md` embedding the relevant Oryol architecture constraints, token budgets, and ownership bounds.
-3. The coding agent operates strictly within the bounded file ownership.
-4. SERA prepares `packet-review.md` for independent review, verifying tenant isolation and permission checks before issuing an exact-head seal.
+### Deterministic Fail-Closed Policy Loading
+SERA deterministically loads `.sera/architecture.md` and `.sera/context.md` into `packet-build.md`, and `.sera/review-rules.md` and `.sera/architecture.md` into `packet-review.md`. If any required policy document is missing or empty, SERA fails closed (`SeraError`).

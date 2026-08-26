@@ -1,29 +1,29 @@
-# SERA Governance & Policy Verification for Oryol Workspace v2
+# SERA Governance & Fail-Closed Policy Enforcement v2.1
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2)  
-**Scope**: Repository Structure, Automatic Policy Loading & PR Verification Pipeline
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
+**P0 Remediation**: Fail-Closed Policy Loading, Standardized Layout & Packet Injection
 
 ---
 
 ## 1. Standardized Repository Governance Layout
 
-Every codebase repository in the Oryol ecosystem (`oryol-core`, `oryol-mail`, `oryol-crm`, `oryol-calendar`, `oryol-drive`, `virel`) must contain a standardized `.sera/` governance directory:
+Every codebase repository in the Oryol ecosystem (`oryol-core`, `oryol-mail`, `oryol-crm`, `oryol-calendar`, `oryol-drive`, `virel`) must contain the standardized `.sera/` governance directory with the exact 5 canonical files:
 
 ```
 <repository-root>/
 └── .sera/
-    ├── config.json            # Machine-readable SERA config: risk terms, paths, budgets, verification suite
+    ├── config.json            # Machine-readable SERA config (modes, budgets, risk policy, verification list)
     ├── context.md             # Repository domain context, technology stack, and engineering conventions
     ├── architecture.md        # Permanent Oryol Workspace architecture rules & component boundaries
     ├── review-rules.md        # Exact-HEAD review checklist (Security, Tenant Isolation, Permissions, Testing)
-    └── verification.md        # Automated verification matrix (Typecheck, Lint, Unit, E2E commands)
+    └── verification.md        # Automated verification matrix and validation commands
 ```
 
 ---
 
-## 2. SERA Governance & Pipeline Loading Flow
+## 2. Deterministic Fail-Closed Policy Loading Pipeline
 
-SERA automatically parses, validates, and incorporates repository policies across every task lifecycle stage:
+Because `.sera/**` runtime data is excluded from ordinary repository file mapping to prevent context bloat, SERA implements **explicit deterministic policy loading**:
 
 ```text
        ┌────────────────────────────────────────────────────────┐
@@ -32,38 +32,35 @@ SERA automatically parses, validates, and incorporates repository policies acros
                                    │
                                    ▼
        ┌────────────────────────────────────────────────────────┐
-       │                 1. Policy Loading Stage                │
-       │   - Parse `.sera/config.json`                          │
-       │   - Ingest `architecture.md` & `review-rules.md`       │
-       │   - Match high-risk paths and terms                    │
+       │             1. Strict Config Validation                │
+       │   - `verification` MUST be a list of strings           │
+       │   - `risk_policy` MUST declare terms and paths         │
+       │   - Malformed config ──► FAILS CLOSED (SeraError)      │
        └───────────────────────────┬────────────────────────────┘
                                    │
                                    ▼
        ┌────────────────────────────────────────────────────────┐
-       │              2. Context Generation Stage               │
-       │   - Sized stage context within token budget            │
-       │   - Bounded file ownership (`allowed_files`)           │
-       │   - Generate `packet-build.md`                         │
+       │             2. Mandatory Policy File Check             │
+       │   - Verifies existence of `architecture.md`,           │
+       │     `review-rules.md`, `context.md`, `verification.md` │
+       │   - Missing or empty file ──► FAILS CLOSED (SeraError) │
        └───────────────────────────┬────────────────────────────┘
                                    │
                                    ▼
        ┌────────────────────────────────────────────────────────┐
-       │                 3. Review Packet Stage                 │
-       │   - Bind exact git `HEAD` commit and tree hash         │
-       │   - Evaluate changes against 6 review criteria         │
-       │   - Require 100% verification pass before `sera seal`  │
+       │             3. Deterministic Packet Injection          │
+       │   - `packet-build.md`: Embeds Architecture + Context   │
+       │   - `packet-review.md`: Embeds Review Rules + Arch     │
        └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Mandatory Review Gate Dimensions
+## 3. Mandatory Review Gate Checklist
 
-Every PR and commit is evaluated against the **6 Canonical Review Dimensions**:
-
-1. **Architecture Alignment**: Respects the two-tier platform hierarchy; does not recreate private auth or detached databases.
-2. **Multi-Tenant Security**: Enforces `organization_id` scoping in every query and storage key; no cross-tenant leakage.
-3. **Identity & Authorization**: Uses standard `authorize({ ... })` checks and standard entity prefixes (`prn_`, `usr_`, `org_`, `mem_`, `dom_`, etc.).
-4. **Session & Security Safety**: Relies on D1 for authoritative session state; KV is used only for caching/rate limits.
-5. **AI Platform Safety**: All AI operations route through the Oryol AI Gateway with permission filtering and zero third-party retention.
-6. **Testing & Verification**: 100% pass on Typecheck (`strict: true`), ESLint, Unit Tests, and E2E smoke tests.
+1. **Architecture Alignment**: Respects two-tier platform hierarchy; no private auth or isolated tenant silos.
+2. **Structural Multi-Tenancy**: Enforces `organization_id` in compound keys and parameterized queries.
+3. **Identity & Authorization**: Adheres to the Principal model and 8-step `authorize()` algebra.
+4. **Authoritative Session Security**: Uses D1 for session state; KV restricted to caching and rate limits.
+5. **Audit & Outbox**: Implements transactional outbox on domain mutations and preserves non-cascading audit logs.
+6. **Testing Verification**: 100% pass on Typecheck (`strict: true`), ESLint, Unit Tests, and E2E smoke tests.

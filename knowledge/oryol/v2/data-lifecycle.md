@@ -1,32 +1,50 @@
-# Oryol Data Lifecycle & Governance v2
+# Oryol Data Lifecycle & Deletion Architecture v2.1
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2)  
-**Supersedes**: `knowledge/oryol/data-model.md` (v1 Data Lifecycle section)
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
+**P0 Remediation**: Honest Deletion Mechanics, D1 Time Travel Reality & Multi-Storage Propagation
 
 ---
 
-## 1. Entity Lifecycle States
+## 1. Canonical Deletion Pipeline
 
-All primary business records in Oryol Workspace progress through standardized lifecycle states:
+Architecture v2.1 eliminates inaccurate claims of instant cryptographic erasure, replacing them with a realistic, multi-phase deletion pipeline:
 
 ```text
-[Created] ──► active ──► soft_deleted ──► archived ──► purged (Hard Deleted)
+[Created] ──► active ──► soft_deleted (Logical Deletion) ──► retention_grace ──► purge_eligible ──► physical_purge (D1/R2)
 ```
 
-| Lifecycle Phase | State | Query Behavior | Recovery Window |
+| Lifecycle State | DB Representation | Query Filtering | SLA / Retention |
 |---|---|---|---|
-| **Active** | `active` | Included in standard application queries (`deleted_at IS NULL`). | N/A |
-| **Soft Deleted** | `soft_deleted` | Excluded from standard views; accessible via Trash/Undo. | 30 Days |
-| **Archived** | `archived` | Read-only compliance state; excluded from active search indexes. | Organization Defined |
-| **Purged** | Cryptographically Erased | Permanently wiped from D1 tables, KV keys, and R2 buckets. | Irreversible |
+| `active` | Normal row | Included by default | Indefinite |
+| `soft_deleted` | `deleted_at = CURRENT_TIMESTAMP` | Excluded from standard views | 30-day grace window |
+| `archived` | `archived_at = CURRENT_TIMESTAMP` | Cold storage read-only | Compliance retention |
+| `purged` | Row deleted (`DELETE FROM ...`) | Irreversible | D1 Time Travel 7-30d |
 
 ---
 
-## 2. Retention & GDPR / Right-to-be-Forgotten Compliance
+## 2. Multi-Storage Propagation Reality
 
-1. **Organization Data Retention Policy**:
-   - Organizations configure retention periods for emails, audit logs, and CRM records (`settings.retention_days`).
-   - Automated nightly scheduled Workers identify and soft-delete expired records.
-2. **User Data Erasure (GDPR)**:
-   - When a human user exercises right-to-be-forgotten, the `users` row is stripped of PII (name replaced with `Deleted User`, email anonymized to `deleted_<hash>@oryol.internal`).
-   - Audit logs retain immutable actor principal IDs (`prn_...`) for security traceability without exposing PII.
+| Storage Subsystem | Deletion Method | Propagation SLA | Backup / Time Travel Reality |
+|---|---|---|---|
+| **Primary D1 Relational** | Physical row `DELETE`. | Immediate upon purge execution. | **D1 Time Travel**: Point-in-time recovery remains active in Cloudflare infrastructure for 7 to 30 days until natural log rotation. |
+| **Cloudflare R2 Objects** | Hard object deletion via R2 API (`DELETE /objects/...`). | Synchronous or asynchronous batch purge (< 24 hours). | R2 versioning lifecycle rules purge non-current versions. |
+| **Search Projections** | Tombstone event (`*.deleted`) consumed by search worker. | Near real-time (< 5 minutes). | Index inverted lists remove document references. |
+| **Outbox & Queues** | Outbox rows cleared post-publish; queues process messages. | Natural queue consumption / TTL drain. | Messages in-flight expire within standard queue retention. |
+| **Audit Logs** | Pseudonymization / Legal Hold. | **Preserved**. PII masked (`Deleted User`), security audit records retained for compliance. | Never cascade-deleted with organization purge. |
+| **Third-Party AI Providers** | Zero Data Retention. | Zero persistence. | Enterprise API contracts enforce 0-day retention on Google/Anthropic/OpenAI edge endpoints. |
+
+---
+
+## 3. Organization Lifecycle & Purge Governance
+
+```text
+active ──► suspended ──► archived ──► deletion_pending (30-day grace) ──► physical_purge
+```
+
+1. **`deletion_pending`**:
+   - Organization status is set to `deletion_pending`.
+   - All active user sessions are terminated; inbound email MX relays return SMTP 550 reject.
+2. **Physical Purge Execution**:
+   - Automated cleanup worker deletes domain records, mailboxes, threads, messages, and memberships from D1.
+   - Deletes all R2 objects under prefix `/org_{org_id}/`.
+   - Emits final audit tombstone `core.organization.purged`.

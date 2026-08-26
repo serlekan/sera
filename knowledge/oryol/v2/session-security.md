@@ -1,83 +1,125 @@
-# Oryol Session Security v2 — Authoritative Session Architecture
+# Oryol Session Security & Token State Machine v2.1
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2)  
-**Correction**: Cloudflare KV is NOT an authoritative security store; D1 is authoritative.
-
----
-
-## 1. The Session Security Invariant
-
-> [!CAUTION]
-> **Architectural Correction**:  
-> Cloudflare KV is an **eventually consistent** edge cache. It must **never** be used as the authoritative source of truth for immediate session revocation, token reuse detection, or security locks.  
-> **D1 (Relational Edge DB)** is the single **authoritative store** for session lifecycle, token families, and device history.
-
-| Storage Layer | Allowed Usage | FORBIDDEN Usage |
-|---|---|---|
-| **Cloudflare D1 (Relational)** | Authoritative session records, refresh token hashes, token family rotation trees, device tracking history, audit links. | High-frequency read caching on every single API hit. |
-| **Cloudflare KV (Key-Value)** | Short-lived cached JWT public keys, fast rate-limiting buckets, temporary OTP verification nonces (TTL < 5m). | Authoritative security state, primary refresh token storage, final revocation decisions. |
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
+**P0 Remediation**: Token Family State Machine, Honest Revocation SLA & Cryptographic JWKS Claims
 
 ---
 
-## 2. Dual-Token Rotation Architecture
+## 1. Three-Tier Session & Token Hierarchy
 
-```text
-                                 ┌─────────────────────────────┐
-                                 │       Client Device         │
-                                 └──────────────┬──────────────┘
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-  ┌─────────────────────────────┐                               ┌─────────────────────────────┐
-  │     Scoped Access Token     │                               │        Refresh Token        │
-  │     (15-Minute Short JWT)   │                               │     (Rotating Token Family) │
-  └──────────────┬──────────────┘                               └──────────────┬──────────────┘
-                 │                                                             │
-                 ▼                                                             ▼
-  ┌─────────────────────────────┐                               ┌─────────────────────────────┐
-  │     Edge JWT Validation     │                               │      D1 Session Refresh     │
-  │ (Validated locally in <1ms  │                               │ (Atomic token rotation &    │
-  │  via Ed25519 public key)    │                               │  reuse detection in D1 DB)  │
-  └─────────────────────────────┘                               └─────────────────────────────┘
+Architecture v2.1 clearly distinguishes between Account Sessions, Organization Access Tokens, and Refresh Token Families:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       1. Account Session (ses_...)                          │
+│     Represents authenticated human principal device login in D1 DB          │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                 ┌─────────────────────┴─────────────────────┐
+                 ▼                                           ▼
+┌─────────────────────────────────┐         ┌─────────────────────────────────┐
+│ 2. Refresh Token Family         │         │ 3. Organization Access Token    │
+│    (fam_... with Generations)   │         │    (Short-lived 10m JWT at Edge)│
+│ Atomic rotation in D1 database  │         │ Cryptographically self-contained│
+└─────────────────────────────────┘         └─────────────────────────────────┘
 ```
 
-### 2.1 Token Rotation & Reuse Detection
-1. **Token Family**: Each login creates a `session_family_id`. Every refresh generates a new refresh token and invalidates the previous one in the same D1 transaction.
-2. **Automatic Breach Defense**: If an already-invalidated refresh token is presented again (indicating token theft), the entire session family is instantly revoked across all devices, triggering an urgent security audit event (`sec.token_reuse_detected`).
-
 ---
 
-## 3. Authoritative Session Schema (D1)
+## 2. Refresh Token Family State Machine
+
+Refresh tokens use strict **Generation Chains** with atomic rotation in Cloudflare D1:
 
 ```sql
-CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,                       -- ses_<ulid>
-    session_family_id TEXT NOT NULL,           -- fam_<ulid>
-    principal_id TEXT NOT NULL,                -- prn_<ulid>
-    active_organization_id TEXT NOT NULL,      -- org_<ulid>
-    refresh_token_hash TEXT NOT NULL,          -- SHA-256 hash of active token
-    device_fingerprint TEXT NOT NULL,
-    ip_address TEXT NOT NULL,
-    user_agent TEXT NOT NULL,
-    is_revoked INTEGER NOT NULL DEFAULT 0,
+CREATE TABLE refresh_tokens (
+    id TEXT PRIMARY KEY,                       -- rtok_<ulid>
+    family_id TEXT NOT NULL,                   -- fam_<ulid>
+    session_id TEXT NOT NULL,                  -- ses_<ulid>
+    generation INTEGER NOT NULL,               -- 1, 2, 3...
+    token_hash TEXT NOT NULL,                  -- SHA-256 hash of plaintext secret
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'consumed', 'revoked')),
+    issued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    consumed_at DATETIME,
+    successor_generation INTEGER,
     revoked_at DATETIME,
     revocation_reason TEXT,
-    last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE,
-    FOREIGN KEY (active_organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    UNIQUE(family_id, generation)
 );
 
-CREATE INDEX idx_sessions_family ON sessions(session_family_id, is_revoked);
-CREATE INDEX idx_sessions_principal ON sessions(principal_id, active_organization_id);
+CREATE INDEX idx_refresh_token_lookup ON refresh_tokens(family_id, token_hash);
+```
+
+### 2.1 Atomic Rotation & Automatic Breach Defense
+1. **Normal Refresh (Atomic)**:
+   - Within a single D1 transaction: active token is marked `consumed` (`consumed_at = CURRENT_TIMESTAMP`, `successor_generation = N + 1`), and new generation `N + 1` token is inserted.
+2. **Reuse Detection (Token Theft Defense)**:
+   - If an already-`consumed` refresh token is presented again:
+     1. The entire `family_id` is immediately marked `revoked`.
+     2. The associated `session_id` is terminated.
+     3. An urgent security audit event (`sec.token_family_breach_detected`) is emitted.
+     4. All active sessions on the device are invalidated, forcing complete re-authentication.
+
+---
+
+## 3. Honest Revocation SLA & Dual-Verification Model
+
+Because stateless edge JWTs cannot be immediately revoked globally without introducing a centralized database read on every edge hit, Oryol enforces an **explicit two-tier revocation SLA**:
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Standard API Endpoints                           │
+│  (e.g. List Mail Messages, View Deal, Search Calendar)                      │
+│                                                                             │
+│  - Verifies Ed25519 JWT locally at Edge in <1ms without DB lookup.          │
+│  - Maximum Revocation Window: 10 Minutes (Token natural TTL expiration).   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         High-Risk Sensitive Endpoints                       │
+│  (e.g. Delete Mailbox, Verify Domain, Export Data, Transfer Ownership)      │
+│                                                                             │
+│  - Synchronously queries authoritative D1 `sessions` & `memberships` table. │
+│  - Revocation SLA: Immediate (0ms delay). Checks active session & version.  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. Immediate Revocation Workflow
+## 4. Canonical Organization Access JWT Claims
 
-1. User clicks **"Logout All Devices"** or Admin revokes Membership:
-   - D1 transaction updates `sessions SET is_revoked = 1, revoked_at = CURRENT_TIMESTAMP WHERE principal_id = ?`.
-2. Active 15-minute Access Tokens expire naturally within 15 minutes; subsequent refresh attempts hit D1 and fail immediately.
-3. High-security actions (e.g. password change, domain deletion) require an explicit D1 session verification check rather than relying solely on access token claims.
+Access tokens are signed using asymmetric `EdDSA` (Ed25519) and contain standard RFC7519 claims:
+
+```json
+{
+  "iss": "https://auth.oryol.com",
+  "aud": "https://api.oryol.com",
+  "sub": "prn_01H8Z7A2B3C4D5E6F7G8H9J0K1",
+  "kid": "k_2026_q3_ed25519_01",
+  "token_type": "org_access",
+  "session_id": "ses_01H8Z7B5C6D7E8F9G0H1J2K3L4",
+  "organization_id": "org_01H8Z7C8D9E0F1G2H3J4K5L6M7",
+  "membership_id": "mem_01H8Z7D1E2F3G4H5J6K7L8M9N0",
+  "authorization_version": 2,
+  "perms": ["mail.messages.read", "mail.messages.send", "domain.manage"],
+  "exp": 1756150200,
+  "iat": 1756149600,
+  "nbf": 1756149600,
+  "jti": "jwt_01H8Z7E4F5G6H7J8K9L0M1N2P3"
+}
+```
+
+---
+
+## 5. Cookie, CSRF & Signing Key Management
+
+1. **HttpOnly Cookie Strategy**:
+   - Refresh tokens are stored in `__Host-Oryol-Refresh` cookies (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/v1/auth`).
+2. **CSRF Defense**:
+   - API mutations require `X-Oryol-Request: true` header; cookie-authenticated endpoints validate cryptographic double-submit anti-CSRF tokens.
+3. **Key Rotation & JWKS**:
+   - Asymmetric Ed25519 signing keys are rotated every 90 days.
+   - Public keys are exposed via standard JWKS endpoint: `GET /.well-known/jwks.json`. Edge workers cache JWKS in Cloudflare KV with a 1-hour TTL.
+4. **Step-Up Authentication Contract**:
+   - Destructive endpoints (e.g. delete organization, purge mailbox) require step-up re-authentication within `< 5 minutes` (`POST /v1/auth/step-up`).
