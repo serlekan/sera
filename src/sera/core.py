@@ -640,12 +640,31 @@ def git_head_identity(root: Path) -> dict[str, str]:
 
 
 
+ORYOL_REGISTERED_REPOSITORIES = {
+    "oryol-mail",
+    "oryol-core",
+    "oryol-crm",
+    "oryol-calendar",
+    "oryol-drive",
+    "virel",
+    "oryolmail",
+    "oryolcore",
+    "oryolcrm",
+    "oryolcalendar",
+    "oryoldrive",
+}
+
 ORYOL_REQUIRED_POLICY_FILES = (
+    "config.json",
+    "context.md",
     "architecture.md",
     "review-rules.md",
-    "context.md",
     "verification.md",
 )
+
+SERA_GOVERNANCE_VERSION = "0.4.2"
+ORYOL_ARCHITECTURE_BASELINE_VERSION = "2.2"
+ORYOL_GOVERNANCE_PINNED_SHA = "55547cc65d788c79e55fd8d2ec0964e3e4c1f5de"
 
 
 def state_path(root: Path) -> Path:
@@ -657,42 +676,99 @@ def config_path(root: Path) -> Path:
 
 
 def is_oryol_repository(root: Path) -> bool:
-    """True if the repository is an Oryol Workspace project requiring canonical policy enforcement."""
-    sera_dir = state_path(root)
-    if not sera_dir.exists():
-        return False
-    if (sera_dir / "architecture.md").exists() or (sera_dir / "review-rules.md").exists() or (sera_dir / "verification.md").exists():
+    """Deterministically detect if a repository belongs to the Oryol Workspace ecosystem.
+
+    Uses multiple independent signals outside of `.sera/` so that deleting `.sera/`
+    or `config.json` never causes SERA to fail open:
+    1. Repository directory name matching registered Oryol product names.
+    2. `package.json` name matching Oryol packages or `@oryol/*` scope.
+    3. `wrangler.toml` project name matching Oryol workers.
+    4. Presence of `.oryol-project` or `.oryol` marker file.
+    5. Git remote origin URL matching `serlekan/oryol-*` or `virel`.
+    6. Presence of Oryol policy files or risk policy terms in `.sera/`.
+    """
+    # 1. Directory basename check
+    repo_name = root.resolve().name.lower()
+    if repo_name in ORYOL_REGISTERED_REPOSITORIES or repo_name.startswith("oryol-") or repo_name.startswith("oryol"):
         return True
-    cfg_file = config_path(root)
-    if cfg_file.exists():
+
+    # 2. package.json project name check
+    pkg_file = root / "package.json"
+    if pkg_file.is_file():
         try:
-            with cfg_file.open("r", encoding="utf-8") as handle:
-                cfg = json.load(handle)
-            terms = cfg.get("risk_policy", {}).get("high_risk_terms", [])
-            if any("oryol" in str(term).lower() for term in terms):
+            pkg = json.loads(pkg_file.read_text(encoding="utf-8"))
+            name = str(pkg.get("name", "")).lower()
+            if name in ORYOL_REGISTERED_REPOSITORIES or name.startswith("oryol-") or name.startswith("@oryol/"):
                 return True
         except Exception:
             pass
+
+    # 3. wrangler.toml worker name check
+    wrangler_file = root / "wrangler.toml"
+    if wrangler_file.is_file():
+        try:
+            content = wrangler_file.read_text(encoding="utf-8").lower()
+            if any(f'name = "{repo}"' in content or f"name = '{repo}'" in content for repo in ORYOL_REGISTERED_REPOSITORIES):
+                return True
+            if 'name = "oryol-' in content or "name = 'oryol-" in content:
+                return True
+        except Exception:
+            pass
+
+    # 4. Marker files
+    if (root / ".oryol-project").exists() or (root / ".oryol").exists():
+        return True
+
+    # 5. Git remote origin check
+    git_config = root / ".git" / "config"
+    if git_config.is_file():
+        try:
+            content = git_config.read_text(encoding="utf-8").lower()
+            if any(f"oryol-{p}" in content for p in ("mail", "core", "crm", "calendar", "drive")) or "virel" in content:
+                return True
+        except Exception:
+            pass
+
+    # 6. Fallback: check .sera/ contents if present
+    sera_dir = state_path(root)
+    if sera_dir.exists():
+        if (sera_dir / "architecture.md").exists() or (sera_dir / "review-rules.md").exists():
+            return True
+        cfg_file = config_path(root)
+        if cfg_file.exists():
+            try:
+                cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+                terms = cfg.get("risk_policy", {}).get("high_risk_terms", [])
+                if any("oryol" in str(term).lower() for term in terms):
+                    return True
+            except Exception:
+                pass
+
     return False
 
 
 def load_repository_policies(root: Path, stage: str | None = None) -> dict[str, str]:
     """Deterministically load repository policy documents from .sera/.
 
-    In Oryol repositories, all required canonical policy files must exist and be non-empty.
+    For Oryol repositories, all 5 canonical files (.sera/config.json, context.md,
+    architecture.md, review-rules.md, verification.md) MUST exist and be non-empty.
     Missing or unreadable policy files fail closed with a SeraError.
     """
     sera_dir = state_path(root)
     policies: dict[str, str] = {}
-    if not sera_dir.exists():
-        return policies
 
     if is_oryol_repository(root):
-        for filename in ORYOL_REQUIRED_POLICY_FILES:
+        if not sera_dir.is_dir():
+            raise SeraError(
+                "Oryol governance violation: '.sera/' directory is missing. "
+                "All Oryol repositories must provide .sera/ with config.json, "
+                "context.md, architecture.md, review-rules.md, and verification.md."
+            )
+        for filename in ("context.md", "architecture.md", "review-rules.md", "verification.md"):
             policy_file = sera_dir / filename
             if not policy_file.is_file():
                 raise SeraError(
-                    f"Required Oryol policy file '.sera/{filename}' is missing. "
+                    f"Oryol governance violation: required policy file '.sera/{filename}' is missing. "
                     "All Oryol repositories must provide architecture.md, review-rules.md, "
                     "context.md, and verification.md."
                 )
@@ -702,12 +778,14 @@ def load_repository_policies(root: Path, stage: str | None = None) -> dict[str, 
                 raise SeraError(f"Failed to read Oryol policy file '.sera/{filename}': {e}")
             if not content:
                 raise SeraError(
-                    f"Oryol policy file '.sera/{filename}' is empty. "
+                    f"Oryol governance violation: policy file '.sera/{filename}' is empty. "
                     "Policy documents must contain non-empty rules."
                 )
             key = filename.replace(".md", "").replace("-", "_")
             policies[key] = content
     else:
+        if not sera_dir.exists():
+            return policies
         for filename in ("POLICY.md", "architecture.md", "review-rules.md", "context.md", "verification.md"):
             policy_file = sera_dir / filename
             if policy_file.is_file():
@@ -720,14 +798,27 @@ def load_repository_policies(root: Path, stage: str | None = None) -> dict[str, 
 
 def load_config(root: Path) -> dict[str, Any]:
     path = config_path(root)
+    is_oryol = is_oryol_repository(root)
+
     if not path.exists():
+        if is_oryol:
+            raise SeraError(
+                "Oryol governance violation: '.sera/config.json' is missing. "
+                "Registered Oryol repositories must define explicit configuration "
+                "and cannot silently fall back to unconfigured defaults."
+            )
         return json.loads(json.dumps(DEFAULT_CONFIG))
-    with path.open("r", encoding="utf-8") as handle:
-        loaded = json.load(handle)
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (json.JSONDecodeError, OSError) as e:
+        raise SeraError(f"Malformed configuration file in '.sera/config.json': {e}")
+
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     _deep_update(merged, loaded)
     validate_config(merged)
-    if is_oryol_repository(root):
+    if is_oryol:
         load_repository_policies(root)
     return merged
 
@@ -2197,6 +2288,12 @@ def generate_packet(
         f"- Stage token budget: {decision.budget_tokens:,}",
         f"- Optional Fable eligible: {'yes' if decision.fable_eligible else 'no'}",
     ]
+    if is_oryol_repository(root):
+        route_lines.extend([
+            f"- SERA governance version: `{SERA_GOVERNANCE_VERSION}`",
+            f"- Architecture baseline version: `{ORYOL_ARCHITECTURE_BASELINE_VERSION}`",
+            f"- Pinned baseline commit: `{ORYOL_GOVERNANCE_PINNED_SHA}`",
+        ])
     context_lines: list[str] = []
     if selected_context:
         chosen = selected_context.get("selected_files", [])
