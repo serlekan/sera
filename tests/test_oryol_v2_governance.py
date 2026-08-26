@@ -140,6 +140,8 @@ class TestOryolV2CorpusIntegrity(unittest.TestCase):
         self.assertIn("team_memberships", mt_doc)
         self.assertIn("role_definitions", mt_doc)
         self.assertIn("UNIQUE(organization_id, id)", mt_doc)
+        self.assertIn("role_permissions", mt_doc)
+        self.assertIn("FOREIGN KEY (registry_version, permission_name) REFERENCES permission_definitions", mt_doc)
         self.assertIn("membership_role_assignments", mt_doc)
         self.assertIn("FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)", mt_doc)
         self.assertIn("invitations", mt_doc)
@@ -148,36 +150,44 @@ class TestOryolV2CorpusIntegrity(unittest.TestCase):
         self.assertIn("resource_grants", mt_doc)
         self.assertIn("FOREIGN KEY (organization_id, resource_type, resource_id) REFERENCES resource_registry", mt_doc)
         self.assertIn("cross_org_grants", mt_doc)
-        self.assertIn("FOREIGN KEY (source_organization_id, resource_type, resource_id) REFERENCES resource_registry", mt_doc)
         self.assertIn("organization_placement", mt_doc)
 
-    def test_authorization_algebra_v2_2_and_entitlements(self):
+    def test_authorization_algebra_v2_2_registry_and_typed_subjects(self):
         auth_doc = (self.knowledge_v2 / "authorization-model.md").read_text(encoding="utf-8")
         self.assertIn("authorize({ principal, membership, organization, action, resource, context })", auth_doc)
         self.assertIn("permission_registry_versions", auth_doc)
         self.assertIn("permission_definitions", auth_doc)
+        self.assertIn("role_permissions", auth_doc)
+        self.assertIn("FOREIGN KEY (registry_version, permission_name) REFERENCES permission_definitions(registry_version, name)", auth_doc)
         self.assertIn("authorization_subjects", auth_doc)
+        self.assertIn("CHECK (", auth_doc)
+        self.assertIn("subject_type = 'membership'", auth_doc)
+        self.assertIn("subject_type = 'team'", auth_doc)
+        self.assertIn("subject_type = 'principal'", auth_doc)
         self.assertIn("explicit_denies", auth_doc)
-        self.assertIn("authorization_versions", auth_doc)
         self.assertIn("Service-to-Application Entitlement Mapping", auth_doc)
         self.assertIn("Always Entitled", auth_doc)
-        self.assertIn("oryol-mail", auth_doc)
+        # Ensure membership in AuthorizationRequest contains clean structural fields without untrusted role/customPermissions
+        self.assertNotIn("role: string;", auth_doc)
+        self.assertNotIn("customPermissions?: string[];", auth_doc)
 
-    def test_session_security_v2_2_cas_and_jwks(self):
+    def test_session_security_v2_2_cas_and_host_cookie(self):
         session_doc = (self.knowledge_v2 / "session-security.md").read_text(encoding="utf-8")
         self.assertIn("account_sessions", session_doc)
         self.assertIn("refresh_token_families", session_doc)
         self.assertIn("refresh_tokens", session_doc)
         self.assertIn("principal_security_versions", session_doc)
-        self.assertIn("Compare-and-Swap (CAS)", session_doc)
-        self.assertIn("UPDATE refresh_tokens", session_doc)
+        self.assertIn("token_hash = :presented_hash", session_doc)
         self.assertIn("affected_rows", session_doc)
+        self.assertIn("Case A: Hash Mismatch or Nonexistent Token", session_doc)
+        self.assertIn("Case B: Token Already Consumed or Revoked", session_doc)
         self.assertIn("Account-Level Replay Defense", session_doc)
-        self.assertIn("step_up_proofs", session_doc)
-        self.assertIn("UNKNOWN_KEY_IDENTIFIER", session_doc)
         self.assertIn("__Host-Oryol-Refresh", session_doc)
+        self.assertIn("Path=/", session_doc)
+        self.assertNotIn("Path=/v1/auth", session_doc)
+        self.assertIn("UNKNOWN_KEY_IDENTIFIER", session_doc)
 
-    def test_audit_and_events_v2_2_lease_recovery_and_legal_holds(self):
+    def test_audit_and_events_v2_2_lease_recovery_legal_holds_and_permanent_retention(self):
         audit_doc = (self.knowledge_v2 / "audit-and-events.md").read_text(encoding="utf-8")
         self.assertIn("outbox_events", audit_doc)
         self.assertIn("idx_outbox_eligibility", audit_doc)
@@ -185,14 +195,18 @@ class TestOryolV2CorpusIntegrity(unittest.TestCase):
         self.assertIn("blocked_on_gap", audit_doc)
         self.assertIn("inbox_events", audit_doc)
         self.assertIn("audit_legal_holds", audit_doc)
+        self.assertIn("core.audit.legal_hold.create", audit_doc)
+        self.assertIn("core.audit.legal_hold.release", audit_doc)
+        self.assertIn("core.audit.legal_hold.read", audit_doc)
         self.assertIn("trg_audit_no_update", audit_doc)
         self.assertIn("trg_audit_no_delete", audit_doc)
+        self.assertIn("No Physical Audit Purge in Phase 1", audit_doc)
         self.assertIn("Atomic Security Mutations", audit_doc)
 
-    def test_data_lifecycle_v2_2_deletion_pipeline(self):
+    def test_data_lifecycle_v2_2_reconciled_with_audit_retention(self):
         lifecycle_doc = (self.knowledge_v2 / "data-lifecycle.md").read_text(encoding="utf-8")
         self.assertIn("D1 Time Travel", lifecycle_doc)
-        self.assertIn("physical_purge", lifecycle_doc)
+        self.assertIn("Permanently Retained (No Physical Purge in Phase 1)", lifecycle_doc)
         self.assertIn("soft_deleted", lifecycle_doc)
 
     def test_virel_domain_ownership_v2_2(self):
