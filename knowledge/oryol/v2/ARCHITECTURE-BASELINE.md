@@ -28,7 +28,7 @@ The following documents constitute the authoritative Architecture v2.1 baseline:
 7. [`audit-and-events.md`](audit-and-events.md) — Separate Audit, Domain Events, and Observability; Transactional Outbox pattern and Idempotent Inbox deduplication.
 8. [`cloudflare-platform.md`](cloudflare-platform.md) — Cloudflare edge storage topology mapping Workers, D1, KV, R2, Queues, and Durable Objects.
 9. [`data-lifecycle.md`](data-lifecycle.md) — Deletion pipeline (`active` ➔ `soft_deleted` ➔ `retention_grace` ➔ `physical_purge`), D1 Time Travel reality, and multi-storage propagation.
-10. [`ai-platform.md`](ai-platform.md) — Centralized Oryol AI Gateway, permission-checked context providers, and zero third-party retention enforcement.
+10. [`ai-platform.md`](ai-platform.md) — Centralized Oryol AI Gateway, permission-checked context providers, and provider-retention policy compliance.
 11. [`search-platform.md`](search-platform.md) — Search contract: derived read model, live authorization post-filtering, and organization isolation.
 12. [`product-integration.md`](product-integration.md) — Integration topology and contracts across OryolMail, CRM, Calendar, Drive, and Virel.
 13. [`sera-governance.md`](sera-governance.md) — Standardized `.sera/` repository layout and fail-closed policy enforcement pipeline.

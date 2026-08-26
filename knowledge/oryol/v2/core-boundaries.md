@@ -29,7 +29,7 @@ Oryol Core provides the single pane of glass for all cross-cutting infrastructur
 ### 1.4 Central Platform Pipelines
 - **Audit Logging**: Immutable, append-only security logs.
 - **Domain Outbox Bus**: Outbox-backed event dispatching for cross-application sync.
-- **AI Gateway**: Model provider routing, PII sanitization, and zero-retention enforcement.
+- **AI Gateway**: Model provider routing, PII sanitization, and provider-retention compliance.
 - **Search Contracts**: Indexing protocols and permission-aware search query contracts.
 - **Application Entitlements**: Managing licensed application modules per organization.
 
@@ -50,7 +50,7 @@ Oryol Core provides the single pane of glass for all cross-cutting infrastructur
 > 1. Application worker receives client request.
 > 2. Application worker retrieves and packages target domain context (e.g. email thread messages) from its own database.
 > 3. Application invokes Core AI Gateway passing the sanitized context payload.
-> 4. Core AI Gateway verifies the caller's permissions, sanitizes secrets, dispatches to the zero-retention LLM, and returns structured JSON.
+> 4. Core AI Gateway verifies the caller's permissions, sanitizes secrets, dispatches to the approved model provider matching the retention policy, and returns structured JSON.
 
 ### 2.3 Search Authorization Contract
 - Search read models perform **live authorization checks or safe post-filtering** against the active `authorize()` engine before results are returned to the client, preventing stale search index ACL leakage.

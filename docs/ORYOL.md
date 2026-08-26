@@ -40,7 +40,7 @@ knowledge/oryol/v2/
 ├── audit-and-events.md        # Audit vs. Outbox separation, Transactional Outbox & Inbox
 ├── cloudflare-platform.md     # Cloudflare edge primitives (Workers, D1, KV, R2, Queues)
 ├── data-lifecycle.md          # Deletion pipeline, D1 Time Travel reality & multi-storage purge
-├── ai-platform.md             # Centralized Oryol AI Gateway & zero-retention enforcement
+├── ai-platform.md             # Centralized Oryol AI Gateway & provider-retention policy compliance
 ├── search-platform.md         # Search contract: derived index & live authorization post-filtering
 ├── product-integration.md     # Application integration contracts across Workspace
 └── sera-governance.md         # Standardized repository layout & fail-closed pipeline

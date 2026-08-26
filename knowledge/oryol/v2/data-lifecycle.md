@@ -31,7 +31,7 @@ Architecture v2.1 eliminates inaccurate claims of instant cryptographic erasure,
 | **Search Projections** | Tombstone event (`*.deleted`) consumed by search worker. | Near real-time (< 5 minutes). | Index inverted lists remove document references. |
 | **Outbox & Queues** | Outbox rows cleared post-publish; queues process messages. | Natural queue consumption / TTL drain. | Messages in-flight expire within standard queue retention. |
 | **Audit Logs** | Pseudonymization / Legal Hold. | **Preserved**. PII masked (`Deleted User`), security audit records retained for compliance. | Never cascade-deleted with organization purge. |
-| **Third-Party AI Providers** | Zero Data Retention. | Zero persistence. | Enterprise API contracts enforce 0-day retention on Google/Anthropic/OpenAI edge endpoints. |
+| **AI Providers** | Provider Retention Policy Compliance. | Governed by approved policy. | Providers handling workspace data must satisfy the approved Oryol retention policy; sensitive workspace data requires verified no-training / zero-retention configurations where contractually available. |
 
 ---
 

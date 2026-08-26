@@ -117,7 +117,8 @@ class TestOryolV2Governance(unittest.TestCase):
         self.assertIn("Refresh Token Family", session_doc)
         self.assertIn("refresh_tokens", session_doc)
         self.assertIn("successor_generation", session_doc)
-        self.assertIn("10 Minutes", session_doc)
+        self.assertIn("10-minute", session_doc.lower())
+        self.assertIn("Protected JOSE Header", session_doc)
 
     def test_audit_and_events_v2_1_defines_outbox_and_inbox(self):
         audit_doc = (self.knowledge_v2 / "audit-and-events.md").read_text(encoding="utf-8")

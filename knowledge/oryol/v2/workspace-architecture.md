@@ -69,7 +69,7 @@ Authorization is evaluated through a unified context-aware interface:
 - **Observability**: Telemetry and metrics measuring "How is the system behaving?".
 
 ### Rule 6: Permission-Aware AI Platform
-Applications must **never** call AI LLM providers directly. All AI requests pass through the Oryol AI Gateway, which enforces pre-flight authorization, tenant context isolation, zero-retention policies, and usage audit logging.
+Applications must **never** call AI LLM providers directly. All AI requests pass through the Oryol AI Gateway, which enforces pre-flight authorization, tenant context isolation, verified provider-retention and training compliance, and usage audit logging.
 
 ### Rule 7: Search as a Derived Index
 Search indexes are derived read models, **never** the source of truth. Search queries inherit organization isolation and enforce document-level permission trimming.

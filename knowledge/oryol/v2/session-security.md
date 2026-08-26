@@ -73,40 +73,57 @@ Because stateless edge JWTs cannot be immediately revoked globally without intro
 │  (e.g. List Mail Messages, View Deal, Search Calendar)                      │
 │                                                                             │
 │  - Verifies Ed25519 JWT locally at Edge in <1ms without DB lookup.          │
-│  - Maximum Revocation Window: 10 Minutes (Token natural TTL expiration).   │
+│  - Standard endpoints accept the documented maximum 10-minute JWT window.   │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         High-Risk Sensitive Endpoints                       │
 │  (e.g. Delete Mailbox, Verify Domain, Export Data, Transfer Ownership)      │
 │                                                                             │
-│  - Synchronously queries authoritative D1 `sessions` & `memberships` table. │
-│  - Revocation SLA: Immediate (0ms delay). Checks active session & version.  │
+│  - High-risk operations perform an authoritative current session,           │
+│    membership, and security-version check in D1 and therefore do not        │
+│    rely on the access-token TTL window for revocation.                      │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. Canonical Organization Access JWT Claims
+## 4. Canonical Organization Access JWT & JOSE Structure
 
-Access tokens are signed using asymmetric `EdDSA` (Ed25519) and contain standard RFC7519 claims:
+Access tokens are signed using asymmetric `EdDSA` (Ed25519) and structured into protected JOSE headers, standard RFC7519 claims, and Oryol private claims:
 
+### 4.1 Protected JOSE Header
+```json
+{
+  "alg": "EdDSA",
+  "typ": "JWT",
+  "kid": "k_2026_q3_ed25519_01"
+}
+```
+
+### 4.2 Standard RFC7519 Payload Claims
+- `iss`: `"https://auth.oryol.com"`
+- `aud`: `"https://api.oryol.com"`
+- `sub`: `"prn_01H8Z7A2B3C4D5E6F7G8H9J0K1"` (Principal ID)
+- `exp`: `1756150200` (10 minutes after issuance)
+- `iat`: `1756149600`
+- `jti`: `"jwt_01H8Z7E4F5G6H7J8K9L0M1N2P3"`
+
+### 4.3 Oryol Private Claims
 ```json
 {
   "iss": "https://auth.oryol.com",
   "aud": "https://api.oryol.com",
   "sub": "prn_01H8Z7A2B3C4D5E6F7G8H9J0K1",
-  "kid": "k_2026_q3_ed25519_01",
+  "exp": 1756150200,
+  "iat": 1756149600,
+  "jti": "jwt_01H8Z7E4F5G6H7J8K9L0M1N2P3",
   "token_type": "org_access",
   "session_id": "ses_01H8Z7B5C6D7E8F9G0H1J2K3L4",
   "organization_id": "org_01H8Z7C8D9E0F1G2H3J4K5L6M7",
   "membership_id": "mem_01H8Z7D1E2F3G4H5J6K7L8M9N0",
   "authorization_version": 2,
-  "perms": ["mail.messages.read", "mail.messages.send", "domain.manage"],
-  "exp": 1756150200,
-  "iat": 1756149600,
-  "nbf": 1756149600,
-  "jti": "jwt_01H8Z7E4F5G6H7J8K9L0M1N2P3"
+  "perms": ["mail.messages.read", "mail.messages.send", "core.domains.manage"]
 }
 ```
 

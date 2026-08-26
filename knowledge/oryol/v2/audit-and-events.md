@@ -66,13 +66,14 @@ CREATE TABLE inbox_events (
     aggregate_version INTEGER NOT NULL,
     processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('completed', 'failed')),
-    UNIQUE(consumer_name, event_id)           -- Guarantees exactly-once execution per consumer
+    UNIQUE(consumer_name, event_id)           -- Provides deduplication for effectively-once application semantics
 );
 ```
 
 ### 3.1 Delivery & Ingestion Guarantees
-- **At-Least-Once Delivery**: Producers retry until acknowledged.
-- **Idempotent Consumers**: `UNIQUE(consumer_name, event_id)` rejects re-delivered duplicate payloads instantly.
+- **At-Least-Once Transport**: Cloudflare Queues and event transport operate strictly on an **at-least-once** delivery model. Transport-level exactly-once delivery is never assumed.
+- **Idempotent Consumers & Deduplication**: Consumers must be designed to be idempotent. The `inbox_events` table provides persistent event deduplication.
+- **Effectively-Once Application Semantics**: When the consumer side effect and the `inbox_events` deduplication marker are committed atomically in the same database transaction, Oryol achieves **effectively-once application semantics**.
 - **Lease Recovery**: If a worker crashes while holding `lease_owner`, `next_attempt_at` and `lease_expires_at` allow new workers to claim and resume delivery.
 - **Dead Letter Queue (DLQ)**: Events exceeding 10 delivery attempts transition to `dead_letter` status for manual inspection.
 - **Tombstones & Deletions**: Deletion events (`*.deleted`) carry full tombstones indicating entity deletion and version.
