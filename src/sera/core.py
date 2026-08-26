@@ -639,12 +639,83 @@ def git_head_identity(root: Path) -> dict[str, str]:
     return {"head_sha": head, "head_tree_sha": tree}
 
 
+
+ORYOL_REQUIRED_POLICY_FILES = (
+    "architecture.md",
+    "review-rules.md",
+    "context.md",
+    "verification.md",
+)
+
+
 def state_path(root: Path) -> Path:
     return root / STATE_DIR
 
 
 def config_path(root: Path) -> Path:
     return state_path(root) / "config.json"
+
+
+def is_oryol_repository(root: Path) -> bool:
+    """True if the repository is an Oryol Workspace project requiring canonical policy enforcement."""
+    sera_dir = state_path(root)
+    if not sera_dir.exists():
+        return False
+    if (sera_dir / "architecture.md").exists() or (sera_dir / "review-rules.md").exists() or (sera_dir / "verification.md").exists():
+        return True
+    cfg_file = config_path(root)
+    if cfg_file.exists():
+        try:
+            with cfg_file.open("r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+            terms = cfg.get("risk_policy", {}).get("high_risk_terms", [])
+            if any("oryol" in str(term).lower() for term in terms):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def load_repository_policies(root: Path, stage: str | None = None) -> dict[str, str]:
+    """Deterministically load repository policy documents from .sera/.
+
+    In Oryol repositories, all required canonical policy files must exist and be non-empty.
+    Missing or unreadable policy files fail closed with a SeraError.
+    """
+    sera_dir = state_path(root)
+    policies: dict[str, str] = {}
+    if not sera_dir.exists():
+        return policies
+
+    if is_oryol_repository(root):
+        for filename in ORYOL_REQUIRED_POLICY_FILES:
+            policy_file = sera_dir / filename
+            if not policy_file.is_file():
+                raise SeraError(
+                    f"Required Oryol policy file '.sera/{filename}' is missing. "
+                    "All Oryol repositories must provide architecture.md, review-rules.md, "
+                    "context.md, and verification.md."
+                )
+            try:
+                content = policy_file.read_text(encoding="utf-8").strip()
+            except OSError as e:
+                raise SeraError(f"Failed to read Oryol policy file '.sera/{filename}': {e}")
+            if not content:
+                raise SeraError(
+                    f"Oryol policy file '.sera/{filename}' is empty. "
+                    "Policy documents must contain non-empty rules."
+                )
+            key = filename.replace(".md", "").replace("-", "_")
+            policies[key] = content
+    else:
+        for filename in ("POLICY.md", "architecture.md", "review-rules.md", "context.md", "verification.md"):
+            policy_file = sera_dir / filename
+            if policy_file.is_file():
+                try:
+                    policies[filename.replace(".md", "").replace("-", "_").lower()] = policy_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+    return policies
 
 
 def load_config(root: Path) -> dict[str, Any]:
@@ -656,7 +727,10 @@ def load_config(root: Path) -> dict[str, Any]:
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     _deep_update(merged, loaded)
     validate_config(merged)
+    if is_oryol_repository(root):
+        load_repository_policies(root)
     return merged
+
 
 
 def _require_mapping(value: Any, label: str) -> dict[str, Any]:
@@ -2176,10 +2250,25 @@ def generate_packet(
         "",
         *([f"- `{item}`" for item in task["verification"]] or ["- Verification is unresolved. Stop before implementation."]),
     ]
+    policies = load_repository_policies(root, stage)
     if stage == "review":
         assert coverage is not None  # set above for every review packet
         baseline = coverage["baseline_identity"] or {}
         committed = coverage["committed_range"]
+        if policies.get("review_rules"):
+            packet.extend([
+                "",
+                "## Repository review policy",
+                "",
+                policies["review_rules"],
+            ])
+        if policies.get("architecture"):
+            packet.extend([
+                "",
+                "## Repository architecture policy",
+                "",
+                policies["architecture"],
+            ])
         packet.extend([
             "",
             "## Repository review identity",
@@ -2218,6 +2307,20 @@ def generate_packet(
             "Return exactly one: `ship`, `fix-first`, or `rethink`. Do not edit files.",
         ])
     else:
+        if policies.get("architecture"):
+            packet.extend([
+                "",
+                "## Repository architecture policy",
+                "",
+                policies["architecture"],
+            ])
+        if policies.get("context"):
+            packet.extend([
+                "",
+                "## Repository context",
+                "",
+                policies["context"],
+            ])
         packet.extend([
             "",
             "## Builder return",
