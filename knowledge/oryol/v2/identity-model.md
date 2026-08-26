@@ -1,216 +1,138 @@
-# Oryol Identity Model v2.1 — Canonical Principal & Identity Architecture
+# Oryol Identity Architecture v2.2 — Canonical Principal Model
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
-**P0 Remediation**: Identity Model Consistency & Principal Taxonomy Fix
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
+**P0 Remediation**: Strict Binary Principal Taxonomy, IdP Uniqueness, Factor Separation & Last-Owner Protection
 
 ---
 
 ## 1. Canonical Principal Taxonomy
 
-In Oryol Architecture v2.1, global principal types are strictly partitioned into two fundamental variants: **Human Principal** and **Service Principal**.
+In Oryol Workspace, the identity layer enforces a strict top-level abstraction:
 
 ```text
-                                 ┌─────────────────────────────┐
-                                 │          Principal          │
-                                 │   (prn_01H8Z7A2B3C4D5...)   │
-                                 └──────────────┬──────────────┘
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-  ┌─────────────────────────────┐                               ┌─────────────────────────────┐
-  │       Human Principal       │                               │      Service Principal      │
-  │     type: "human"           │                               │     type: "service"         │
-  └──────────────┬──────────────┘                               └──────────────┬──────────────┘
-                 │                                                             │
-   ┌─────────────┼─────────────┐                                 ┌─────────────┼─────────────┐
-   ▼             ▼             ▼                                 ▼             ▼             ▼
-┌───────┐ ┌─────────────┐ ┌─────────┐                         ┌─────────┐ ┌─────────┐ ┌───────────┐
-│ User  │ │   Auth      │ │  IdP    │                         │ Service │ │  API    │ │Automation │
-│Profile│ │  Factors    │ │Bindings │                         │ Account │ │ Client  │ │  Agent    │
-└───────┘ └─────────────┘ └─────────┘                         └─────────┘ └─────────┘ └───────────┘
+Principal (prn_<ulid>)
+├── Human Principal (`type = 'human'`)  ──► Backed by `users` record
+└── Service Principal (`type = 'service'`) ──► Backed by `service_accounts` record
 ```
 
 > [!IMPORTANT]
-> **Strict Principal Typing Rule**:  
-> Roles and affiliations such as `enterprise_user`, `employee`, `contractor`, `guest`, and `external collaborator` are **NEVER** global principal types.  
-> They are strictly **Organization Membership attributes, scopes, and Identity Provider Bindings**.
+> **Strict Taxonomy Rule**:  
+> Concepts such as `enterprise_user`, `employee`, `contractor`, `guest`, and `external collaborator` are **NOT** global principal types.  
+> They are strictly modeled as **Organization Membership attributes** (`memberships.member_type`) and **Identity Provider Bindings** (`identity_provider_bindings`).
 
 ---
 
-## 2. Core Identity Entities & Schemas
+## 2. Relational Schema for Identity Core (D1 Relational)
 
-### 2.1 Principals Table (`principals`)
 ```sql
+-- 1. Base Principals Table
 CREATE TABLE principals (
     id TEXT PRIMARY KEY,                       -- prn_<ulid>
     type TEXT NOT NULL CHECK(type IN ('human', 'service')),
-    display_name TEXT NOT NULL,
-    avatar_url TEXT,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'deactivated')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-### 2.2 Human Principal Components
-
-#### User Profile (`users`)
-```sql
+-- 2. Human Users (Profile and primary identity)
 CREATE TABLE users (
-    principal_id TEXT PRIMARY KEY,             -- prn_<ulid>
+    id TEXT PRIMARY KEY,                       -- usr_<ulid>
+    principal_id TEXT UNIQUE NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
     primary_email TEXT UNIQUE NOT NULL,
-    email_verified INTEGER NOT NULL DEFAULT 0,
-    phone_number TEXT,
-    timezone TEXT NOT NULL DEFAULT 'UTC',
+    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    display_name TEXT NOT NULL,
     locale TEXT NOT NULL DEFAULT 'en-US',
+    timezone TEXT NOT NULL DEFAULT 'UTC',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-#### Authentication Factors & Credentials (`credentials`)
-```sql
+-- 3. Authentication Factor Credentials
 CREATE TABLE credentials (
-    id TEXT PRIMARY KEY,                       -- cred_<ulid>
-    principal_id TEXT NOT NULL,                -- prn_<ulid>
-    factor_type TEXT NOT NULL CHECK(factor_type IN ('passkey', 'password', 'totp', 'backup_code')),
-    credential_data TEXT NOT NULL,             -- JSON: FIDO2 public key, Argon2id hash, or encrypted secret
-    name TEXT NOT NULL,                        -- e.g. "MacBook Touch ID", "YubiKey 5C"
+    id TEXT PRIMARY KEY,                       -- crd_<ulid>
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    factor_type TEXT NOT NULL CHECK(factor_type IN ('passkey_webauthn', 'password_argon2id', 'totp', 'magic_link')),
+    public_key_or_hash TEXT NOT NULL,          -- WebAuthn COSE public key or Argon2id hash
+    algorithm TEXT NOT NULL,                   -- 'ES256', 'RS256', 'argon2id', 'totp_sha1'
+    counter INTEGER DEFAULT 0,                 -- Sign counter for WebAuthn replay defense
+    aaguid TEXT,                               -- Authenticator Attestation GUID
+    name TEXT NOT NULL,                        -- e.g. "MacBook TouchID", "YubiKey 5C"
     last_used_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-#### Identity Provider Bindings (`identity_provider_bindings`)
-```sql
+-- 4. Identity Provider Bindings (Enterprise SSO, Google Workspace, Microsoft Entra)
 CREATE TABLE identity_provider_bindings (
     id TEXT PRIMARY KEY,                       -- idp_<ulid>
-    principal_id TEXT NOT NULL,                -- prn_<ulid>
-    organization_id TEXT,                      -- Nullable for global auth; set if binding is enterprise-tenant specific
-    provider_type TEXT NOT NULL CHECK(provider_type IN ('oidc', 'saml', 'google', 'github', 'microsoft', 'okta')),
-    provider_subject TEXT NOT NULL,            -- IdP unique immutable subject ID
-    provider_email TEXT NOT NULL,
-    metadata TEXT NOT NULL DEFAULT '{}',       -- JSON claims from IdP
-    linked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_login_at DATETIME,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE,
-    UNIQUE(provider_type, provider_subject)
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    provider_type TEXT NOT NULL,               -- 'google_oidc', 'microsoft_entra', 'okta_saml', 'custom_oidc'
+    provider_issuer TEXT NOT NULL,             -- e.g. 'https://accounts.google.com', 'https://login.microsoftonline.com/{tenant}'
+    provider_subject TEXT NOT NULL,            -- Unique immutable subject claim (sub/NameID)
+    email_at_provider TEXT NOT NULL,
+    raw_claims TEXT,                           -- Encrypted JSON attributes
+    bound_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_authenticated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider_type, provider_issuer, provider_subject)
 );
-```
 
-#### Recovery Methods (`recovery_methods`)
-```sql
+-- 5. Account Recovery Methods
 CREATE TABLE recovery_methods (
-    id TEXT PRIMARY KEY,                       -- rec_<ulid>
-    principal_id TEXT NOT NULL,                -- prn_<ulid>
-    method_type TEXT NOT NULL CHECK(method_type IN ('recovery_email', 'phone_sms', 'security_questions')),
-    destination TEXT NOT NULL,                 -- Encrypted email/phone
-    is_verified INTEGER NOT NULL DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE
+    id TEXT PRIMARY KEY,                       -- rcv_<ulid>
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    method_type TEXT NOT NULL CHECK(method_type IN ('recovery_email', 'backup_codes', 'security_questions_tier2')),
+    destination_or_hash TEXT NOT NULL,         -- Verified secondary email or hashed backup codes
+    is_primary_factor BOOLEAN NOT NULL DEFAULT FALSE, -- Security questions are never primary
+    verified_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-### 2.3 Service Principal Components
-
-#### Service Accounts & API Clients (`service_accounts`, `api_clients`)
-```sql
+-- 6. Service Accounts (Machine & Automation Identities)
 CREATE TABLE service_accounts (
-    principal_id TEXT PRIMARY KEY,             -- prn_<ulid>
-    organization_id TEXT NOT NULL,             -- org_<ulid>
-    service_type TEXT NOT NULL CHECK(service_type IN ('api_client', 'automation_agent', 'integration_sync')),
+    id TEXT PRIMARY KEY,                       -- svc_<ulid>
+    principal_id TEXT UNIQUE NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
     description TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE,
-    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+    system_managed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 7. Service Account API Credentials (Hashed)
 CREATE TABLE api_credentials (
-    id TEXT PRIMARY KEY,                       -- apikey_<ulid>
-    principal_id TEXT NOT NULL,                -- prn_<ulid>
-    key_prefix TEXT NOT NULL,                  -- e.g. 'oryol_live_...' (public lookup prefix)
-    key_hash TEXT NOT NULL,                    -- Argon2id hash of raw secret token
-    name TEXT NOT NULL,                        -- e.g. "Zapier Sync Key"
-    allowed_ips TEXT NOT NULL DEFAULT '[]',    -- JSON array of CIDRs
+    id TEXT PRIMARY KEY,                       -- apic_<ulid>
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    key_prefix TEXT NOT NULL,                  -- First 8 chars of key for lookup (e.g. 'ory_live_')
+    key_hash TEXT NOT NULL,                    -- Argon2id hash of full secret key
+    name TEXT NOT NULL,
+    scopes TEXT NOT NULL,                      -- Comma-separated canonical permissions
     expires_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE
-);
-```
-
-#### Delegated Authority (`delegated_authority`)
-```sql
-CREATE TABLE delegated_authority (
-    id TEXT PRIMARY KEY,                       -- del_<ulid>
-    grantor_principal_id TEXT NOT NULL,        -- prn_<ulid> (User delegating access)
-    grantee_principal_id TEXT NOT NULL,        -- prn_<ulid> (Agent or Service account receiving delegation)
-    organization_id TEXT NOT NULL,             -- org_<ulid>
-    allowed_scopes TEXT NOT NULL,              -- JSON array of scopes e.g. ["mail.messages.send"]
-    expires_at DATETIME NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (grantor_principal_id) REFERENCES principals(id) ON DELETE CASCADE,
-    FOREIGN KEY (grantee_principal_id) REFERENCES principals(id) ON DELETE CASCADE,
-    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
-);
-```
-
----
-
-## 3. Memberships vs. Invitations
-
-```sql
--- Organization Memberships (Expresses Employee vs Contractor vs Guest)
-CREATE TABLE memberships (
-    id TEXT PRIMARY KEY,                       -- mem_<ulid>
-    organization_id TEXT NOT NULL,             -- org_<ulid>
-    principal_id TEXT NOT NULL,                -- prn_<ulid>
-    member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest', 'bot')),
-    role TEXT NOT NULL DEFAULT 'member',       -- 'owner', 'admin', 'member', 'guest' or custom role
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'left')),
-    custom_title TEXT,
-    expires_at DATETIME,                       -- Set for time-bounded contractors/guests
-    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE,
-    UNIQUE(organization_id, principal_id)
+    last_used_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Separate Invitations Entity
+-- 8. Organization Invitations
 CREATE TABLE invitations (
     id TEXT PRIMARY KEY,                       -- inv_<ulid>
-    organization_id TEXT NOT NULL,             -- org_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    inviter_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
     email TEXT NOT NULL,
-    invited_role TEXT NOT NULL DEFAULT 'member',
+    token_hash TEXT NOT NULL,                  -- SHA-256 hash of random invite token
+    role_id TEXT NOT NULL REFERENCES role_definitions(id) ON DELETE RESTRICT,
     member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest')),
-    invited_by_principal_id TEXT NOT NULL,
-    token_hash TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'declined', 'expired', 'revoked')),
     expires_at DATETIME NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    FOREIGN KEY (invited_by_principal_id) REFERENCES principals(id) ON DELETE CASCADE
+    UNIQUE(organization_id, email, status)
 );
-
-CREATE INDEX idx_invitations_org ON invitations(organization_id, email, status);
 ```
 
 ---
 
-## 4. Lifecycle Invariants & Invariant Rules
+## 3. Core Identity Invariants
 
-1. **Principal Creation**:
-   - Creating a human principal creates a record in `principals` (`type='human'`) and an initial profile in `users`.
-   - Creating a service principal creates a record in `principals` (`type='service'`) and a record in `service_accounts`.
-2. **Principal Activation & Suspension**:
-   - `status='suspended'` immediately halts all session refresh attempts and API token validations for that principal across all organizations.
-3. **Principal Deactivation**:
-   - Soft-deactivates the principal, revokes all active credentials and sessions, and marks memberships as `left`.
-4. **Credential Revocation & IdP Unlinking**:
-   - A principal must always maintain at least one valid authentication factor or IdP binding. Unlinking the final authentication method is rejected unless accompanied by account deletion.
-5. **Last-Owner Protection**:
-   - An organization must have at least one active membership with the `owner` role.
-   - Any operation (role demotion, membership deletion, principal deactivation) that would reduce the count of active owners in an active organization to zero is **strictly rejected** with `LAST_OWNER_PROTECTION_VIOLATION`.
+1. **Last-Owner Protection Invariant**:
+   An organization membership holding the `Owner` role cannot be removed, deactivated, or downgraded if it is the sole remaining active Owner of an active Organization (`LAST_OWNER_PROTECTION_VIOLATION`).
+2. **Strict Factor Verification**:
+   Passkey/WebAuthn is the primary passwordless standard. Security questions are restricted to secondary/tier-2 recovery verification and are **never** permitted as a standalone primary recovery factor.
+3. **Enterprise IdP Uniqueness**:
+   IdP subject bindings enforce global uniqueness across `(provider_type, provider_issuer, provider_subject)` to prevent tenant-spoofing across multi-tenant IdPs.

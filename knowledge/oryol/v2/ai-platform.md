@@ -1,6 +1,6 @@
-# Oryol AI Platform Architecture v2.1 — Centralized Gateway
+# Oryol AI Platform Architecture v2.2 — Centralized Gateway
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
 **P0 Remediation**: Centralized AI Gateway, Provider Retention Governance & Application Context-Provider Model
 
 ---

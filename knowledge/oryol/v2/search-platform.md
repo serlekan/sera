@@ -1,53 +1,67 @@
-# Oryol Search Platform Architecture v2
+# Oryol Search Platform Architecture v2.2 — Derived Read Models
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2)  
-**Scope**: Search Contract & Multi-Tenant Indexing Blueprint
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
+**P0 Remediation**: Strict Live Authorization Check, Sensitive Snippet Protection & AI Retrieval Alignment
 
 ---
 
-## 1. Search Contract & Core Invariants
+## 1. Universal Search Architecture Principles
+
+Search in Oryol Workspace is implemented as a **derived secondary index** built asynchronously via domain outbox events.
 
 > [!IMPORTANT]
-> **Three Search Rules**:
-> 1. **Search is NOT the Source of Truth**: Search indexes are derived read models built asynchronously from Domain Outbox Events. Primary relational stores (D1) remain authoritative.
-> 2. **Search Respects Permissions**: Search queries perform document-level and mailbox-level permission trimming before returning results.
-> 3. **Search Inherits Organization Isolation**: Search indexes are strictly partitioned by `organization_id`. Cross-tenant search queries are structurally impossible.
+> **Strict Authorization Invariant**:  
+> Projected ACL tags or index metadata are **NEVER sufficient to authorize result exposure**.  
+> Search query results (including titles, highlighted snippets, and metadata) must undergo a **live `authorize()` check** before being returned to the client.
 
 ---
 
-## 2. Searchable Workspace Domains
-
-The centralized search index aggregates searchable business entities across all applications:
-
-| Application | Searchable Resources | Indexed Attributes | Permission Scope |
-|---|---|---|---|
-| **OryolMail** | Emails, Threads, Attachments | Subject, sender, recipients, body text, AI summary, tags | `mail.read` |
-| **Oryol CRM** | Contacts, Accounts, Deals | Name, company, email, notes, deal title, timeline | `crm.contacts.read` |
-| **Oryol Drive** | Documents, Assets, Folders | Filename, OCR text, document body, owner, tags | `drive.read` |
-| **Calendar** | Meetings, Events, Invites | Event title, description, attendees, location | `calendar.read` |
-| **Virel** | Tasks, Action Items, Automations | Task name, checklist items, assigned owner | `virel.synthesize` |
-
----
-
-## 3. Asynchronous Search Indexing Protocol
+## 2. Canonical Search Query Flow
 
 ```text
-Application Mutation (e.g. Email Received)
-       │
-       ▼
-Transactional Outbox Event (`mail.message.created`)
-       │
-       ▼
-Cloudflare Queue Consumer
-       │
-       ▼
-Search Ingestion Pipeline
- 1. Extract text and metadata
- 2. Attach `organization_id` & `acl_tags` (e.g. `mailbox:mbx_123`, `public`)
- 3. Push to Vector / Lexical Search Index (Cloudflare Vectorize / Edge Search)
+┌─────────────────┐
+│ Client Request  │ (Query: "Acme contract", Authenticated Principal & Membership)
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Oryol Search Gateway                             │
+│                                                                             │
+│ 1. Organization Partition ─► Scope search strictly to `organization_id`     │
+│                                                                             │
+│ 2. Index Pre-Filter ───────► Query derived index (Vectorize/BM25) with ACL  │
+│                              tags used solely as a performance pre-filter   │
+│                                                                             │
+│ 3. Extract Candidates ─────► Collect candidate resource IDs (e.g. 50 items) │
+│                                                                             │
+│ 4. Live Authorization ─────► Dispatch candidate batch to Core `authorize()` │
+│                              evaluator in parallel                          │
+│                                                                             │
+│ 5. Filter Unauthorized ────► Drop any candidate where `authorize()` returns │
+│                              DENY (stale permissions trimmed dynamically)   │
+│                                                                             │
+│ 6. Render Authorized Hits ─► Return search response containing authorized   │
+│                              titles, snippets, and resource references      │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────┐ (Client opens result)
+│ App Data Fetch  │ ──► Owning application serves authoritative full payload
+└─────────────────┘
 ```
 
-When a user executes a search (`GET /v1/search?q=invoice`):
-1. Gateway injects caller's `org_id` and active `membership_id` / `team_ids`.
-2. Search query filters: `organization_id == ctx.orgId AND (acl_tags CONTAINS ctx.accessibleMailboxes)`.
-3. Results are returned with highlighting, relevance scores, and deep-link resource URLs.
+---
+
+## 3. Sensitive Snippet Governance
+
+Highlighted text snippets frequently contain confidential PII, email bodies, financial numbers, or deal negotiations. Therefore:
+1. Snippets are **never returned** for candidate records prior to live authorization approval.
+2. Inverted index storage encrypts snippet fields at rest using organization-scoped keys.
+
+---
+
+## 4. Alignment with AI Retrieval Contracts
+
+When the Oryol AI Gateway performs Retrieval-Augmented Generation (RAG):
+1. The AI retrieval worker executes searches **strictly through the same authorized Search Gateway path**.
+2. Context documents dropped by live authorization are excluded from the prompt envelope before foundation model dispatch.

@@ -1,7 +1,7 @@
-# Oryol Authorization Policy Algebra v2.1
+# Oryol Authorization Policy Algebra v2.2
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
-**P0 Remediation**: Strict 8-Step Evaluation Algebra, Coarse-to-Fine Capability Invariants & Canonical 3-Part Namespace
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
+**P0 Remediation**: Executable 8-Step Algebra, Conceptual Registry Entities, Role Inheritance Rules & Trusted Context
 
 ---
 
@@ -10,8 +10,6 @@
 All authorization decisions in Oryol Workspace are executed through the standard `authorize({ principal, membership, organization, action, resource, context })` interface:
 
 ```typescript
-export function authorize(req: AuthorizationRequest): Promise<AuthorizationResult>;
-```
 export interface AuthorizationRequest {
   principal: {
     id: string;                // prn_<ulid>
@@ -35,7 +33,7 @@ export interface AuthorizationRequest {
   resource: {
     type: string;              // "mailbox", "thread", "deal", "document"
     id: string;                // "mbx_123", "deal_456"
-    ownerOrganizationId: string;
+    organizationId: string;
     attributes?: Record<string, unknown>;
   };
   context: {
@@ -46,96 +44,113 @@ export interface AuthorizationRequest {
   };
 }
 
-export interface AuthorizationResult {
-  decision: 'allow' | 'deny';
-  reasonCode: string;          // e.g. "ALLOWED_RBAC_AND_ACL", "DENIED_LACKING_CAPABILITY"
-  permissionRegistryVersion: string; // e.g. "2.1.0"
-  decisionVersion: string;           // e.g. "2.1.0"
-  matchedGrants?: string[];
-}
+export function authorize(req: AuthorizationRequest): Promise<AuthorizationResult>;
 ```
 
 ---
 
-## 2. Mandatory 8-Step Evaluation Algebra
+## 2. Authoritative Permission Registry & Security Entities
 
-Every evaluation executes in strictly deterministic, non-reorderable sequence:
+```sql
+-- 1. Published Permission Vocabulary (Permission Registry Version)
+CREATE TABLE permission_definitions (
+    name TEXT PRIMARY KEY,                     -- e.g. 'mail.messages.send'
+    service TEXT NOT NULL,                     -- 'core', 'mail', 'crm', 'calendar', 'drive', 'virel'
+    description TEXT NOT NULL,
+    risk_level TEXT NOT NULL CHECK(risk_level IN ('low', 'medium', 'high', 'critical')),
+    is_inheritable BOOLEAN NOT NULL DEFAULT FALSE,
+    registry_version INTEGER NOT NULL DEFAULT 1 -- Global permission schema vocabulary version
+);
+
+-- 2. Role Definitions
+CREATE TABLE role_definitions (
+    id TEXT PRIMARY KEY,                       -- rol_<ulid>
+    organization_id TEXT,                      -- NULL for global platform roles; org_<ulid> for custom roles
+    name TEXT NOT NULL,                        -- 'Owner', 'Admin', 'Member', 'SupportAgent'
+    description TEXT,
+    is_system BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. Role Permissions Mapping (Flat in Phase 1)
+CREATE TABLE role_permissions (
+    role_id TEXT NOT NULL REFERENCES role_definitions(id) ON DELETE CASCADE,
+    permission_name TEXT NOT NULL REFERENCES permission_definitions(name) ON DELETE RESTRICT,
+    PRIMARY KEY(role_id, permission_name)
+);
+
+-- 4. Explicit Deny Rules (Precedence over All Grants)
+CREATE TABLE explicit_denies (
+    id TEXT PRIMARY KEY,                       -- dny_<ulid>
+    organization_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('principal', 'membership', 'team')),
+    subject_id TEXT NOT NULL,
+    action_pattern TEXT NOT NULL,              -- e.g. 'mail.*', 'core.domains.manage'
+    resource_type TEXT,                        -- NULL for all resources in org
+    resource_id TEXT,                          -- NULL for all instances
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5. Monotonic Authorization Version Tracking
+CREATE TABLE authorization_versions (
+    organization_id TEXT PRIMARY KEY,          -- org_<ulid>
+    version INTEGER NOT NULL DEFAULT 1,        -- Monotonically incremented on membership/role changes
+    last_invalidated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Permission Registry Version vs. Authorization Version
+- **Permission Registry Version**: The static schema version of the published permission dictionary/vocabulary supported by the software release.
+- **Authorization Version**: A runtime monotonic integer incremented whenever an organization's memberships, role bindings, or security policies mutate, allowing Edge tokens to detect stale cached privileges.
+
+---
+
+## 3. Mandatory 8-Step Evaluation Algebra
+
+Every evaluation executes in strict linear order:
 
 ```text
- 1. Validate Principal Active
-       │ (if principal.status !== 'active' ──► DENY: "PRINCIPAL_INACTIVE")
-       ▼
- 2. Validate Membership Active & Bound
-       │ (if membership.status !== 'active' OR membership.orgId !== organization.id ──► DENY: "MEMBERSHIP_INVALID")
-       ▼
- 3. Validate Application Entitlement
-       │ (if app for action not in organization.entitledApps ──► DENY: "APP_NOT_ENTITLED")
-       ▼
- 4. Apply Explicit Deny Rules
-       │ (if explicit deny rule matches ──► DENY: "EXPLICIT_DENY_PRECEDENCE")
-       ▼
- 5. Resolve RBAC Coarse Permission Capability
-       │ (if principal/membership lacks coarse capability scope ──► DENY: "CAPABILITY_UNAUTHORIZED")
-       ▼
- 6. Resolve Resource ACL / ReBAC Grants
-       │ (if coarse allowed, check resource-specific ACL/assignment/team grant ──► if no grant ──► DENY: "RESOURCE_ACCESS_DENIED")
-       ▼
- 7. Apply Constrained Contextual Conditions (ABAC)
-       │ (evaluate IP allowlists, organization status lockouts, time bounds ──► if violated ──► DENY: "CONTEXT_VIOLATION")
-       ▼
- 8. Default Deny Fallback
-         (if no explicit grant path completed ──► DENY: "DEFAULT_DENY")
+1. Validate Principal Active
+   └─► If principal.status != 'active' ──► DENY(PRINCIPAL_INACTIVE)
+
+2. Validate Membership Binding & State
+   └─► If membership.principal_id != principal.id ──► DENY(MEMBERSHIP_PRINCIPAL_MISMATCH)
+   └─► If membership.organization_id != organization.id ──► DENY(MEMBERSHIP_ORG_MISMATCH)
+   └─► If membership.status != 'active' ──► DENY(MEMBERSHIP_INACTIVE)
+
+3. Validate Application Entitlement & Organization State
+   └─► If organization.status != 'active' ──► DENY(ORGANIZATION_INACTIVE)
+   └─► If action.service NOT IN organization.entitledApps ──► DENY(APP_NOT_ENTITLED)
+
+4. Resource Tenant Alignment
+   └─► If resource.organizationId != organization.id:
+         └─► Verify active `cross_org_grants` record; if absent ──► DENY(CROSS_TENANT_VIOLATION)
+
+5. Apply Explicit Deny Rules
+   └─► If matching `explicit_denies` rule exists for principal, membership, or team ──► DENY(EXPLICIT_DENY)
+
+6. Resolve Coarse RBAC Capability
+   └─► Resolve assigned roles for membership. If permission is NOT present in any active role ──► DENY(RBAC_DENIED)
+
+7. Resolve Fine-Grained Resource ACL / ReBAC Grant
+   └─► If resource requires specific ACL and no matching `resource_grants` or hierarchy inheritance exists ──► DENY(ACL_DENIED)
+
+8. Apply Contextual ABAC & Fallback
+   └─► Validate trusted edge context (IP allowlist, device posture).
+   └─► If all checks pass ──► ALLOW; otherwise ──► DEFAULT_DENY
 ```
 
 ---
 
-## 3. Coarse Capability vs. Resource Access Invariant
+## 4. Hierarchy, Inheritance & Context Invariants
 
-> [!IMPORTANT]
-> **Fundamental Access Control Invariant**:  
-> **RBAC** defines the coarse capability (e.g. `mail.messages.read`).  
-> **ACL / ReBAC** defines specific resource access (e.g. `mailbox:mbx_support`).  
-> **ABAC** applies contextual restrictions (e.g. `ip in allowlist`).  
-> 
-> **An ACL or resource grant must NEVER create a capability that the principal lacks at the RBAC capability level.**
-> 
-> *Example*: If a user does not possess the `mail.messages.read` permission in their role, being added to a shared mailbox ACL grants zero access.
-
----
-
-## 4. Canonical 3-Part Permission Namespaces
-
-All permissions use the standardized three-part format: `<service>.<resource>.<action>`
-
-### Core Platform (`core.*`)
-- `core.members.invite` — Invite users or provision service accounts.
-- `core.members.manage` — Change roles, edit titles, or remove memberships.
-- `core.roles.manage` — Create, edit, or delete custom organization roles.
-- `core.domains.manage` — Add, configure, or delete organization domain claims.
-- `core.audit.read` — View organization audit records.
-
-### OryolMail (`mail.*`)
-- `mail.messages.read` — View email content in assigned/accessible mailboxes.
-- `mail.messages.send` — Dispatch outbound emails from authorized aliases.
-- `mail.messages.delete` — Purge or trash email messages.
-- `mail.shared.assign` — Assign support tickets and post internal discussion notes.
-- `mail.domains.manage` — Configure DKIM, SPF, and MX routing rules.
-
-### Oryol CRM (`crm.*`)
-- `crm.deals.read` / `crm.deals.manage` — View and edit sales opportunities.
-- `crm.contacts.read` / `crm.contacts.manage` — View and edit customer directories.
-- `crm.exports.create` — Export CRM records (sensitive capability).
-
-### Finance & Billing (`finance.*`)
-- `finance.invoices.read` / `finance.invoices.manage` — View and manage billing invoices.
-
----
-
-## 5. Policy Rules & Constraints
-
-1. **Wildcard Policy**:
-   - Unrestricted global `*` is strictly **forbidden**.
-   - Subsystem wildcards are bounded to a single namespace (e.g. `mail.messages.*` or `mail.*`), and are restricted to system `owner` / `admin` roles.
-2. **Context Attributes (Trusted vs. Untrusted)**:
-   - **Trusted Context** (`ipAddress`, `tokenSessionId`, `activeOrgId`) is extracted directly by Cloudflare edge middleware from verified connection metadata and cryptographically signed JWT claims.
-   - **Untrusted Context** (user-submitted query params or client body attributes) cannot be used for coarse permission bypass.
+1. **Role Inheritance (Phase 1 Invariant)**:
+   Arbitrary recursive role inheritance is **disallowed** in Phase 1. Role-permission mappings are flat and direct.
+2. **Resource Hierarchies & Inheritance**:
+   - *Mail*: `Domain ──► Mailbox ──► Thread ──► Message`
+   - *Drive*: `Drive/Space ──► Folder ──► Document`
+   - *CRM*: `Account ──► Deal / Contact`
+   Permissions propagate down a hierarchy only when the permission definition explicitly specifies `is_inheritable = TRUE`.
+3. **Trusted vs. Untrusted Contextual Attributes**:
+   - **Trusted**: Server-resolved organization, server-resolved membership, authenticated session ID, authoritative resource metadata from D1, Cloudflare connecting IP.
+   - **Untrusted**: Arbitrary client request headers, client-supplied organization IDs in body, unverified client ACL assertions.

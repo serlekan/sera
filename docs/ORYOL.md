@@ -1,4 +1,4 @@
-# SERA Specialization for Oryol Workspace (Architecture v2.1)
+# SERA Specialization for Oryol Workspace (Architecture v2.2)
 
 SERA is the official engineering intelligence, task boundary, and review controller across the **Oryol Workspace** ecosystem.
 
@@ -26,11 +26,11 @@ Oryol Product Repositories (oryol-core, oryol-mail, oryol-crm, oryol-calendar, o
 
 ---
 
-## 2. Canonical Architecture v2.1 Knowledge Base (`knowledge/oryol/v2/`)
+## 2. Canonical Architecture v2.2 Knowledge Base (`knowledge/oryol/v2/`)
 
 ```
 knowledge/oryol/v2/
-├── ARCHITECTURE-BASELINE.md   # Version 2.1 Candidate Baseline & Gate Declaration
+├── ARCHITECTURE-BASELINE.md   # Version 2.2 Candidate Baseline & Gate Declaration
 ├── workspace-architecture.md  # Two-tier hierarchy (Platform -> Core -> Apps) & 7 rules
 ├── core-boundaries.md         # Platform capabilities vs. Application business domains
 ├── multi-tenancy.md           # Structural tenant isolation & organization_placement sharding

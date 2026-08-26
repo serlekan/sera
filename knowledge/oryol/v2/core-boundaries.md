@@ -1,7 +1,7 @@
-# Oryol Core — System Boundaries & Service Contracts v2.1
+# Oryol Core — System Boundaries & Service Contracts v2.2
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2.1)  
-**P0 Remediation**: Domain Verification Ownership, AI Context-Provider Inversion & Search Post-Filtering
+**Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
+**P0 Remediation**: Domain Verification Ownership, AI Context-Provider Inversion, Search Live Authorization & Virel Ownership
 
 ---
 
@@ -10,9 +10,9 @@
 Oryol Core provides the single pane of glass for all cross-cutting infrastructure, identity, and governance concerns.
 
 ### 1.1 Identity & Principal Registry
-- Global Principal management (`prn_...`) representing human users (`type='human'`) and service principals (`type='service'`).
+- Global Principal management (`prn_...`) representing human users (`type='human'`) and service accounts (`type='service'`).
 - WebAuthn Passkeys, Magic Links, MFA verification, and Enterprise IdP mappings.
-- Authoritative session store with cryptographic token rotation and instant revocation.
+- Authoritative session store with cryptographic token rotation and authoritative session verification.
 
 ### 1.2 Multi-Tenant Hierarchy & Organization Governance
 - Organization (`org_...`) lifecycle management: `active`, `suspended`, `archived`, `deletion_pending`.
@@ -23,8 +23,8 @@ Oryol Core provides the single pane of glass for all cross-cutting infrastructur
 
 ### 1.3 Authorization Engine
 - Uniform evaluation contract: `authorize({ principal, membership, organization, action, resource, context })`.
-- Standard 3-part permission registry (`core.*`, `mail.*`, `crm.*`, `calendar.*`, `drive.*`, `finance.*`).
-- Deny-precedence rule resolution and scope validation.
+- Standard 3-part permission registry (`core.*`, `mail.*`, `crm.*`, `calendar.*`, `drive.*`, `virel.*`).
+- Deny-precedence rule resolution, strict structural isolation, and scope validation.
 
 ### 1.4 Central Platform Pipelines
 - **Audit Logging**: Immutable, append-only security logs.
@@ -44,7 +44,7 @@ Oryol Core provides the single pane of glass for all cross-cutting infrastructur
 ### 2.2 AI Context-Provider Contract (Inversion of Control)
 > [!IMPORTANT]
 > **Strict AI Boundary**:  
-> The Core AI Gateway must **NEVER directly query** OryolMail, CRM, or Drive databases.  
+> The Core AI Gateway must **NEVER directly query** OryolMail, CRM, Drive, or Virel databases.  
 > Context retrieval is strictly **application-owned via a Context-Provider Contract**:
 > 
 > 1. Application worker receives client request.
@@ -53,4 +53,12 @@ Oryol Core provides the single pane of glass for all cross-cutting infrastructur
 > 4. Core AI Gateway verifies the caller's permissions, sanitizes secrets, dispatches to the approved model provider matching the retention policy, and returns structured JSON.
 
 ### 2.3 Search Authorization Contract
-- Search read models perform **live authorization checks or safe post-filtering** against the active `authorize()` engine before results are returned to the client, preventing stale search index ACL leakage.
+- Search read models perform **live authorization checks or safe post-filtering** against the active `authorize()` engine before results are returned to the client. Projected ACL metadata is never sufficient to expose titles, snippets, or metadata.
+
+### 2.4 Attachment Persistence Contract
+- **OryolMail Owns**: Attachment storage, deduplication, and persistence within mail storage buckets.
+- **Drive Separation**: Mail attachments are **not** automatically relocated into Oryol Drive. Oryol Drive integration exposes explicit, user-controlled copy/link workflows.
+
+### 2.5 Financial & Ledger Ownership (Virel)
+- **Virel Owns**: Wallets, transactions, invoices, payment records, billing reconciliation, and accounting ledgers.
+- Core and other products never maintain parallel financial ledger state.
