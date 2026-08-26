@@ -1,7 +1,7 @@
 # Oryol Session Security & Token Family Architecture v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: Refresh Token Family Entities, Atomic Rotation State Machine, Replay Breaches & Step-Up Proof Binding
+**P0 Remediation**: CAS Refresh Concurrency, Account-Level Compromise Scope, JWKS Key Rotation & Cookie Transport
 
 ---
 
@@ -47,8 +47,8 @@ CREATE TABLE refresh_tokens (
     UNIQUE(family_id, generation)
 );
 
--- 4. Session Security Versions (Instant Invalidation)
-CREATE TABLE session_security_versions (
+-- 4. Principal Security Versions (Instant Account-Wide Invalidation)
+CREATE TABLE principal_security_versions (
     principal_id TEXT PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,
     security_version INTEGER NOT NULL DEFAULT 1,
     last_incremented_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -57,46 +57,54 @@ CREATE TABLE session_security_versions (
 
 ---
 
-## 2. Atomic Refresh State Machine & Concurrency Control
+## 2. Compare-and-Swap (CAS) Refresh Token Rotation
 
-When an client presents a refresh token `rtk_curr` with secret `S`:
+When a client presents a refresh token `rtk_curr` with secret `S`:
 
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       Atomic D1 Refresh Transaction                         │
-│                                                                             │
-│ 1. Verify `refresh_token_families` WHERE family_id = ? AND status = 'active'│
-│ 2. Verify `refresh_tokens` WHERE token_id = ? AND token_hash = SHA256(S)    │
-│    └─► IF status == 'consumed' OR status == 'revoked':                      │
-│          ──► TRIGGER REPLAY DEFENSE (Revoke Family, Terminate Session)      │
-│ 3. UPDATE `refresh_tokens` SET status = 'consumed', consumed_at = NOW(),    │
-│    successor_token_id = ? WHERE token_id = ?                                │
-│ 4. INSERT INTO `refresh_tokens` (new token_id, generation + 1, new_hash)     │
-│ 5. UPDATE `refresh_token_families` SET current_generation = gen + 1,        │
-│    last_rotated_at = NOW() WHERE family_id = ?                              │
-│ 6. Commit transaction atomically                                            │
-└─────────────────────────────────────────────────────────────────────────────┘
+```sql
+-- Step 1: Atomic Compare-and-Swap Consumption
+UPDATE refresh_tokens
+SET
+    status = 'consumed',
+    consumed_at = CURRENT_TIMESTAMP,
+    successor_token_id = :successor_token_id
+WHERE
+    token_id = :token_id
+    AND family_id = :family_id
+    AND generation = :generation
+    AND status = 'active';
 ```
 
-### Concurrency & Replay Attack Defense
-1. **Single Rotation Winner**: If two concurrent requests present the same generation token, only one transaction succeeds in updating the row from `active` to `consumed`.
-2. **Replay Detection & Family Revocation**: The competing request sees `status = 'consumed'`. It immediately:
-   - Sets `refresh_token_families.status = 'revoked'` (`revocation_reason = 'token_reuse_detected'`).
-   - Sets `account_sessions.status = 'revoked'`.
-   - Increments `session_security_versions.security_version`.
-   - Emits a high-severity security audit event (`core.session.security_breach`).
-   - Requires full re-authentication for all user devices.
+### Invariants for CAS Rotation:
+1. **Single Rotation Winner**: `affected_rows` **MUST equal 1**. Only one concurrent worker can successfully rotate the generation.
+2. **Replay Trigger on 0 Rows**: If `affected_rows == 0`, reload authoritative token state:
+   - If token status is `'consumed'` or `'revoked'`: **Trigger Account-Level Replay Defense**.
+   - If token hash does not match: **Reject with 401 Unauthorized**.
+
+### Account-Level Replay Defense:
+When token reuse is detected:
+1. Mark `refresh_token_families.status = 'revoked'` (`revocation_reason = 'token_reuse_detected'`).
+2. Mark all active `account_sessions` for that principal as `'revoked'`.
+3. Increment `principal_security_versions.security_version` in D1.
+4. Record high-severity security audit event `core.session.security_breach`.
+5. Require full re-authentication across **all user devices**.
 
 ---
 
-## 3. Membership Revocation & Organization Switching
+## 3. Membership Revalidation on Token Issuance
 
-- **Membership Revocation**: When a membership is suspended or removed, the organization's `authorization_versions` is incremented. High-risk endpoints check D1 and reject stale tokens immediately.
-- **Organization Switching**: Switching active organizations (`POST /v1/auth/switch-org`) verifies target membership status directly against D1 before issuing a new organization access token.
+Every organization access-token issuance or refresh-derived token exchange must revalidate against authoritative D1 state:
+- `account_sessions.status == 'active'`
+- `principals.status == 'active'`
+- `memberships.status == 'active'` AND `memberships.principal_id == principal_id` AND `memberships.organization_id == target_organization_id`
+- `organizations.status == 'active'`
+- `authorization_versions` current
+
+A refresh token alone can **never** mint an access token into a membership that has been revoked or suspended.
 
 ---
 
-## 4. Protected JOSE Header & JWT Claim Structure
+## 4. Protected JOSE Header & JWT Structure
 
 ```json
 // Protected JOSE Header
@@ -118,6 +126,7 @@ When an client presents a refresh token `rtk_curr` with secret `S`:
   "session_id": "ses_01H8Z7B5C6D7E8F9G0H1J2K3L4",
   "organization_id": "org_01H8Z7C8D9E0F1G2H3J4K5L6M7",
   "membership_id": "mem_01H8Z7D1E2F3G4H5J6K7L8M9N0",
+  "security_version": 1,
   "authorization_version": 2,
   "perms": ["mail.messages.read", "mail.messages.send", "core.domains.manage"]
 }
@@ -125,16 +134,32 @@ When an client presents a refresh token `rtk_curr` with secret `S`:
 
 ---
 
-## 5. Dual Verification Revocation SLA
+## 5. JWKS Key Lifecycle & Unknown `kid` Handling
 
-- **Standard API Endpoints**: Edge-verified via Ed25519 with a maximum revocation window of **10 minutes** (natural TTL).
-- **High-Risk Sensitive Endpoints**: High-risk operations (e.g. deleting mailboxes, verifying domains, transferring ownership) perform an authoritative current session, membership, and security-version check in D1 and **do not rely on the access-token TTL window for revocation**.
+- **Key Rotation Schedule**: Signing keys rotate every 90 days. Previous verification keys remain active in the JWKS for a 14-day overlap grace period.
+- **Edge Cache TTL**: Edge workers cache the JWKS in Cloudflare KV / in-memory for a maximum TTL of **1 hour**.
+- **Unknown `kid` On-Demand Resolution Flow**:
+  1. If an incoming token specifies an unknown `kid`:
+  2. Edge worker executes **one on-demand refresh** from authoritative `https://auth.oryol.com/.well-known/jwks.json`.
+  3. If the `kid` is present in the refreshed keyset: Verify signature and proceed.
+  4. If the `kid` remains unknown after refresh: **Immediately reject token with `401 Unauthorized (UNKNOWN_KEY_IDENTIFIER)`**.
 
 ---
 
-## 6. Step-Up Authentication Proof Binding Contract
+## 6. Browser Cookie Transport & CSRF Protection
 
-Step-up authentication is bound cryptographically to specific context and cannot be satisfied by an unbound boolean flag:
+- **Refresh Cookie**: `__Host-Oryol-Refresh` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/v1/auth`).
+- **CSRF Mitigation**:
+  - API endpoints enforce custom header verification: `X-Oryol-Request: true`.
+  - Mutating cookie-authenticated endpoints validate double-submit anti-CSRF tokens.
+
+---
+
+## 7. Dual Verification Revocation SLA & Step-Up Proofs
+
+- **Standard API Endpoints**: Edge-verified via Ed25519 with a maximum revocation window of **10 minutes** (natural TTL).
+- **High-Risk Sensitive Endpoints**: High-risk operations (e.g. deleting mailboxes, verifying domains, transferring ownership) perform an authoritative current session, membership, and security-version check in D1 and **do not rely on the access-token TTL window for revocation**.
+- **Cryptographic Step-Up Proof Binding**:
 
 ```sql
 CREATE TABLE step_up_proofs (

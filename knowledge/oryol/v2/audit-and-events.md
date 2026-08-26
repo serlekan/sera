@@ -1,7 +1,7 @@
 # Oryol Audit, Outbox & Event Ingestion Architecture v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: Reliable Outbox Dispatching, Lease Locks, Non-Cascading Audit & System Actors
+**P0 Remediation**: Expired Lease Recovery, Aggregate Ordering, Atomic Inbox Semantics, Legal Holds & Append-Only Enforcement
 
 ---
 
@@ -33,7 +33,7 @@ CREATE TABLE outbox_events (
     causation_id TEXT,                         -- Causation trace ULID
     idempotency_key TEXT UNIQUE NOT NULL,      -- Dedup key (e.g. 'evt_<agg_id>_<ver>')
     payload TEXT NOT NULL,                     -- Validated JSON payload
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'published', 'dead_letter', 'retry')),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'published', 'dead_letter', 'retry', 'blocked_on_gap')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     lease_owner TEXT,                          -- Worker instance ID holding claim
@@ -43,16 +43,15 @@ CREATE TABLE outbox_events (
     published_at DATETIME
 );
 
-CREATE INDEX idx_outbox_dispatch ON outbox_events(status, next_attempt_at)
-WHERE status IN ('pending', 'retry');
+CREATE INDEX idx_outbox_eligibility ON outbox_events(status, next_attempt_at, lease_expires_at);
 ```
 
 ---
 
-## 3. Dispatcher Claim Algorithm, Ordering & Retries
+## 3. Dispatcher Claim Algorithm & Expired Lease Recovery
 
-### 3.1 Worker Atomic Lease Claim
-An outbox dispatcher worker queries for eligible events using an atomic lease update:
+### 3.1 Canonical Eligibility & Atomic Lease Claim
+An outbox dispatcher worker queries and claims eligible events using an atomic lease update:
 ```sql
 UPDATE outbox_events
 SET status = 'processing',
@@ -61,27 +60,48 @@ SET status = 'processing',
     attempt_count = attempt_count + 1
 WHERE event_id IN (
     SELECT event_id FROM outbox_events
-    WHERE status IN ('pending', 'retry')
-      AND next_attempt_at <= datetime('now')
-      AND (lease_owner IS NULL OR lease_expires_at <= datetime('now'))
+    WHERE (status IN ('pending', 'retry') AND next_attempt_at <= datetime('now'))
+       OR (status = 'processing' AND lease_expires_at <= datetime('now'))
     ORDER BY occurred_at ASC
     LIMIT 50
 );
 ```
-Only the worker holding `lease_owner` prior to `lease_expires_at` may publish to Cloudflare Queues and mark `status = 'published'`.
 
-### 3.2 Retry, Backoff & Dead Letter Queue (DLQ)
-- **Backoff Formula**: `delay = min(3600, 2^(attempt_count) * 1.5 + jitter_ms)`
-- **Max Attempts**: If `attempt_count >= 10`, event transitions to `status = 'dead_letter'`.
-- **Replay Authorization**: Replay of dead-lettered events is restricted to privileged platform operators, emits an audit event (`core.outbox.replay_initiated`), and retains the original `event_id` and `idempotency_key`.
-
-### 3.3 Aggregate Ordering via `aggregate_version`
-- Cloudflare Queues transport is strictly **at-least-once**.
-- Ordering guarantees are enforced per-aggregate using `aggregate_version`. Downstream consumers reject or buffer events with impossible version gaps (`expected_version > received_version`).
+### 3.2 Safe Finalize Invariant
+Only the current lease owner may finalize publication before lease expiration:
+```sql
+UPDATE outbox_events
+SET status = 'published',
+    published_at = datetime('now'),
+    lease_owner = NULL,
+    lease_expires_at = NULL
+WHERE event_id = :event_id
+  AND lease_owner = :worker_id
+  AND status = 'processing'
+  AND lease_expires_at > datetime('now');
+```
+If the lease expired prior to publication completion, the worker **fails closed** and does not mark the record published blindly.
 
 ---
 
-## 4. Consumer Inbox Deduplication Schema (`inbox_events`)
+## 4. Aggregate Ordering, Gap Recovery & Schema Evolution
+
+### 4.1 Transport & Ordering Rules
+- **Transport Reality**: Cloudflare Queues transport is strictly **at-least-once**. Queue-level ordering is **not** assumed.
+- **Aggregate Evaluation**:
+  - `received_version == expected_version` ➔ Process normally and advance `expected_version = received_version + 1`.
+  - `received_version < expected_version` ➔ Candidate is duplicate or stale ➔ Deduplicate via `inbox_events` or safely ignore.
+  - `received_version > expected_version` ➔ Forward gap detected ➔ Set `status = 'blocked_on_gap'`, buffer event, request/replay missing aggregate versions from source. If unresolved within 5 minutes ➔ Send to DLQ and trigger operational alert.
+
+### 4.2 Schema Evolution
+- Every event specifies `event_type` and `schema_version`.
+- Additive, non-breaking schema additions are backward-compatible.
+- Breaking changes require a new `schema_version` or new `event_type`.
+- Consumers declare supported version ranges; unsupported versions route to DLQ for triage (never guessed). Replay retains original `schema_version`.
+
+---
+
+## 5. Atomic Inbox Semantics & Deduplication (`inbox_events`)
 
 ```sql
 CREATE TABLE inbox_events (
@@ -93,16 +113,39 @@ CREATE TABLE inbox_events (
     aggregate_id TEXT NOT NULL,
     aggregate_version INTEGER NOT NULL,
     processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('completed', 'failed')),
-    UNIQUE(consumer_name, event_id)           -- Provides deduplication for effectively-once application semantics
+    status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('pending', 'completed', 'failed')),
+    UNIQUE(consumer_name, event_id)
 );
 ```
 
+### Invariant for Effectively-Once Application Semantics:
+- **Atomic Side Effect & Marker**: Effectively-once semantics require the **consumer domain side effect** and the **`inbox_events` completion marker** to commit in the **same atomic D1 transaction**.
+- Non-atomic consumers remain at-least-once / idempotent.
+- A failed inbox processing attempt records `status = 'failed'` without permanently blocking legitimate retries.
+
 ---
 
-## 5. Immutable Compliance Audit Schema (`audit_events`)
+## 6. Audit Legal Holds & Append-Only Enforcement
 
 ```sql
+-- 1. Legal Holds: Overrides Normal Retention Purge
+CREATE TABLE audit_legal_holds (
+    id TEXT PRIMARY KEY,                       -- hld_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('organization', 'principal', 'mailbox', 'deal')),
+    scope_id TEXT,                             -- NULL for entire org, or specific entity ID
+    reason TEXT NOT NULL,
+    legal_authority TEXT NOT NULL,             -- Subpoena / court order / regulator ref
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'released')),
+    placed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    placed_by_membership_id TEXT NOT NULL,
+    released_at DATETIME,
+    released_by_membership_id TEXT,
+    FOREIGN KEY (organization_id, placed_by_membership_id) REFERENCES memberships(organization_id, id),
+    FOREIGN KEY (organization_id, released_by_membership_id) REFERENCES memberships(organization_id, id)
+);
+
+-- 2. Compliance Audit Events
 CREATE TABLE audit_events (
     id TEXT PRIMARY KEY,                       -- aud_<ulid>
     organization_id TEXT NOT NULL,             -- org_<ulid> (NEVER cascade-deleted)
@@ -120,7 +163,25 @@ CREATE TABLE audit_events (
 );
 ```
 
-### Audit Invariants & Redaction:
-1. **Append-Only Engine Enforcement**: D1 tables reject `UPDATE` and `DELETE` queries on `audit_events`. Corrections are recorded as new compensating audit events.
-2. **System Actor Handling**: `actor_principal_id` is nullable for system actors; structured `actor_metadata` captures worker identity and job run details.
-3. **Redaction / Pseudonymization**: Historical audit action meaning is never altered. User PII is pseudonymized (`Deleted User <prn_id>`) upon verified erasure requests without deleting audit records.
+### 6.1 Multi-Layer Append-Only Enforcement
+1. **Repository Capability Boundary**: The `AuditRepository` interface exposes strictly `append(event: AuditEvent)`—no `update()` or `delete()` methods exist.
+2. **D1 SQLite Engine Triggers**:
+   ```sql
+   CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_events
+   BEGIN SELECT RAISE(FAIL, 'AUDIT_LOG_IMMUTABLE: updates prohibited'); END;
+
+   CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_events
+   BEGIN SELECT RAISE(FAIL, 'AUDIT_LOG_IMMUTABLE: deletes prohibited'); END;
+   ```
+3. **Compensating Audit Records**: Any correction or retraction is recorded as a new append-only compensating audit event.
+
+### 6.2 Atomic Security Mutations
+All security-critical operations require the **business state mutation** and the corresponding **audit event insert** to execute in the **same atomic D1 transaction**:
+- Membership revocation / role change
+- Organization ownership transfer
+- Credential / service account revocation
+- Session security breach invalidation
+- Cross-org grant creation / revocation
+- Legal hold placement / release
+
+If the audit event insertion fails, the entire transaction **fails closed** and rolls back.
