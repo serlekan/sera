@@ -30,7 +30,7 @@ Architecture v2.2 replaces inaccurate claims of instant cryptographic erasure wi
 | **Cloudflare R2 Objects** | Hard object deletion via R2 API (`DELETE /objects/...`). | Synchronous or asynchronous batch purge (< 24 hours). | R2 versioning lifecycle rules purge non-current versions. |
 | **Search Projections** | Tombstone event (`*.deleted`) consumed by search worker. | Near real-time (< 5 minutes). | Index inverted lists remove document references. |
 | **Outbox & Queues** | Outbox rows cleared post-publish; pending tombstones preserved. | Natural queue consumption / TTL drain. | Outbox tombstones never cascade-deleted; drained to completion. |
-| **Audit Logs** | Pseudonymization / Legal Hold. | **Preserved**. PII masked (`Deleted User`), security audit records retained for compliance. | Never cascade-deleted with organization purge. |
+| **Audit Logs** | Pseudonymization / Legal Hold. | **Permanently Retained (No Physical Purge in Phase 1)**. PII masked (`Deleted User`), security audit records retained for compliance. | Never cascade-deleted with organization purge. D1 triggers enforce append-only immutability. |
 | **AI Providers** | Provider Retention Policy Compliance. | Governed by approved policy. | Providers handling workspace data must satisfy the approved Oryol retention policy; sensitive workspace data requires verified no-training / zero-retention configurations where contractually available. |
 
 ---

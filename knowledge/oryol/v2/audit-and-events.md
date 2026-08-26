@@ -1,7 +1,7 @@
 # Oryol Audit, Outbox & Event Ingestion Architecture v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: Expired Lease Recovery, Aggregate Ordering, Atomic Inbox Semantics, Legal Holds & Append-Only Enforcement
+**P0 Remediation**: Expired Lease Recovery, Aggregate Ordering, Atomic Inbox Semantics, Legal Holds & Phase 1 Permanent Retention
 
 ---
 
@@ -9,7 +9,7 @@
 
 | Subsystem | Primary Purpose | Storage | Cascade on Org Delete | Mutability |
 |---|---|---|---|---|
-| **Compliance Audit Log** (`audit_events`) | Forensics, legal compliance, "Who did what and when?" | Cloudflare D1 + R2 cold archive | **NEVER** (Preserved under legal retention) | **Strictly Append-Only** |
+| **Compliance Audit Log** (`audit_events`) | Forensics, legal compliance, "Who did what and when?" | Cloudflare D1 + R2 cold archive | **NEVER** (Preserved under permanent Phase 1 retention) | **Strictly Append-Only (No Physical Purge in Phase 1)** |
 | **Transactional Outbox** (`outbox_events`) | Reliable asynchronous integration & domain state broadcasts | Cloudflare D1 (Temporary buffer) | **NEVER cascade pending tombstones** (drained to completion) | Mutated by Dispatcher (Lease/Status) |
 | **Observability & Metrics** | System health, query latency, error rates, token usage | Cloudflare Analytics / Tail Workers | Transient TTL | Aggregated metrics |
 
@@ -125,10 +125,16 @@ CREATE TABLE inbox_events (
 
 ---
 
-## 6. Audit Legal Holds & Append-Only Enforcement
+## 6. Phase 1 Permanent Audit Retention & Legal Holds
+
+### 6.1 Phase 1 Permanent Retention Policy
+> [!IMPORTANT]
+> **No Physical Audit Purge in Phase 1**:  
+> In Phase 1, `audit_events` are **permanently append-only**. There is **no normal physical audit purge** in Phase 1.  
+> Organization deletion, account termination, and user erasure requests **never** physically delete audit records. User privacy requests pseudonymize permitted PII fields (`Deleted User <prn_id>`) or append redaction markers while preserving historical audit log integrity.
 
 ```sql
--- 1. Legal Holds: Overrides Normal Retention Purge
+-- 1. Legal Holds Contract
 CREATE TABLE audit_legal_holds (
     id TEXT PRIMARY KEY,                       -- hld_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
@@ -145,7 +151,7 @@ CREATE TABLE audit_legal_holds (
     FOREIGN KEY (organization_id, released_by_membership_id) REFERENCES memberships(organization_id, id)
 );
 
--- 2. Compliance Audit Events
+-- 2. Compliance Audit Events (Append-Only)
 CREATE TABLE audit_events (
     id TEXT PRIMARY KEY,                       -- aud_<ulid>
     organization_id TEXT NOT NULL,             -- org_<ulid> (NEVER cascade-deleted)
@@ -163,7 +169,20 @@ CREATE TABLE audit_events (
 );
 ```
 
-### 6.1 Multi-Layer Append-Only Enforcement
+### 6.2 Legal Hold Governance & Required Permissions
+Legal holds govern:
+- Whether pseudonymization/redaction is permitted on audit records.
+- Mandatory retention guarantees during legal discovery.
+- Cold-archive preservation and eDiscovery export restrictions.
+
+**Required Permissions for Legal Holds**:
+- `core.audit.legal_hold.create`: Permission to place an active legal hold.
+- `core.audit.legal_hold.release`: Permission to release an active legal hold.
+- `core.audit.legal_hold.read`: Permission to view active and released legal holds.
+
+Hold creation and release require active authorized membership, step-up authentication, and are themselves recorded as immutable audit events.
+
+### 6.3 Multi-Layer Append-Only Enforcement
 1. **Repository Capability Boundary**: The `AuditRepository` interface exposes strictly `append(event: AuditEvent)`—no `update()` or `delete()` methods exist.
 2. **D1 SQLite Engine Triggers**:
    ```sql
@@ -175,7 +194,7 @@ CREATE TABLE audit_events (
    ```
 3. **Compensating Audit Records**: Any correction or retraction is recorded as a new append-only compensating audit event.
 
-### 6.2 Atomic Security Mutations
+### 6.4 Atomic Security Mutations
 All security-critical operations require the **business state mutation** and the corresponding **audit event insert** to execute in the **same atomic D1 transaction**:
 - Membership revocation / role change
 - Organization ownership transfer

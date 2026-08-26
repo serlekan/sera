@@ -1,13 +1,17 @@
 # Oryol Authorization Policy Algebra v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: Executable 8-Step Algebra, Published Permission Registry, Tenant-Safe Roles & Explicit Deny Subjects
+**P0 Remediation**: Published Permission Registry Binding, Structurally Typed Authorization Subjects & Clean Request Model
 
 ---
 
 ## 1. Canonical Authorization Contract
 
-All authorization decisions in Oryol Workspace are executed through the standard `authorize({ principal, membership, organization, action, resource, context })` interface:
+All authorization decisions in Oryol Workspace are executed through the standard `authorize({ principal, membership, organization, action, resource, context })` interface.
+
+> [!IMPORTANT]
+> **Server-Resolved Privilege Invariant**:  
+> The `membership` object in `AuthorizationRequest` contains **only structural identifiers and status**. Roles and permissions are resolved **strictly server-side** from `membership_role_assignments`, `role_permissions`, and the active immutable permission registry version. Client-supplied role claims are never accepted or processed.
 
 ```typescript
 export interface AuthorizationRequest {
@@ -20,9 +24,7 @@ export interface AuthorizationRequest {
     id: string;                // mem_<ulid>
     principalId: string;
     organizationId: string;
-    role: string;
     status: 'active' | 'suspended' | 'left';
-    customPermissions?: string[];
   };
   organization: {
     id: string;                // org_<ulid>
@@ -83,17 +85,19 @@ CREATE TABLE role_definitions (
     UNIQUE(organization_id, name)
 );
 
--- 4. Role Permissions Mapping (Flat, Non-Recursive in Phase 1)
+-- 4. Role Permissions Mapping: Structurally Bound to Organization Role and Immutable Registry Version
 CREATE TABLE role_permissions (
     organization_id TEXT NOT NULL,
     role_id TEXT NOT NULL,
+    registry_version INTEGER NOT NULL,
     permission_name TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(organization_id, role_id, permission_name),
-    FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE
+    PRIMARY KEY(organization_id, role_id, registry_version, permission_name),
+    FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (registry_version, permission_name) REFERENCES permission_definitions(registry_version, name) ON DELETE RESTRICT
 );
 
--- 5. Canonical Typed Authorization Subjects for Explicit Deny
+-- 5. Canonical Structurally-Typed Authorization Subjects for Explicit Deny
 CREATE TABLE authorization_subjects (
     id TEXT PRIMARY KEY,                       -- asb_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -104,7 +108,12 @@ CREATE TABLE authorization_subjects (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, team_id) REFERENCES teams(organization_id, id) ON DELETE CASCADE,
-    UNIQUE(organization_id, id)
+    UNIQUE(organization_id, id),
+    CHECK (
+        (subject_type = 'membership' AND membership_id IS NOT NULL AND team_id IS NULL AND principal_id IS NULL) OR
+        (subject_type = 'team' AND team_id IS NOT NULL AND membership_id IS NULL AND principal_id IS NULL) OR
+        (subject_type = 'principal' AND principal_id IS NOT NULL AND membership_id IS NULL AND team_id IS NULL)
+    )
 );
 
 -- 6. Explicit Deny Rules (Precedence over All Grants; Structurally Bound to Organization)
@@ -128,9 +137,13 @@ CREATE TABLE authorization_versions (
 );
 ```
 
-### Permission Registry Version vs. Authorization Version
-- **Permission Registry Version**: The static, immutable schema version of the published permission dictionary/vocabulary supported by the software release.
-- **Authorization Version**: A runtime monotonic integer incremented whenever an organization's memberships, role bindings, or security policies mutate, allowing Edge tokens and high-risk checks to detect stale cached privileges.
+### Active Registry & Migration Semantics
+- **Single Active Registry per Decision**: In Phase 1, each organization's authorization policy resolves against **exactly one active published registry version** compatible with the deployed Core software.
+- **Immutable Vocabulary**: Published `permission_registry_versions` rows are immutable. When new vocabulary is introduced:
+  1. Core publishes a new `permission_registry_versions` record and child `permission_definitions`.
+  2. Organization authorization bindings migrate to the new registry version.
+  3. `authorization_versions` is incremented to invalidate stale cached permissions.
+- **Principal Deny Organization Relevance**: A global principal can only be bound as a `principal`-type authorization subject in an organization if they have an authoritative relationship to that tenant (such as an existing membership or explicit tenant service binding).
 
 ---
 
@@ -178,7 +191,7 @@ Every evaluation executes in strict linear order:
    └─► If matching `explicit_denies` rule exists for subject ──► DENY(EXPLICIT_DENY)
 
 6. Resolve Coarse RBAC Capability
-   └─► Resolve assigned roles for membership from `role_permissions`.
+   └─► Resolve assigned roles for membership from `membership_role_assignments` and `role_permissions`.
    └─► Note: Brokered cross-org grants require the user to hold the coarse capability (e.g. `drive.documents.read`) in their own organization.
    └─► If permission is NOT present in any active role ──► DENY(RBAC_DENIED)
 

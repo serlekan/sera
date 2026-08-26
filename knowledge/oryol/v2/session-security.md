@@ -1,7 +1,7 @@
 # Oryol Session Security & Token Family Architecture v2.2
 
 **Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: CAS Refresh Concurrency, Account-Level Compromise Scope, JWKS Key Rotation & Cookie Transport
+**P0 Remediation**: CAS Refresh Secret Verification, Atomic Successor Chain, Account Compromise Scope, JWKS & __Host- Cookie Standard
 
 ---
 
@@ -38,7 +38,7 @@ CREATE TABLE refresh_tokens (
     token_id TEXT PRIMARY KEY,                 -- rtk_<ulid>
     family_id TEXT NOT NULL REFERENCES refresh_token_families(family_id) ON DELETE CASCADE,
     generation INTEGER NOT NULL,
-    token_hash TEXT NOT NULL,                  -- SHA-256 hash of secret token
+    token_hash TEXT NOT NULL,                  -- SHA-256 hash of secret token S
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'consumed', 'revoked')),
     issued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     consumed_at DATETIME,
@@ -57,12 +57,18 @@ CREATE TABLE principal_security_versions (
 
 ---
 
-## 2. Compare-and-Swap (CAS) Refresh Token Rotation
+## 2. Compare-and-Swap (CAS) Refresh Token Rotation & Atomic Successor
 
 When a client presents a refresh token `rtk_curr` with secret `S`:
 
+```text
+presented_hash = SHA256(S)
+```
+
+The refresh flow executes as a single atomic D1 transaction:
+
 ```sql
--- Step 1: Atomic Compare-and-Swap Consumption
+-- Step 1: Atomic Compare-and-Swap Consumption with Secret Hash Predicate
 UPDATE refresh_tokens
 SET
     status = 'consumed',
@@ -72,17 +78,49 @@ WHERE
     token_id = :token_id
     AND family_id = :family_id
     AND generation = :generation
+    AND token_hash = :presented_hash
+    AND status = 'active';
+
+-- Step 2: Insert Successor Token (Executed in same transaction)
+INSERT INTO refresh_tokens (
+    token_id,
+    family_id,
+    generation,
+    token_hash,
+    status,
+    issued_at,
+    expires_at
+) VALUES (
+    :successor_token_id,
+    :family_id,
+    :generation + 1,
+    :new_token_hash,
+    'active',
+    CURRENT_TIMESTAMP,
+    :expires_at
+);
+
+-- Step 3: Advance Family Generation & Rotate Timestamp (Same transaction)
+UPDATE refresh_token_families
+SET
+    current_generation = :generation + 1,
+    last_rotated_at = CURRENT_TIMESTAMP
+WHERE
+    family_id = :family_id
     AND status = 'active';
 ```
 
 ### Invariants for CAS Rotation:
-1. **Single Rotation Winner**: `affected_rows` **MUST equal 1**. Only one concurrent worker can successfully rotate the generation.
-2. **Replay Trigger on 0 Rows**: If `affected_rows == 0`, reload authoritative token state:
-   - If token status is `'consumed'` or `'revoked'`: **Trigger Account-Level Replay Defense**.
-   - If token hash does not match: **Reject with 401 Unauthorized**.
+1. **Single Rotation Winner**: `affected_rows` in Step 1 **MUST equal 1**. Only one concurrent worker can successfully rotate the generation.
+2. **Replay vs. Invalid Token Classification on `affected_rows == 0`**:
+   If `affected_rows == 0`, the transaction reloads authoritative token state:
+   - **Case A: Hash Mismatch or Nonexistent Token**: Reject with `401 Unauthorized`. Do **NOT** trigger account-wide replay merely because an invalid ID/hash was submitted.
+   - **Case B: Token Already Consumed or Revoked (with valid historical token identity)**: Trigger **Account-Level Replay Defense**.
+   - **Case C: Family Revoked or Inactive**: Reject with `401 Unauthorized` and require authentication per family state.
+3. **Atomic Commit Guarantee**: Old token consumption, successor creation, family generation advancement, and required security audit events **must never partially commit**.
 
 ### Account-Level Replay Defense:
-When token reuse is detected:
+When legitimate token reuse is detected:
 1. Mark `refresh_token_families.status = 'revoked'` (`revocation_reason = 'token_reuse_detected'`).
 2. Mark all active `account_sessions` for that principal as `'revoked'`.
 3. Increment `principal_security_versions.security_version` in D1.
@@ -146,9 +184,15 @@ A refresh token alone can **never** mint an access token into a membership that 
 
 ---
 
-## 6. Browser Cookie Transport & CSRF Protection
+## 6. Browser Cookie Transport (`__Host-` Standard) & CSRF Protection
 
-- **Refresh Cookie**: `__Host-Oryol-Refresh` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/v1/auth`).
+Per RFC 6265bis, any cookie using the `__Host-` prefix MUST be sent with `Secure`, `Path=/`, and **MUST NOT contain a `Domain` attribute**:
+
+```http
+Set-Cookie: __Host-Oryol-Refresh=<secret_token>; HttpOnly; Secure; SameSite=Strict; Path=/
+```
+
+- **Path Scoping**: Path authorization is enforced by server endpoint logic (e.g. `/v1/auth/refresh`), not by invalid cookie `Path` parameters.
 - **CSRF Mitigation**:
   - API endpoints enforce custom header verification: `X-Oryol-Request: true`.
   - Mutating cookie-authenticated endpoints validate double-submit anti-CSRF tokens.

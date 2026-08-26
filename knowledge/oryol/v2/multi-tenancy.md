@@ -68,7 +68,19 @@ CREATE TABLE role_definitions (
     UNIQUE(organization_id, name)
 );
 
--- 6. Membership Role Assignments: Structurally Bound to Organization & Organization-Scoped Role
+-- 6. Role Permissions Mapping: Bound to Organization Role & Immutable Registry Version
+CREATE TABLE role_permissions (
+    organization_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    registry_version INTEGER NOT NULL,
+    permission_name TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(organization_id, role_id, registry_version, permission_name),
+    FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (registry_version, permission_name) REFERENCES permission_definitions(registry_version, name) ON DELETE RESTRICT
+);
+
+-- 7. Membership Role Assignments: Structurally Bound to Organization & Organization-Scoped Role
 CREATE TABLE membership_role_assignments (
     id TEXT PRIMARY KEY,                       -- mra_<ulid>
     organization_id TEXT NOT NULL,
@@ -80,7 +92,7 @@ CREATE TABLE membership_role_assignments (
     UNIQUE(organization_id, membership_id, role_id)
 );
 
--- 7. Invitations: Structurally Bound to Organization & Organization-Scoped Role
+-- 8. Invitations: Structurally Bound to Organization & Organization-Scoped Role
 CREATE TABLE invitations (
     id TEXT PRIMARY KEY,                       -- inv_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
