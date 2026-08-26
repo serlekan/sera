@@ -5,7 +5,7 @@
 **Date**: 2026-08-26  
 **Ecosystem**: Oryol Workspace Platform (`serlekan/serlekan-sera`, `serlekan/oryol-mail`, `serlekan/oryol-core`)  
 **SERA Governance Version**: `0.4.2`  
-**Expected Pinned Baseline SHA**: `55547cc65d788c79e55fd8d2ec0964e3e4c1f5de`  
+**Architecture Specification Commit**: `c7017e7ace44466e19ad849240aceb8a72076b1c`  
 
 ---
 

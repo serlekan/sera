@@ -664,7 +664,7 @@ ORYOL_REQUIRED_POLICY_FILES = (
 
 SERA_GOVERNANCE_VERSION = "0.4.2"
 ORYOL_ARCHITECTURE_BASELINE_VERSION = "2.2"
-ORYOL_GOVERNANCE_PINNED_SHA = "55547cc65d788c79e55fd8d2ec0964e3e4c1f5de"
+ORYOL_ARCHITECTURE_SPEC_SHA = "c7017e7ace44466e19ad849240aceb8a72076b1c"
 
 
 def state_path(root: Path) -> Path:
@@ -2292,7 +2292,7 @@ def generate_packet(
         route_lines.extend([
             f"- SERA governance version: `{SERA_GOVERNANCE_VERSION}`",
             f"- Architecture baseline version: `{ORYOL_ARCHITECTURE_BASELINE_VERSION}`",
-            f"- Pinned baseline commit: `{ORYOL_GOVERNANCE_PINNED_SHA}`",
+            f"- Architecture specification commit: `{ORYOL_ARCHITECTURE_SPEC_SHA}`",
         ])
     context_lines: list[str] = []
     if selected_context:

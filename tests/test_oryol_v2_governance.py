@@ -17,7 +17,7 @@ if str(SRC_DIR) not in sys.path:
 
 from sera.core import (
     ORYOL_ARCHITECTURE_BASELINE_VERSION,
-    ORYOL_GOVERNANCE_PINNED_SHA,
+    ORYOL_ARCHITECTURE_SPEC_SHA,
     ORYOL_REQUIRED_POLICY_FILES,
     SERA_GOVERNANCE_VERSION,
     SeraError,
@@ -39,12 +39,15 @@ def run_git(root: Path, *args: str) -> str:
 
 
 class TestOryolV2CorpusIntegrity(unittest.TestCase):
-    """Scan the entire canonical Architecture v2.2 corpus for prohibited stale terms and contradictions."""
+    """Verify that all Oryol v2.2 canonical architecture and governance documents exist and are structurally valid."""
 
     @classmethod
     def setUpClass(cls):
         cls.root = Path(__file__).resolve().parent.parent
         cls.knowledge_v2 = cls.root / "knowledge" / "oryol" / "v2"
+
+    def test_v2_knowledge_directory_exists(self):
+        self.assertTrue(self.knowledge_v2.is_dir(), "knowledge/oryol/v2 directory must exist")
 
     def test_all_13_canonical_v2_documents_exist(self):
         expected_docs = [
@@ -72,6 +75,25 @@ class TestOryolV2CorpusIntegrity(unittest.TestCase):
                 "CANONICAL ARCHITECTURE BASELINE (v2.2)" in content or "CANDIDATE FOR FINAL IMPLEMENTATION REVIEW" in content,
                 f"Document {doc_name} missing canonical v2.2 header"
             )
+
+    def test_v1_documents_marked_superseded(self):
+        knowledge_v1 = self.root / "knowledge" / "oryol"
+        v1_docs = [
+            "workspace.md",
+            "identity.md",
+            "security.md",
+            "data-model.md",
+            "ai-principles.md",
+            "backend.md",
+            "oryol-core-architecture.md",
+            "oryol-core-implementation-roadmap.md",
+            "oryol-core-phase1-specification.md",
+        ]
+        for doc_name in v1_docs:
+            doc_path = knowledge_v1 / doc_name
+            if doc_path.is_file():
+                content = doc_path.read_text(encoding="utf-8")
+                self.assertIn("SUPERSEDED", content, f"v1 document {doc_name} must be marked SUPERSEDED")
 
     def test_corpus_contradiction_scan_no_stale_patterns(self):
         """Scans all v2 files for prohibited stale patterns identified during GPT reviews."""
@@ -126,6 +148,65 @@ class TestOryolV2CorpusIntegrity(unittest.TestCase):
                     f"Direct product DB query pattern found in {filename}"
                 )
 
+    def test_identity_v2_2_contains_principal_model(self):
+        identity_doc = (self.knowledge_v2 / "identity-model.md").read_text(encoding="utf-8")
+        self.assertIn("Principal", identity_doc)
+        self.assertIn("Human Principal", identity_doc)
+        self.assertIn("Service Principal", identity_doc)
+        self.assertIn("principals", identity_doc)
+        self.assertIn("service_accounts", identity_doc)
+        self.assertIn("identity_provider_bindings", identity_doc)
+        self.assertIn("recovery_methods", identity_doc)
+        self.assertIn("last-owner protection", identity_doc.lower())
+
+    def test_multi_tenancy_v2_2_structural_isolation(self):
+        mt_doc = (self.knowledge_v2 / "multi-tenancy.md").read_text(encoding="utf-8")
+        self.assertIn("team_memberships", mt_doc)
+        self.assertIn("membership_role_assignments", mt_doc)
+        self.assertIn("resource_grants", mt_doc)
+        self.assertIn("cross_org_grants", mt_doc)
+        self.assertIn("organization_placement", mt_doc)
+        self.assertIn("FOREIGN KEY (organization_id, team_id)", mt_doc)
+
+    def test_authorization_algebra_v2_2(self):
+        auth_doc = (self.knowledge_v2 / "authorization-model.md").read_text(encoding="utf-8")
+        self.assertIn("authorize({ principal, membership, organization, action, resource, context })", auth_doc)
+        self.assertIn("Mandatory 8-Step Evaluation Algebra", auth_doc)
+        self.assertIn("permission_definitions", auth_doc)
+        self.assertIn("role_definitions", auth_doc)
+        self.assertIn("explicit_denies", auth_doc)
+        self.assertIn("authorization_versions", auth_doc)
+
+    def test_session_security_v2_2_state_machine(self):
+        session_doc = (self.knowledge_v2 / "session-security.md").read_text(encoding="utf-8")
+        self.assertIn("account_sessions", session_doc)
+        self.assertIn("refresh_token_families", session_doc)
+        self.assertIn("refresh_tokens", session_doc)
+        self.assertIn("successor_token_id", session_doc)
+        self.assertIn("step_up_proofs", session_doc)
+        self.assertIn("Protected JOSE Header", session_doc)
+
+    def test_audit_and_events_v2_2_defines_outbox_and_inbox(self):
+        audit_doc = (self.knowledge_v2 / "audit-and-events.md").read_text(encoding="utf-8")
+        self.assertIn("outbox_events", audit_doc)
+        self.assertIn("inbox_events", audit_doc)
+        self.assertIn("audit_events", audit_doc)
+        self.assertIn("lease_owner", audit_doc)
+        self.assertIn("idempotency_key", audit_doc)
+        self.assertIn("aggregate_version", audit_doc)
+
+    def test_data_lifecycle_v2_2_deletion_pipeline(self):
+        lifecycle_doc = (self.knowledge_v2 / "data-lifecycle.md").read_text(encoding="utf-8")
+        self.assertIn("D1 Time Travel", lifecycle_doc)
+        self.assertIn("Physical Purge", lifecycle_doc)
+        self.assertIn("soft_deleted", lifecycle_doc)
+
+    def test_virel_domain_ownership_v2_2(self):
+        ws_doc = (self.knowledge_v2 / "workspace-architecture.md").read_text(encoding="utf-8")
+        self.assertIn("Virel", ws_doc)
+        self.assertIn("Wallets", ws_doc)
+        self.assertIn("invoices", ws_doc.lower())
+
 
 class TestOryolFailClosedGovernance(unittest.TestCase):
     """Prove fail-closed policy enforcement under all negative conditions including missing .sera."""
@@ -177,7 +258,6 @@ class TestOryolFailClosedGovernance(unittest.TestCase):
         (sera_dir / "context.md").write_text("# Context\n", encoding="utf-8")
         (sera_dir / "review-rules.md").write_text("# Rules\n", encoding="utf-8")
         (sera_dir / "verification.md").write_text("# Verif\n", encoding="utf-8")
-        # architecture.md is missing!
 
         with self.assertRaises(SeraError) as ctx:
             load_config(self.repo)
@@ -189,7 +269,7 @@ class TestOryolFailClosedGovernance(unittest.TestCase):
         sera_dir.mkdir(parents=True)
         (sera_dir / "config.json").write_text(json.dumps({"schema_version": 1, "verification": ["npm test"]}), encoding="utf-8")
         (sera_dir / "context.md").write_text("# Context\n", encoding="utf-8")
-        (sera_dir / "architecture.md").write_text("   \n\n  ", encoding="utf-8")  # Empty!
+        (sera_dir / "architecture.md").write_text("   \n\n  ", encoding="utf-8")
         (sera_dir / "review-rules.md").write_text("# Rules\n", encoding="utf-8")
         (sera_dir / "verification.md").write_text("# Verif\n", encoding="utf-8")
 
@@ -230,7 +310,6 @@ class TestOryolFailClosedGovernance(unittest.TestCase):
         loaded = load_config(self.repo)
         self.assertEqual(loaded["verification"], ["npm run typecheck", "npm test"])
 
-        # Generate build packet
         task_dir = new_task(
             self.repo,
             name="Valid Task",
@@ -243,15 +322,51 @@ class TestOryolFailClosedGovernance(unittest.TestCase):
         self.assertIn("Invariant: Compound tenant keys", b_text)
         self.assertIn("## Repository context", b_text)
         self.assertIn("Tech stack: TypeScript", b_text)
-        self.assertIn("SERA governance version: `0.4.2`", b_text)
-        self.assertIn("Architecture baseline version: `2.2`", b_text)
 
-        # Generate review packet
         (self.repo / "src" / "index.ts").write_text("console.log('modified');", encoding="utf-8")
         r_path, r_text = generate_packet(self.repo, task_dir, "review")
         self.assertIn("## Repository review policy", r_text)
         self.assertIn("Checklist: 100% test pass", r_text)
         self.assertIn("## Repository architecture policy", r_text)
+
+    def test_builder_and_reviewer_packets_contain_exact_v2_2_provenance(self):
+        """Verify that both builder and reviewer packets embed Architecture v2.2 and exact specification commit SHA."""
+        sera_dir = self.repo / ".sera"
+        sera_dir.mkdir(parents=True)
+        config = {
+            "schema_version": 1,
+            "verification": ["npm test"],
+            "risk_policy": {
+                "high_risk_terms": ["oryol"],
+                "high_risk_paths": ["src/index.ts"],
+            },
+        }
+        (sera_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        (sera_dir / "context.md").write_text("# Context\n", encoding="utf-8")
+        (sera_dir / "architecture.md").write_text("# Architecture\n", encoding="utf-8")
+        (sera_dir / "review-rules.md").write_text("# Rules\n", encoding="utf-8")
+        (sera_dir / "verification.md").write_text("# Verification\n", encoding="utf-8")
+
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-m", "Provenance test repo")
+
+        task_dir = new_task(
+            self.repo,
+            name="Provenance Task",
+            objective="Test provenance embedding",
+            allowed_files=["src/index.ts"],
+            verification=["npm test"],
+        )
+        _, build_text = generate_packet(self.repo, task_dir, "build")
+        self.assertIn(f"SERA governance version: `{SERA_GOVERNANCE_VERSION}`", build_text)
+        self.assertIn(f"Architecture baseline version: `{ORYOL_ARCHITECTURE_BASELINE_VERSION}`", build_text)
+        self.assertIn(f"Architecture specification commit: `{ORYOL_ARCHITECTURE_SPEC_SHA}`", build_text)
+
+        (self.repo / "src" / "index.ts").write_text("console.log('reviewed');", encoding="utf-8")
+        _, review_text = generate_packet(self.repo, task_dir, "review")
+        self.assertIn(f"SERA governance version: `{SERA_GOVERNANCE_VERSION}`", review_text)
+        self.assertIn(f"Architecture baseline version: `{ORYOL_ARCHITECTURE_BASELINE_VERSION}`", review_text)
+        self.assertIn(f"Architecture specification commit: `{ORYOL_ARCHITECTURE_SPEC_SHA}`", review_text)
 
 
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):
