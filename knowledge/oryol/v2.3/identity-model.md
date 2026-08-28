@@ -1,7 +1,7 @@
 # Oryol Identity Architecture v2.3 — Canonical Principal Model
 
 **Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
-**Revision Scope**: Service Principal Role Assignments Integration (ADR-002)
+**Revision Scope**: Service Principal Role Assignments Integration (ADR-002) & Database-Enforced Taxonomy (F-8)
 
 ---
 
@@ -11,8 +11,8 @@ In Oryol Workspace, the identity layer enforces a strict top-level abstraction:
 
 ```text
 Principal (prn_<ulid>)
-├── Human Principal (`type = 'human'`)   ──► Bound to organizations via `memberships` & `membership_role_assignments`
-└── Service Principal (`type = 'service'`) ──► Bound to organizations via `organization_service_principals` & `service_principal_role_assignments`
+├── Human Principal (`type = 'human'`)   ──► Backed by `users` record; bound to organizations via `memberships` & `membership_role_assignments`
+└── Service Principal (`type = 'service'`) ──► Backed by `service_accounts` record; bound to organizations via `organization_service_principals` & `service_principal_role_assignments`
 ```
 
 > [!IMPORTANT]
@@ -111,7 +111,22 @@ CREATE TABLE api_credentials (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 8. Organization Service Principals: Explicit Tenant-Bound Service Accounts
+-- 8. Organization Invitations (Restored — F-9)
+CREATE TABLE invitations (
+    id TEXT PRIMARY KEY,                       -- inv_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    inviter_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    token_hash TEXT NOT NULL,                  -- SHA-256 hash of random invite token
+    role_id TEXT NOT NULL REFERENCES role_definitions(id) ON DELETE RESTRICT,
+    member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest')),
+    expires_at DATETIME NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, email, status)
+);
+
+-- 9. Organization Service Principals: Explicit Tenant-Bound Service Accounts
 CREATE TABLE organization_service_principals (
     id TEXT PRIMARY KEY,                       -- osp_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -123,7 +138,7 @@ CREATE TABLE organization_service_principals (
     UNIQUE(organization_id, id)
 );
 
--- 9. Service Principal Role Assignments (ADR-002)
+-- 10. Service Principal Role Assignments (ADR-002)
 CREATE TABLE service_principal_role_assignments (
     id TEXT PRIMARY KEY,                       -- sra_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -149,5 +164,5 @@ CREATE TABLE service_principal_role_assignments (
    Passkey/WebAuthn is the primary passwordless standard. Security questions are restricted to secondary/tier-2 recovery verification and are **never** permitted as a standalone primary recovery factor.
 3. **Enterprise IdP Uniqueness**:
    IdP subject bindings enforce global uniqueness across `(provider_type, provider_issuer, provider_subject)` to prevent tenant-spoofing across multi-tenant IdPs.
-4. **Service Principal Role Confinement**:
-   Service principals receive permissions strictly through `service_principal_role_assignments` evaluated against the active registry version. Human memberships and service principals are strictly segregated.
+4. **Service Principal Role Confinement & Taxonomy**:
+   Service principals receive permissions strictly through `service_principal_role_assignments` evaluated against the active registry version. Human memberships and service principals are strictly segregated in the schema.

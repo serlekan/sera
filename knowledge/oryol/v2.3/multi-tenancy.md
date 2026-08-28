@@ -1,7 +1,7 @@
 # Oryol Multi-Tenancy & Structural Isolation Architecture v2.3
 
 **Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
-**Revision Scope**: Core Security Policies (ADR-001) & Service Principal Role Assignments (ADR-002)
+**Revision Scope**: Core Security Policies (ADR-001), Service Principal Role Assignments (ADR-002), Immutable Role Templates (F-6) & Principal Taxonomy Triggers (F-8)
 
 ---
 
@@ -31,6 +31,14 @@ CREATE TABLE memberships (
     UNIQUE(organization_id, id),
     UNIQUE(organization_id, principal_id)
 );
+
+-- Database-Enforced Human Principal Taxonomy Trigger (F-8)
+CREATE TRIGGER trg_memberships_human_principal_check BEFORE INSERT ON memberships
+BEGIN
+    SELECT RAISE(FAIL, 'MEMBERSHIP_PRINCIPAL_TYPE_INVALID: memberships may only bind human principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'human';
+END;
 
 -- 3. Teams with Compound Organization Key
 CREATE TABLE teams (
@@ -66,17 +74,23 @@ CREATE TABLE organization_permission_registries (
     FOREIGN KEY (organization_id, activated_by_membership_id) REFERENCES memberships(organization_id, id)
 );
 
--- 6. Role Definitions: Organization-Scoped Custom Roles & Immutable System Role Templates
+-- 6. Role Definitions: Organization-Scoped with Immutable System Templates (F-6)
 CREATE TABLE role_definitions (
     id TEXT PRIMARY KEY,                       -- rol_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name TEXT NOT NULL,                        -- e.g. 'Billing Auditor', 'Support Lead'
     description TEXT NOT NULL,
     is_system_template BOOLEAN NOT NULL DEFAULT FALSE,
+    template_key TEXT CHECK(template_key IN ('owner', 'admin', 'member') OR template_key IS NULL),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(organization_id, id),
     UNIQUE(organization_id, name)
 );
+
+CREATE TRIGGER trg_role_definitions_immutable_template BEFORE UPDATE OF is_system_template, template_key ON role_definitions
+BEGIN
+    SELECT RAISE(FAIL, 'ROLE_TEMPLATE_IMMUTABLE: cannot modify system template designation');
+END;
 
 -- 7. Role Permissions Mapping: Bound to Organization Role & Immutable Registry Version
 CREATE TABLE role_permissions (
@@ -112,7 +126,7 @@ CREATE TABLE service_principal_role_assignments (
     FOREIGN KEY (organization_id, organization_service_principal_id)
         REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, role_id)
-        REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+        REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     UNIQUE(organization_id, organization_service_principal_id, role_id),
     UNIQUE(organization_id, id)
 );
@@ -143,6 +157,14 @@ CREATE TABLE organization_service_principals (
     UNIQUE(organization_id, principal_id),
     UNIQUE(organization_id, id)
 );
+
+-- Database-Enforced Service Principal Taxonomy Trigger (F-8)
+CREATE TRIGGER trg_osp_service_principal_check BEFORE INSERT ON organization_service_principals
+BEGIN
+    SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'service';
+END;
 
 -- 12. Canonical Structurally-Typed Authorization Subjects for Explicit Deny
 CREATE TABLE authorization_subjects (
@@ -221,6 +243,7 @@ CREATE TABLE organization_security_policies (
     organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
     mfa_enforcement TEXT NOT NULL DEFAULT 'optional' CHECK(mfa_enforcement IN ('optional', 'required_all', 'required_admins')),
     ip_allowlist_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(ip_allowlist_mode IN ('disabled', 'enforced_all', 'enforced_admins')),
+    allow_internal_dispatch BOOLEAN NOT NULL DEFAULT TRUE,
     device_posture_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(device_posture_mode IN ('disabled', 'compliant_only', 'managed_only')),
     session_idle_timeout_seconds INTEGER NOT NULL DEFAULT 86400 CHECK(session_idle_timeout_seconds >= 300),
     session_absolute_timeout_seconds INTEGER NOT NULL DEFAULT 604800 CHECK(session_absolute_timeout_seconds >= 3600),
@@ -274,6 +297,11 @@ CREATE TABLE cross_org_grants (
     FOREIGN KEY (source_organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id)
 );
 ```
+
+### Invariants for Brokered Grants (Restored — F-9):
+1. **Authoritative Membership Resolution**: Principal identities are derived directly from the authoritative `source_membership_id` and `target_membership_id`.
+2. **Resource Ownership Proof**: The resource must be proven to belong to `source_organization_id` via `resource_registry(source_organization_id, resource_type, resource_id)`.
+3. **No Coarse Capability Creation**: A cross-org grant satisfies the tenant-alignment exception and resource-level grant, but does **not** manufacture missing coarse permissions (the target user must already hold an active capability such as `drive.documents.read` in their organization).
 
 ---
 

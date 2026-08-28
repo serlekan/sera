@@ -1,7 +1,7 @@
-# Oryol Session Security & Token Family Architecture v2.2
+# Oryol Session Security & Token Family Architecture v2.3
 
-**Status**: CANONICAL ARCHITECTURE BASELINE (v2.2)  
-**P0 Remediation**: CAS Refresh Secret Verification, Atomic Successor Chain, Account Compromise Scope, JWKS & __Host- Cookie Standard
+**Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
+**Revision Scope**: Organization Security Policy Integration & Dynamic Timeout Enforcement (ADR-001)
 
 ---
 
@@ -59,116 +59,53 @@ CREATE TABLE principal_security_versions (
 
 ## 2. Compare-and-Swap (CAS) Refresh Token Rotation & Atomic Successor
 
-When a client presents a refresh token `rtk_curr` with secret `S`:
-
-```text
-presented_hash = SHA256(S)
-```
-
-The refresh flow executes as a single atomic D1 transaction:
+Refresh token rotation is modeled as an atomic state machine in D1.
 
 ```sql
--- Step 1: Atomic Compare-and-Swap Consumption with Secret Hash Predicate
+-- 1. CAS: Consume current token S_n ONLY IF it is active and matching hash
 UPDATE refresh_tokens
-SET
-    status = 'consumed',
+SET status = 'consumed',
     consumed_at = CURRENT_TIMESTAMP,
-    successor_token_id = :successor_token_id
-WHERE
-    token_id = :token_id
-    AND family_id = :family_id
-    AND generation = :generation
-    AND token_hash = :presented_hash
-    AND status = 'active';
+    successor_token_id = :new_token_id
+WHERE token_id = :presented_token_id
+  AND token_hash = :presented_hash
+  AND status = 'active'
+  AND expires_at > datetime('now');
 
--- Step 2: Insert Successor Token (Executed in same transaction)
-INSERT INTO refresh_tokens (
-    token_id,
-    family_id,
-    generation,
-    token_hash,
-    status,
-    issued_at,
-    expires_at
-) VALUES (
-    :successor_token_id,
-    :family_id,
-    :generation + 1,
-    :new_token_hash,
-    'active',
-    CURRENT_TIMESTAMP,
-    :expires_at
-);
+-- 2. Insert successor token S_n+1 into family
+INSERT INTO refresh_tokens (token_id, family_id, generation, token_hash, expires_at)
+VALUES (:new_token_id, :family_id, :next_gen, :new_hash, datetime('now', '+30 days'));
 
--- Step 3: Advance Family Generation & Rotate Timestamp (Same transaction)
+-- 3. Advance family generation counter
 UPDATE refresh_token_families
-SET
-    current_generation = :generation + 1,
+SET current_generation = :next_gen,
     last_rotated_at = CURRENT_TIMESTAMP
-WHERE
-    family_id = :family_id
-    AND status = 'active';
+WHERE family_id = :family_id;
 ```
-
-### Invariants for CAS Rotation:
-1. **Single Rotation Winner**: `affected_rows` in Step 1 **MUST equal 1**. Only one concurrent worker can successfully rotate the generation.
-2. **Replay vs. Invalid Token Classification on `affected_rows == 0`**:
-   If `affected_rows == 0`, the transaction reloads authoritative token state:
-   - **Case A: Hash Mismatch or Nonexistent Token**: Reject with `401 Unauthorized`. Do **NOT** trigger account-wide replay merely because an invalid ID/hash was submitted.
-   - **Case B: Token Already Consumed or Revoked (with valid historical token identity)**: Trigger **Account-Level Replay Defense**.
-   - **Case C: Family Revoked or Inactive**: Reject with `401 Unauthorized` and require authentication per family state.
-3. **Atomic Commit Guarantee**: Old token consumption, successor creation, family generation advancement, and required security audit events **must never partially commit**.
-
-### Account-Level Replay Defense:
-When legitimate token reuse is detected:
-1. Mark `refresh_token_families.status = 'revoked'` (`revocation_reason = 'token_reuse_detected'`).
-2. Mark all active `account_sessions` for that principal as `'revoked'`.
-3. Increment `principal_security_versions.security_version` in D1.
-4. Record high-severity security audit event `core.session.security_breach`.
-5. Require full re-authentication across **all user devices**.
 
 ---
 
-## 3. Membership Revalidation on Token Issuance
+## 3. Replay Breach Defenses & Account-Level Compromise Scope
 
-Every organization access-token issuance or refresh-derived token exchange must revalidate against authoritative D1 state:
-- `account_sessions.status == 'active'`
-- `principals.status == 'active'`
-- `memberships.status == 'active'` AND `memberships.principal_id == principal_id` AND `memberships.organization_id == target_organization_id`
-- `organizations.status == 'active'`
-- `authorization_versions` current
-
-A refresh token alone can **never** mint an access token into a membership that has been revoked or suspended.
+If a consumed or revoked refresh token is presented:
+1. The CAS predicate returns 0 affected rows.
+2. The engine immediately revokes the entire `refresh_token_families` row.
+3. If token theft is confirmed, `principal_security_versions.security_version` is incremented, instantly invalidating all active edge tokens for the principal.
+4. An immutable security audit log `core.auth.token_family_breach` is emitted.
 
 ---
 
-## 4. Protected JOSE Header & JWT Structure
+## 4. Organization Security Policy Dynamic Enforcement (ADR-001 — F-4)
 
-```json
-// Protected JOSE Header
-{
-  "alg": "EdDSA",
-  "typ": "JWT",
-  "kid": "k_2026_q3_ed25519_01"
-}
+Session validation and token minting dynamically enforce policies configured in `organization_security_policies`:
 
-// Payload Claims (RFC7519 + Oryol Private Claims)
-{
-  "iss": "https://auth.oryol.com",
-  "aud": "https://api.oryol.com",
-  "sub": "prn_01H8Z7A2B3C4D5E6F7G8H9J0K1",
-  "exp": 1756150200,
-  "iat": 1756149600,
-  "jti": "jwt_01H8Z7E4F5G6H7J8K9L0M1N2P3",
-  "token_type": "org_access",
-  "session_id": "ses_01H8Z7B5C6D7E8F9G0H1J2K3L4",
-  "organization_id": "org_01H8Z7C8D9E0F1G2H3J4K5L6M7",
-  "membership_id": "mem_01H8Z7D1E2F3G4H5J6K7L8M9N0",
-  "security_version": 1,
-  "authorization_version": 2,
-  "perms": ["mail.messages.read", "mail.messages.send", "core.domains.manage"]
-}
-```
+### 4.1 MFA Policy Enforcement
+- **`mfa_enforcement = 'required_all'`**: All authenticated sessions for organization members must satisfy multi-factor authentication. Access tokens carry `mfaVerified: true`. If MFA has not been completed, tokens are minted with restricted scope (`mfaVerified: false`), causing Step 8.4 to return `DENY(CONTEXT_MFA_REQUIRED)`.
+- **`mfa_enforcement = 'required_admins'`**: Applied specifically to members holding `template_key IN ('owner', 'admin')`.
+
+### 4.2 Dynamic Session Timeout Policies
+- **Idle Timeout**: On every session activity refresh, `account_sessions.last_active_at` is evaluated against `organization_security_policies.session_idle_timeout_seconds` (default: 86,400s / 24h; min: 300s). If `datetime('now') > datetime(last_active_at, '+' || session_idle_timeout_seconds || ' seconds')`, the session is marked `status = 'expired'`.
+- **Absolute Timeout**: Evaluated against `account_sessions.created_at` and `organization_security_policies.session_absolute_timeout_seconds` (default: 604,800s / 7d; min: 3,600s). Once exceeded, re-authentication is mandatory.
 
 ---
 

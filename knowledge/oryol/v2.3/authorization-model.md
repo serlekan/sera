@@ -1,7 +1,7 @@
 # Oryol Authorization Policy Algebra v2.3
 
 **Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
-**Revision Scope**: Step 8 Core Security Policy & Device Posture (ADR-001); Service Principal RBAC (ADR-002)
+**Revision Scope**: Step 8 Core Security Policy, IP CIDR Normalization & Device Posture (ADR-001); Service Principal RBAC, Immutable Role Templates & Escalation Ceiling (ADR-002)
 
 ---
 
@@ -17,14 +17,15 @@ All authorization decisions in Oryol Workspace are executed through the standard
 export interface TrustedDevicePosture {
   state: 'compliant' | 'managed' | 'non_compliant' | 'unknown';
   source: 'cloudflare_zero_trust' | 'managed_client_cert' | 'unverified';
-  verifiedAt: string; // ISO-8601 UTC timestamp of edge attestation
+  verifiedAt: string; // ISO-8601 UTC timestamp of edge attestation (max age <= 300s)
 }
 
 export interface AuthorizationContext {
-  ipAddress: string;                   // Derived from Cloudflare CF-Connecting-IP, never client headers
-  clientType?: 'web' | 'mobile' | 'api' | 'automation';
+  ipAddress: string;                   // Derived from Cloudflare CF-Connecting-IP, or 'internal:worker_runtime'
+  clientType: 'web' | 'mobile' | 'api' | 'automation' | 'internal_execution';
   timestamp: string;                   // ISO-8601 UTC from Worker runtime clock
-  tokenAuthorizationVersion?: number;  // From cryptographically verified JWT claim
+  tokenAuthorizationVersion: number;   // Required: From cryptographically verified JWT claim or session
+  mfaVerified?: boolean;               // True if authenticated session satisfies MFA requirements
   devicePosture?: TrustedDevicePosture;
 }
 
@@ -118,17 +119,23 @@ CREATE TABLE organization_permission_registries (
     FOREIGN KEY (organization_id, activated_by_membership_id) REFERENCES memberships(organization_id, id)
 );
 
--- 4. Role Definitions: Organization-Scoped with System Templates
+-- 4. Role Definitions: Organization-Scoped with Immutable System Templates (F-6)
 CREATE TABLE role_definitions (
     id TEXT PRIMARY KEY,                       -- rol_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name TEXT NOT NULL,                        -- 'Owner', 'Admin', 'Member', 'CustomRole'
     description TEXT NOT NULL,
     is_system_template BOOLEAN NOT NULL DEFAULT FALSE,
+    template_key TEXT CHECK(template_key IN ('owner', 'admin', 'member') OR template_key IS NULL),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(organization_id, id),
     UNIQUE(organization_id, name)
 );
+
+CREATE TRIGGER trg_role_definitions_immutable_template BEFORE UPDATE OF is_system_template, template_key ON role_definitions
+BEGIN
+    SELECT RAISE(FAIL, 'ROLE_TEMPLATE_IMMUTABLE: cannot modify system template designation');
+END;
 
 -- 5. Role Permissions Mapping
 CREATE TABLE role_permissions (
@@ -150,7 +157,7 @@ CREATE TABLE membership_role_assignments (
     role_id TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     UNIQUE(organization_id, membership_id, role_id),
     UNIQUE(organization_id, id)
 );
@@ -177,7 +184,7 @@ CREATE TABLE service_principal_role_assignments (
     FOREIGN KEY (organization_id, organization_service_principal_id)
         REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, role_id)
-        REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+        REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     UNIQUE(organization_id, organization_service_principal_id, role_id),
     UNIQUE(organization_id, id)
 );
@@ -227,6 +234,7 @@ CREATE TABLE organization_security_policies (
     organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
     mfa_enforcement TEXT NOT NULL DEFAULT 'optional' CHECK(mfa_enforcement IN ('optional', 'required_all', 'required_admins')),
     ip_allowlist_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(ip_allowlist_mode IN ('disabled', 'enforced_all', 'enforced_admins')),
+    allow_internal_dispatch BOOLEAN NOT NULL DEFAULT TRUE,
     device_posture_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(device_posture_mode IN ('disabled', 'compliant_only', 'managed_only')),
     session_idle_timeout_seconds INTEGER NOT NULL DEFAULT 86400 CHECK(session_idle_timeout_seconds >= 300),
     session_absolute_timeout_seconds INTEGER NOT NULL DEFAULT 604800 CHECK(session_absolute_timeout_seconds >= 3600),
@@ -268,6 +276,10 @@ CREATE TABLE organization_ip_allowlist_entries (
 3. Transaction atomically switches `organization_permission_registries.registry_version` and increments `authorization_versions`.
 4. Stale edge access tokens are rejected at high-risk endpoints or refresh cycles according to policy.
 
+### 3.3 Exact Phase 1 Deny Subject Scoping (Restored — F-9)
+- **Human Principals**: Organization-level explicit deny is modeled **exclusively through `membership` subjects**. Direct global-principal deny subjects for humans are prohibited.
+- **Service Principals**: Explicitly bound via `organization_service_principals`. No unconstrained global principal can ever be inserted as a tenant deny subject.
+
 ---
 
 ## 4. Service-to-Application Entitlement Mapping
@@ -308,9 +320,10 @@ Every evaluation executes in strict linear order:
    └─► If action.service == 'core': PROCEED (Always entitled for active org)
    └─► If mapped application_id NOT IN organization.entitledApps ──► DENY(APP_NOT_ENTITLED)
 
-4. Resource Tenant Alignment & Brokered Grants
+4. Resource Tenant Alignment & Brokered Grants (F-10.d)
    └─► If resource.organizationId == organization.id: PROCEED
    └─► If resource.organizationId != organization.id:
+         └─► If principal.type == 'service': DENY(CROSS_TENANT_VIOLATION) [Service principal cross-org grants deferred to Phase 2]
          └─► Query authoritative `cross_org_grants` for (source_org=resource.organizationId, target_membership=membership.id, resource, permission).
          └─► Validate source organization active, source principal active, source membership active, and no broker explicit deny.
          └─► If valid grant found: PROCEED to Step 5 (tenant exception satisfied).
@@ -321,7 +334,10 @@ Every evaluation executes in strict linear order:
    └─► If matching deny rule found ──► DENY(EXPLICIT_DENY)
 
 6. Resolve Coarse RBAC Capability (ADR-002)
-   └─► Query `organization_permission_registries` for active `registry_version` (prv.status = 'active').
+   └─► Query `organization_permission_registries` for active `registry_version`.
+   └─► If no registry bound ──► DENY(REGISTRY_NOT_BOUND)
+   └─► If bound registry status != 'active' ──► DENY(REGISTRY_DEPRECATED)
+   └─► If action does not exist in permission_definitions ──► DENY(PERMISSION_UNKNOWN)
    └─► If principal.type == 'human':
          └─► Resolve assigned roles from `membership_role_assignments` and `role_permissions` WHERE `registry_version == active_registry_version`.
    └─► If principal.type == 'service':
@@ -331,7 +347,7 @@ Every evaluation executes in strict linear order:
 
 7. Resolve Fine-Grained Resource ACL / ReBAC Grant
    └─► If action is organization-level or resource is unowned ──► ALLOW(ALLOW_ROLE)
-   └─► If caller holds system template Admin/Owner role (is_system_template = 1) ──► ALLOW(ALLOW_ROLE)
+   └─► If caller holds system template Admin/Owner role (rd.template_key IN ('owner', 'admin')) ──► ALLOW(ALLOW_ROLE)
    └─► If caller is resource owner ──► ALLOW(ALLOW_ROLE)
    └─► If matching `resource_grants` row exists ──► ALLOW(ALLOW_RESOURCE_GRANT)
    └─► If valid `delegated_authority` exists from grantor with resource authority (depth = 1) ──► ALLOW(ALLOW_DELEGATION)
@@ -339,15 +355,30 @@ Every evaluation executes in strict linear order:
    └─► Otherwise ──► DENY(ACL_DENIED)
 
 8. Apply Contextual ABAC & Fallback (ADR-001)
-   └─► Sub-step 8.1: If context.tokenAuthorizationVersion < db.version ──► DENY(AUTHORIZATION_VERSION_STALE)
-   └─► Sub-step 8.2: If context.ipAddress is empty or invalid format ──► DENY(DEFAULT_DENY)
-   └─► Sub-step 8.3: Query organization_security_policies for organization.id.
-   └─► Sub-step 8.4: If ip_allowlist_mode != 'disabled' and applies to caller:
-         └─► Match context.ipAddress against active organization_ip_allowlist_entries.
-         └─► If no active entries exist or IP does not match any CIDR ──► DENY(CONTEXT_IP_ALLOWLIST_DENIED)
-   └─► Sub-step 8.5: If device_posture_mode != 'disabled':
-         └─► If context.devicePosture is missing, unverified, or non-compliant ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED)
-   └─► Sub-step 8.6: If all checks pass and previous steps proved an allow ──► ALLOW; otherwise ──► DENY(DEFAULT_DENY)
+   └─► Sub-step 8.1 (Token Invalidation):
+         └─► If context.tokenAuthorizationVersion is missing/NaN/null ──► DENY(AUTHORIZATION_VERSION_STALE)
+         └─► Query authorization_versions for organization.id.
+         └─► If context.tokenAuthorizationVersion != db.version ──► DENY(AUTHORIZATION_VERSION_STALE)
+   └─► Sub-step 8.2 (Edge Context Structural Validation):
+         └─► If context.clientType == 'internal_execution': validate context.ipAddress == 'internal:worker_runtime'.
+         └─► Otherwise: validate context.ipAddress is valid IPv4 or IPv6 format. If invalid ──► DENY(DEFAULT_DENY).
+   └─► Sub-step 8.3 (Load Organization Security Policy):
+         └─► Query organization_security_policies for organization.id. (Apply defaults if absent).
+   └─► Sub-step 8.4 (MFA Enforcement):
+         └─► If policy.mfa_enforcement == 'required_all' and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
+         └─► If policy.mfa_enforcement == 'required_admins' and rd.template_key IN ('owner','admin') and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
+   └─► Sub-step 8.5 (IP Allowlist Policy):
+         └─► If context.clientType == 'internal_execution' and policy.allow_internal_dispatch == true: PROCEED.
+         └─► If policy.ip_allowlist_mode != 'disabled' and applies to caller:
+               └─► Match normalized context.ipAddress against active organization_ip_allowlist_entries (filtered by ip_version).
+               └─► If no active entries exist or IP does not match any CIDR ──► DENY(CONTEXT_IP_ALLOWLIST_DENIED).
+   └─► Sub-step 8.6 (Device Posture Policy):
+         └─► If policy.device_posture_mode != 'disabled':
+               └─► If context.devicePosture is missing, or source NOT IN ('cloudflare_zero_trust', 'managed_client_cert'), or verifiedAt age > 300s ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
+               └─► If policy.device_posture_mode == 'compliant_only' and context.devicePosture.state != 'compliant' ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
+               └─► If policy.device_posture_mode == 'managed_only' and context.devicePosture.state NOT IN ('compliant', 'managed') ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
+   └─► Sub-step 8.7 (Decision Finalization):
+         └─► If all Step 8 checks pass and previous steps proved an allow ──► ALLOW; otherwise ──► DENY(DEFAULT_DENY).
 ```
 
 ---
@@ -361,6 +392,8 @@ Every evaluation executes in strict linear order:
    - *Drive*: `Drive/Space ──► Folder ──► Document`
    - *CRM*: `Account ──► Deal / Contact`
    Permissions propagate down a hierarchy only when the permission definition explicitly specifies `is_inheritable = TRUE`.
-3. **Trusted vs. Untrusted Contextual Attributes**:
-   - **Trusted**: Server-resolved organization, server-resolved membership, authenticated session ID, authoritative resource metadata from D1, Cloudflare connecting IP, edge-attested device posture.
+3. **Privilege Escalation Ceiling Invariant (F-5)**:
+   An actor cannot assign roles conferring permissions that the actor does not actively hold, unless the actor holds the immutable system template `Owner` role (`template_key = 'owner'`).
+4. **Trusted vs. Untrusted Contextual Attributes**:
+   - **Trusted**: Server-resolved organization, server-resolved membership, authenticated session ID, authoritative resource metadata from D1, Cloudflare connecting IP socket metadata, edge-attested device posture (source-verified and $\le 300$s fresh).
    - **Untrusted**: Arbitrary client request headers, client-supplied organization IDs in body, unverified client ACL assertions. Untrusted client headers are completely ignored.

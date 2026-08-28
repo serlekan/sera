@@ -4,7 +4,7 @@
 **Date**: 2026-08-28  
 **Author**: Deep Builder (`anthropic/claude-sonnet-5`)  
 **Scope**: Oryol Core Identity, Tenancy, and Authorization Engine  
-**Affected Documents**: `authorization-model.md`, `multi-tenancy.md`, `identity-model.md`
+**Affected Documents**: `authorization-model.md`, `multi-tenancy.md`, `identity-model.md`, `audit-and-events.md`
 
 ---
 
@@ -36,11 +36,31 @@ During Phase 1 — Slice 3 implementation of the authorization engine, a schema 
 
 We introduce explicit, tenant-bound service principal role assignments in D1, establishing unified coarse-RBAC capability resolution across both human and service principal identities.
 
-### 3.1 Persistence Model
+### 3.1 Persistence Model & Immutable System Templates
 
-A dedicated, normalized role assignment table is introduced:
+#### Table 1: `role_definitions` Enhancement (F-6)
+To prevent role renaming and template flag mutability from creating administrative privilege escalation vectors, `role_definitions` includes an immutable `template_key` column:
 
-#### Table: `service_principal_role_assignments`
+```sql
+CREATE TABLE role_definitions (
+    id TEXT PRIMARY KEY,                       -- rol_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,                        -- 'Owner', 'Admin', 'Member', 'CustomRole'
+    description TEXT NOT NULL,
+    is_system_template BOOLEAN NOT NULL DEFAULT FALSE,
+    template_key TEXT CHECK(template_key IN ('owner', 'admin', 'member') OR template_key IS NULL),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, id),
+    UNIQUE(organization_id, name)
+);
+
+CREATE TRIGGER trg_role_definitions_immutable_template BEFORE UPDATE OF is_system_template, template_key ON role_definitions
+BEGIN
+    SELECT RAISE(FAIL, 'ROLE_TEMPLATE_IMMUTABLE: cannot modify system template designation');
+END;
+```
+
+#### Table 2: `service_principal_role_assignments`
 ```sql
 CREATE TABLE service_principal_role_assignments (
     id TEXT PRIMARY KEY,                       -- sra_<ulid>
@@ -60,12 +80,15 @@ CREATE INDEX idx_sra_osp ON service_principal_role_assignments(organization_id, 
 CREATE INDEX idx_sra_role ON service_principal_role_assignments(organization_id, role_id);
 ```
 
-#### Key Properties:
+#### Key Relational Invariants:
 1. **Compound Tenant Isolation**: Universal compound foreign keys enforce that:
    - `organization_service_principal_id` belongs to the exact same `organization_id`.
-   - `role_id` belongs to the exact same `organization_id` (or is an active system template role).
+   - `role_id` belongs to the exact same `organization_id`.
 2. **Compound Uniqueness**: `UNIQUE(organization_id, organization_service_principal_id, role_id)` prevents duplicate assignments of the same role to a service principal within an organization.
-3. **No Identity Conflation**: Service principals are never assigned synthetic `memberships` records.
+3. **Database-Enforced Principal Taxonomy (F-8)**:
+   Database triggers guarantee that:
+   - `memberships` can only reference `principals WHERE type = 'human'`.
+   - `organization_service_principals` can only reference `principals WHERE type = 'service'`.
 
 ---
 
@@ -92,14 +115,15 @@ graph TD
 ```
 
 #### Resolution Algorithm:
-1. Query `organization_permission_registries` for `organization_id` joined with `permission_registry_versions prv WHERE prv.status = 'active'`.
-   If no active bound registry $\to$ **`DENY(REGISTRY_NOT_BOUND)`**.
+1. Query `organization_permission_registries` for `organization_id` joined with `permission_registry_versions prv`.
+   - If no registry is bound $\to$ **`DENY(REGISTRY_NOT_BOUND)`**.
+   - If bound registry has `prv.status != 'active'` $\to$ **`DENY(REGISTRY_DEPRECATED)`**.
 2. Query `permission_definitions` for `(registry_version, action)`.
-   If action does not exist $\to$ **`DENY(PERMISSION_UNKNOWN)`**.
+   - If action does not exist in registry $\to$ **`DENY(PERMISSION_UNKNOWN)`**.
 3. Resolve assigned roles based on principal taxonomy:
    - **For `principal.type = 'human'`**:
      ```sql
-     SELECT rp.permission_name, rd.name as role_name, rd.is_system_template
+     SELECT rp.permission_name, rd.name as role_name, rd.is_system_template, rd.template_key
      FROM membership_role_assignments mra
      JOIN role_definitions rd ON rd.organization_id = mra.organization_id AND rd.id = mra.role_id
      JOIN role_permissions rp ON rp.organization_id = rd.organization_id AND rp.role_id = rd.id
@@ -110,7 +134,7 @@ graph TD
      ```
    - **For `principal.type = 'service'`**:
      ```sql
-     SELECT rp.permission_name, rd.name as role_name, rd.is_system_template
+     SELECT rp.permission_name, rd.name as role_name, rd.is_system_template, rd.template_key
      FROM service_principal_role_assignments sra
      JOIN role_definitions rd ON rd.organization_id = sra.organization_id AND rd.id = sra.role_id
      JOIN role_permissions rp ON rp.organization_id = rd.organization_id AND rp.role_id = rd.id
@@ -124,15 +148,33 @@ graph TD
 
 ---
 
-### 3.3 Strict Evaluation Invariants
+### 3.3 Privilege Escalation Ceiling & Mutation Permissions (F-5)
+
+1. **Required Permission Definitions**:
+   The following permissions are defined in the active registry:
+
+   | Permission Name | Service | Risk Level | Description |
+   |---|---|---|---|
+   | `core.rbac.service_principal_role.assign` | `core` | `critical` | Assign a role to an organization service principal |
+   | `core.rbac.service_principal_role.revoke` | `core` | `critical` | Remove a role from an organization service principal |
+
+2. **Privilege Escalation Ceiling Invariant**:
+   When an actor assigns a role to a service principal (or another human), the authorization engine enforces that:
+   - The mutating actor MUST actively hold all permissions conferred by the target role within that organization, OR
+   - The mutating actor MUST hold the immutable system template `Owner` role (`role.template_key = 'owner'`).
+   An actor holding only `core.rbac.service_principal_role.assign` cannot grant roles containing permissions they themselves do not possess (`ERR_PRIVILEGE_ESCALATION_CEILING`).
+
+---
+
+### 3.4 Strict Evaluation Invariants
 
 1. **Shared Registry & Role Definitions**:
    Service principals evaluate against the **exact same** `permission_definitions`, `role_definitions`, and `role_permissions` as human members. No bespoke "service-only" permission registry is introduced.
 2. **Explicit Deny Precedence (Step 5)**:
    Explicit denies configured on service principals (`authorization_subjects WHERE subject_type = 'service_principal'`) execute at Step 5 and unconditionally override any role permission granted via `service_principal_role_assignments`.
-3. **Step 7 Fine-Grained Resource Evaluation**:
-   - Organization-wide non-resource actions (e.g. `mail.messages.send`) succeed upon passing Step 6 coarse-RBAC and Step 8 contextual ABAC.
-   - Privately owned resources (`resource.owner_membership_id !== null`) require explicit resource grants (`resource_grants`) or unowned resource status. Service principals holding system template Admin/Owner roles bypass private ACLs identically to human administrators.
+3. **Step 7 Fine-Grained Resource Evaluation & Immutable Template Matching (F-6)**:
+   - Organization-wide non-resource actions succeed upon passing Step 6 coarse-RBAC and Step 8 contextual ABAC.
+   - Privately owned resources require explicit resource grants (`resource_grants`) or unowned resource status. Service principals holding system template Admin/Owner roles (`template_key IN ('owner', 'admin')`) bypass private ACLs identically to human administrators.
 4. **Authentication vs. Authorization Separation**:
    This ADR defines authorization state and evaluation only. How a service principal authenticates (API keys, mTLS, client credentials) is managed by dedicated authentication slices. The authorization engine receives an already-authenticated principal and verifies rights authoritatively in D1.
 
@@ -146,7 +188,7 @@ graph TD
 2. **Atomic Batch Guarantee**:
    All service principal role mutations execute in a single atomic D1 transaction (`db.batch()`) containing:
    - The role assignment `INSERT` or conditional `DELETE`.
-   - The conditional `authorization_versions` increment (`INSERT...ON CONFLICT DO UPDATE SET version = version + 1 WHERE EXISTS (...)`).
+   - The conditional `authorization_versions` increment.
    - The immutable audit event (`core.rbac.service_principal_role_assigned` / `core.rbac.service_principal_role_removed`).
    - The transactional outbox event.
 3. **No-Op Atomicity**:
