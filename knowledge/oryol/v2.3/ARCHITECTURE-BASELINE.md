@@ -6,7 +6,7 @@
 **Ecosystem**: Oryol Workspace Platform (`serlekan/serlekan-sera`, `serlekan/oryol-mail`, `serlekan/oryol-core`)  
 **SERA Governance Version**: `0.4.2`  
 **Previous Specification Commit**: `e59f28a1abc0392fe3f38ecfe3a3fde8e379c033` (Architecture v2.2)  
-**Architecture Specification Commit**: `ce560928798b958f8bda38edde510edb614e8478`  
+**Architecture Specification Commit**: `e72228553fb315d1f4f2ae53130659d710d830b3`  
 
 ---
 
