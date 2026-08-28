@@ -3,10 +3,11 @@
 **Version**: 2.3  
 **Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
 **Date**: 2026-08-28  
-**Ecosystem**: Oryol Workspace Platform (`serlekan/serlekan-sera`, `serlekan/oryol-mail`, `serlekan/oryol-core`)  
+**Ecosystem**: Oryol Workspace Platform (`serlekan/sera`, `serlekan/oryol-mail`, `serlekan/oryol-core`)  
 **SERA Governance Version**: `0.4.2`  
-**Previous Specification Commit**: `e59f28a1abc0392fe3f38ecfe3a3fde8e379c033` (Architecture v2.2)  
-**Architecture Specification Commit**: `e72228553fb315d1f4f2ae53130659d710d830b3`  
+**Previous Baseline Version**: `2.2`  
+**Previous Baseline SHA**: `e59f28a1abc0392fe3f38ecfe3a3fde8e379c033`  
+**Accepted Specification SHA**: Assigned externally after approval  
 
 ---
 
