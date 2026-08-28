@@ -35,6 +35,11 @@ CREATE TABLE principals (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TRIGGER trg_principals_immutable_type BEFORE UPDATE OF type ON principals
+BEGIN
+    SELECT RAISE(FAIL, 'PRINCIPAL_TYPE_IMMUTABLE: principal type cannot be modified');
+END;
+
 -- 2. Human Users (Profile and primary identity)
 CREATE TABLE users (
     id TEXT PRIMARY KEY,                       -- usr_<ulid>

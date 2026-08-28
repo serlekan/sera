@@ -1,7 +1,7 @@
 # Oryol Authorization Policy Algebra v2.3
 
 **Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
-**Revision Scope**: Step 8 Core Security Policy, IP CIDR Normalization & Device Posture (ADR-001); Service Principal RBAC, Immutable Role Templates & Escalation Ceiling (ADR-002)
+**Revision Scope**: Step 8 Core Security Policy, Deterministic CIDR Ingestion & Device Posture (ADR-001); Service Principal RBAC, Immutable Role Templates & Escalation Ceiling (ADR-002)
 
 ---
 
@@ -17,7 +17,7 @@ All authorization decisions in Oryol Workspace are executed through the standard
 export interface TrustedDevicePosture {
   state: 'compliant' | 'managed' | 'non_compliant' | 'unknown';
   source: 'cloudflare_zero_trust' | 'managed_client_cert' | 'unverified';
-  verifiedAt: string; // ISO-8601 UTC timestamp of edge attestation (max age <= 300s)
+  verifiedAt: string; // ISO-8601 UTC timestamp of edge attestation (max age in [0, 300s])
 }
 
 export interface AuthorizationContext {
@@ -364,17 +364,19 @@ Every evaluation executes in strict linear order:
          └─► Otherwise: validate context.ipAddress is valid IPv4 or IPv6 format. If invalid ──► DENY(DEFAULT_DENY).
    └─► Sub-step 8.3 (Load Organization Security Policy):
          └─► Query organization_security_policies for organization.id. (Apply defaults if absent).
-   └─► Sub-step 8.4 (MFA Enforcement):
-         └─► If policy.mfa_enforcement == 'required_all' and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
-         └─► If policy.mfa_enforcement == 'required_admins' and rd.template_key IN ('owner','admin') and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
+   └─► Sub-step 8.4 (MFA Enforcement — Human-only R-4):
+         └─► If principal.type == 'human':
+               └─► If policy.mfa_enforcement == 'required_all' and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
+               └─► If policy.mfa_enforcement == 'required_admins' and rd.template_key IN ('owner','admin') and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
    └─► Sub-step 8.5 (IP Allowlist Policy):
          └─► If context.clientType == 'internal_execution' and policy.allow_internal_dispatch == true: PROCEED.
          └─► If policy.ip_allowlist_mode != 'disabled' and applies to caller:
                └─► Match normalized context.ipAddress against active organization_ip_allowlist_entries (filtered by ip_version).
                └─► If no active entries exist or IP does not match any CIDR ──► DENY(CONTEXT_IP_ALLOWLIST_DENIED).
-   └─► Sub-step 8.6 (Device Posture Policy):
+   └─► Sub-step 8.6 (Device Posture Policy — R-5, R-10):
+         └─► If context.clientType == 'internal_execution' and policy.allow_internal_dispatch == true: PROCEED.
          └─► If policy.device_posture_mode != 'disabled':
-               └─► If context.devicePosture is missing, or source NOT IN ('cloudflare_zero_trust', 'managed_client_cert'), or verifiedAt age > 300s ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
+               └─► If context.devicePosture is missing, or source NOT IN ('cloudflare_zero_trust', 'managed_client_cert'), or verifiedAt age NOT IN [0, 300s] ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
                └─► If policy.device_posture_mode == 'compliant_only' and context.devicePosture.state != 'compliant' ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
                └─► If policy.device_posture_mode == 'managed_only' and context.devicePosture.state NOT IN ('compliant', 'managed') ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
    └─► Sub-step 8.7 (Decision Finalization):

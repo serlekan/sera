@@ -36,9 +36,18 @@ During Phase 1 — Slice 3 implementation of the authorization engine, a schema 
 
 We introduce explicit, tenant-bound service principal role assignments in D1, establishing unified coarse-RBAC capability resolution across both human and service principal identities.
 
-### 3.1 Persistence Model & Immutable System Templates
+### 3.1 Persistence Model, Immutable System Templates & Taxonomy Invariants (F-6, R-7)
 
-#### Table 1: `role_definitions` Enhancement (F-6)
+#### Table 1: `principals` Enhancement (R-7)
+To ensure the principal taxonomy is permanently immutable and cannot be flipped post-creation:
+```sql
+CREATE TRIGGER trg_principals_immutable_type BEFORE UPDATE OF type ON principals
+BEGIN
+    SELECT RAISE(FAIL, 'PRINCIPAL_TYPE_IMMUTABLE: principal type cannot be modified');
+END;
+```
+
+#### Table 2: `role_definitions` Enhancement (F-6)
 To prevent role renaming and template flag mutability from creating administrative privilege escalation vectors, `role_definitions` includes an immutable `template_key` column:
 
 ```sql
@@ -60,7 +69,7 @@ BEGIN
 END;
 ```
 
-#### Table 2: `service_principal_role_assignments`
+#### Table 3: `service_principal_role_assignments`
 ```sql
 CREATE TABLE service_principal_role_assignments (
     id TEXT PRIMARY KEY,                       -- sra_<ulid>
@@ -71,7 +80,7 @@ CREATE TABLE service_principal_role_assignments (
     FOREIGN KEY (organization_id, organization_service_principal_id)
         REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, role_id)
-        REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+        REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     UNIQUE(organization_id, organization_service_principal_id, role_id),
     UNIQUE(organization_id, id)
 );
@@ -80,15 +89,38 @@ CREATE INDEX idx_sra_osp ON service_principal_role_assignments(organization_id, 
 CREATE INDEX idx_sra_role ON service_principal_role_assignments(organization_id, role_id);
 ```
 
-#### Key Relational Invariants:
-1. **Compound Tenant Isolation**: Universal compound foreign keys enforce that:
-   - `organization_service_principal_id` belongs to the exact same `organization_id`.
-   - `role_id` belongs to the exact same `organization_id`.
-2. **Compound Uniqueness**: `UNIQUE(organization_id, organization_service_principal_id, role_id)` prevents duplicate assignments of the same role to a service principal within an organization.
-3. **Database-Enforced Principal Taxonomy (F-8)**:
-   Database triggers guarantee that:
-   - `memberships` can only reference `principals WHERE type = 'human'`.
-   - `organization_service_principals` can only reference `principals WHERE type = 'service'`.
+#### Database-Enforced Principal Taxonomy Triggers (F-8, R-7):
+```sql
+-- Enforce human principal type on memberships INSERT and UPDATE
+CREATE TRIGGER trg_memberships_human_principal_insert_check BEFORE INSERT ON memberships
+BEGIN
+    SELECT RAISE(FAIL, 'MEMBERSHIP_PRINCIPAL_TYPE_INVALID: memberships may only bind human principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'human';
+END;
+
+CREATE TRIGGER trg_memberships_human_principal_update_check BEFORE UPDATE OF principal_id ON memberships
+BEGIN
+    SELECT RAISE(FAIL, 'MEMBERSHIP_PRINCIPAL_TYPE_INVALID: memberships may only bind human principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'human';
+END;
+
+-- Enforce service principal type on organization_service_principals INSERT and UPDATE
+CREATE TRIGGER trg_osp_service_principal_insert_check BEFORE INSERT ON organization_service_principals
+BEGIN
+    SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'service';
+END;
+
+CREATE TRIGGER trg_osp_service_principal_update_check BEFORE UPDATE OF principal_id ON organization_service_principals
+BEGIN
+    SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'service';
+END;
+```
 
 ---
 
@@ -99,7 +131,7 @@ Step 6 resolves coarse capabilities uniformly based on principal type:
 ```mermaid
 graph TD
     Step6[Step 6: Resolve Coarse RBAC Capability] --> RegCheck[Verify Organization Active Registry Version prv.status = 'active']
-    RegCheck -->|Inactive or Unbound| DenyReg[DENY: REGISTRY_NOT_BOUND]
+    RegCheck -->|Inactive or Unbound| DenyReg[DENY: REGISTRY_NOT_BOUND | REGISTRY_DEPRECATED]
     RegCheck --> ActionCheck[Verify Action exists in permission_definitions]
     ActionCheck -->|Unknown Action| DenyPerm[DENY: PERMISSION_UNKNOWN]
     ActionCheck --> TypeBranch{Principal Type?}

@@ -80,17 +80,17 @@ CREATE INDEX idx_ip_allowlist_org_status ON organization_ip_allowlist_entries(or
 
 ---
 
-### 3.2 Canonical CIDR & IP Normalization Specification
+### 3.2 Deterministic CIDR Ingestion & IP Normalization Specification (R-6)
 
 To eliminate subnet ambiguity, representation spoofing, and parsing drift:
 
-1. **IPv4 Ingestion & Normalization**:
+1. **Deterministic IPv4 Ingestion**:
    - Representation: Canonical dot-decimal format `a.b.c.d/prefix` where `prefix` $\in [0, 32]$. Single IPs must be formatted as `/32` (e.g. `203.0.113.50/32`).
-   - Host Bit Masking: All host bits outside the subnet mask MUST be zeroed on ingestion (e.g., `192.168.1.135/24` is rejected or normalized to `192.168.1.0/24`).
+   - Host Bit Invariant: All host bits outside the subnet mask MUST be zero. Ingestion strictly **rejects** inputs with non-zero host bits (e.g. `192.168.1.135/24` is rejected with `ERR_CIDR_NON_ZERO_HOST_BITS`). Operators must submit the canonical network address `192.168.1.0/24`.
    - `ip_version` must be `4`.
-2. **IPv6 Ingestion & Normalization**:
+2. **Deterministic IPv6 Ingestion**:
    - Representation: Canonical RFC 5952 lowercase, zero-compressed format `[addr]/prefix` where `prefix` $\in [0, 128]$. Single IPs must be formatted as `/128`.
-   - Host Bit Masking: All host bits outside the subnet mask MUST be zeroed on ingestion.
+   - Host Bit Invariant: All host bits outside the subnet mask MUST be zero. Ingestion strictly **rejects** inputs with non-zero host bits.
    - `ip_version` must be `6`.
 3. **IPv4-Mapped IPv6 Unwrapping**:
    - Inbound socket addresses formatted as IPv4-mapped IPv6 (e.g. `::ffff:198.51.100.1`) MUST be unwrapped to standard canonical IPv4 (`198.51.100.1`) before matching.
@@ -111,7 +111,7 @@ export interface TrustedDevicePosture {
 }
 
 export interface AuthorizationContext {
-  ipAddress: string;                   // Derived from Cloudflare CF-Connecting-IP, never client headers
+  ipAddress: string;                   // Derived from Cloudflare CF-Connecting-IP, or 'internal:worker_runtime'
   clientType: 'web' | 'mobile' | 'api' | 'automation' | 'internal_execution';
   timestamp: string;                   // ISO-8601 UTC from Worker runtime clock
   tokenAuthorizationVersion: number;   // Required: From cryptographically verified JWT / session claim
@@ -124,9 +124,9 @@ export interface AuthorizationContext {
 1. **Client Headers Untrusted**: Request headers such as `X-Forwarded-For`, `Client-IP`, `X-Device-Status`, or client request body properties are **strictly untrusted** and MUST NEVER establish `ipAddress`, `mfaVerified`, or `devicePosture`.
 2. **Mandatory Token Authorization Version (F-1)**: `tokenAuthorizationVersion` is **required**. Requests lacking a valid integer `tokenAuthorizationVersion` fail closed immediately with `DENY(AUTHORIZATION_VERSION_STALE)`.
 3. **Edge Attestation**: `ipAddress` is populated exclusively from Cloudflare Worker request metadata (`request.headers.get('CF-Connecting-IP')` or runtime socket properties). For `clientType: 'internal_execution'` (cron triggers, queue consumers, outbox dispatchers), `ipAddress` is populated as `'internal:worker_runtime'`.
-4. **Posture Attestation & Max Age Threshold (F-2)**:
+4. **Posture Attestation & Freshness Invariant (F-2, R-10)**:
    - Posture is valid ONLY when `source IN ('cloudflare_zero_trust', 'managed_client_cert')`. A posture with `source = 'unverified'` is treated as invalid.
-   - The edge attestation timestamp `verifiedAt` MUST be fresh: $(t_{\text{current}} - t_{\text{verifiedAt}}) \le 300\text{ seconds}$ (5 minutes max staleness). If expired, missing, or future-dated $\to$ posture is treated as `'unknown'`.
+   - The edge attestation timestamp `verifiedAt` MUST satisfy: $(t_{\text{current}} - t_{\text{verifiedAt}}) \in [0, 300\text{ seconds}]$ (freshness $\le 5$ minutes, non-negative). If future-dated, expired, missing, or unparseable $\to$ posture is treated as `'unknown'`.
 
 ---
 
@@ -143,9 +143,9 @@ graph TD
     V2 -->|Invalid format or empty IP| DenyDefault[DENY: DEFAULT_DENY]
     V2 -->|Valid structure| V3[8.3 Load Organization Security Policy from D1]
     
-    V3 --> V4{8.4 MFA Enforcement Check}
-    V4 -->|MFA required but context.mfaVerified != true| DenyMFA[DENY: CONTEXT_MFA_REQUIRED]
-    V4 -->|MFA satisfied or optional| V5{8.5 IP Allowlist Policy}
+    V3 --> V4{8.4 Human MFA Enforcement Check}
+    V4 -->|Human caller & MFA required but context.mfaVerified != true| DenyMFA[DENY: CONTEXT_MFA_REQUIRED]
+    V4 -->|Service principal or MFA satisfied or optional| V5{8.5 IP Allowlist Policy}
     
     V5 -->|Internal Execution & allow_internal_dispatch=true| V6{8.6 Device Posture Policy}
     V5 -->|Disabled| V6
@@ -153,8 +153,9 @@ graph TD
     CheckIP -->|No match or empty allowlist| DenyIP[DENY: CONTEXT_IP_ALLOWLIST_DENIED]
     CheckIP -->|IP Matches active CIDR| V6
     
-    V6 -->|Disabled| V7[8.7 Decision Finalization]
-    V6 -->|Enforced| CheckPosture[Validate devicePosture state, source, and freshness <= 300s]
+    V6 -->|Internal Execution & allow_internal_dispatch=true| V7[8.7 Decision Finalization]
+    V6 -->|Disabled| V7
+    V6 -->|Enforced| CheckPosture[Validate devicePosture state, source, and freshness in 0-300s]
     CheckPosture -->|Failed, Non-compliant, Stale, or Unknown| DenyPosture[DENY: CONTEXT_DEVICE_POSTURE_DENIED]
     CheckPosture -->|Compliant / Managed Valid| V7
     
@@ -172,11 +173,13 @@ graph TD
 3. **Sub-step 8.3 (Load Organization Security Policy)**:
    - Query `organization_security_policies` for `organization_id`.
    - If no record exists, apply default policy (`ip_allowlist_mode = 'disabled'`, `device_posture_mode = 'disabled'`, `mfa_enforcement = 'optional'`, `allow_internal_dispatch = true`).
-4. **Sub-step 8.4 (MFA Policy Evaluation — F-4)**:
-   - If `policy.mfa_enforcement === 'required_all'`:
-     If `context.mfaVerified !== true` $\to$ **`DENY(CONTEXT_MFA_REQUIRED)`**.
-   - If `policy.mfa_enforcement === 'required_admins'`:
-     If caller holds system template Admin/Owner role (`role.template_key IN ('owner', 'admin')`) AND `context.mfaVerified !== true` $\to$ **`DENY(CONTEXT_MFA_REQUIRED)`**.
+4. **Sub-step 8.4 (MFA Policy Evaluation — F-4, R-4)**:
+   - MFA enforcement applies **exclusively to Human Principals** (`principal.type === 'human'`). Service principals and internal dispatchers authenticate via cryptographic machine credentials and are not subject to interactive human MFA.
+   - If `principal.type === 'human'`:
+     - If `policy.mfa_enforcement === 'required_all'`:
+       If `context.mfaVerified !== true` $\to$ **`DENY(CONTEXT_MFA_REQUIRED)`**.
+     - If `policy.mfa_enforcement === 'required_admins'`:
+       If caller holds an immutable system template Admin/Owner role (`role.template_key IN ('owner', 'admin')`) AND `context.mfaVerified !== true` $\to$ **`DENY(CONTEXT_MFA_REQUIRED)`**.
 5. **Sub-step 8.5 (IP Allowlist Policy Evaluation — F-3, F-7)**:
    - If `context.clientType === 'internal_execution'`:
      - If `policy.allow_internal_dispatch === true` $\to$ IP allowlist check bypassed for internal worker runtime.
@@ -190,9 +193,11 @@ graph TD
        - If active entries list is empty $\to$ **`DENY(CONTEXT_IP_ALLOWLIST_DENIED)`** (fail-closed).
        - Evaluate `context.ipAddress` against each CIDR block with matching `ip_version` using exact bitwise subnet masking.
        - If no active CIDR matches $\to$ **`DENY(CONTEXT_IP_ALLOWLIST_DENIED)`**.
-6. **Sub-step 8.6 (Device Posture Policy Evaluation — F-2)**:
+6. **Sub-step 8.6 (Device Posture Policy Evaluation — F-2, R-5, R-10)**:
+   - If `context.clientType === 'internal_execution'` AND `policy.allow_internal_dispatch === true`:
+     - Device posture check is bypassed for internal runtime executions.
    - If `policy.device_posture_mode != 'disabled'`:
-     - If `context.devicePosture` is absent, or `source NOT IN ('cloudflare_zero_trust', 'managed_client_cert')`, or $(t_{\text{now}} - t_{\text{verifiedAt}}) > 300\text{s}$ $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.
+     - If `context.devicePosture` is absent, or `source NOT IN ('cloudflare_zero_trust', 'managed_client_cert')`, or $(t_{\text{now}} - t_{\text{verifiedAt}}) \notin [0, 300\text{s}]$ $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.
      - If `policy.device_posture_mode = 'compliant_only'` and `context.devicePosture.state != 'compliant'` $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.
      - If `policy.device_posture_mode = 'managed_only'` and `context.devicePosture.state NOT IN ('compliant', 'managed')` $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.
 7. **Sub-step 8.7 (Decision Finalization)**:
@@ -213,8 +218,12 @@ The following canonical permission definitions are defined in the active registr
 | `core.ip_allowlist.read` | `core` | `low` | List IP allowlist CIDR entries |
 | `core.ip_allowlist.manage` | `core` | `critical` | Create, update, or remove IP allowlist CIDR entries |
 
-### 4.2 Self-Lockout Prevention Invariant (F-10.e)
-When an administrator updates `organization_security_policies.ip_allowlist_mode` to `'enforced_all'` or `'enforced_admins'`, or modifies allowlist entries, the policy mutation service MUST verify that the administrator's current `context.ipAddress` is covered by at least one active CIDR entry. If the mutation would immediately lock out the active administrator $\to$ transaction rejected with `ERR_SECURITY_POLICY_SELF_LOCKOUT`.
+### 4.2 Comprehensive Self-Lockout Prevention Invariant (F-10.e, R-8)
+When an administrator modifies `organization_security_policies` or `organization_ip_allowlist_entries`, the policy mutation service MUST verify that the mutating administrator's active session satisfies the proposed policy before committing:
+1. **IP Allowlist Self-Lockout**: If enabling IP allowlist (`enforced_all` or `enforced_admins`), the admin's `context.ipAddress` must match at least one active allowlist CIDR entry.
+2. **MFA Self-Lockout**: If enabling mandatory MFA (`required_all` or `required_admins`), the admin's current session must have `mfaVerified === true`.
+3. **Device Posture Self-Lockout**: If enabling mandatory posture (`compliant_only` or `managed_only`), the admin's current session must possess verified compliant/managed posture.
+Any mutation violating self-lockout validation is rejected with `ERR_SECURITY_POLICY_SELF_LOCKOUT`.
 
 ### 4.3 Atomic Batch Guarantee & Version Invalidation
 Any update to `organization_security_policies` or insert/update/delete on `organization_ip_allowlist_entries` MUST execute inside a single atomic `db.batch()` transaction:
@@ -239,7 +248,7 @@ Any update to `organization_security_policies` or insert/update/delete on `organ
 
 ## 6. Security Consequences
 
-- **Fail-Closed Guarantee**: Missing posture signals, expired attestations ($>300$s), or empty allowlists when policies are active immediately deny access.
+- **Fail-Closed Guarantee**: Missing posture signals, expired attestations, or empty allowlists when policies are active immediately deny access.
 - **Spoofing Resistance**: Untrusted HTTP request headers are completely ignored; only Worker runtime socket context is evaluated.
 - **Tenant Isolation**: Universal compound keys `(organization_id, id)` and `(organization_id, cidr_block)` guarantee cross-tenant policy leakage is impossible.
 - **Deterministic Auditing**: All policy changes produce structured audit events and invalidate cached authorization versions immediately.

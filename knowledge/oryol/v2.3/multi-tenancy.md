@@ -32,8 +32,15 @@ CREATE TABLE memberships (
     UNIQUE(organization_id, principal_id)
 );
 
--- Database-Enforced Human Principal Taxonomy Trigger (F-8)
-CREATE TRIGGER trg_memberships_human_principal_check BEFORE INSERT ON memberships
+-- Database-Enforced Human Principal Taxonomy Triggers (F-8, R-7)
+CREATE TRIGGER trg_memberships_human_principal_insert_check BEFORE INSERT ON memberships
+BEGIN
+    SELECT RAISE(FAIL, 'MEMBERSHIP_PRINCIPAL_TYPE_INVALID: memberships may only bind human principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'human';
+END;
+
+CREATE TRIGGER trg_memberships_human_principal_update_check BEFORE UPDATE OF principal_id ON memberships
 BEGIN
     SELECT RAISE(FAIL, 'MEMBERSHIP_PRINCIPAL_TYPE_INVALID: memberships may only bind human principals')
     FROM principals
@@ -158,8 +165,15 @@ CREATE TABLE organization_service_principals (
     UNIQUE(organization_id, id)
 );
 
--- Database-Enforced Service Principal Taxonomy Trigger (F-8)
-CREATE TRIGGER trg_osp_service_principal_check BEFORE INSERT ON organization_service_principals
+-- Database-Enforced Service Principal Taxonomy Triggers (F-8, R-7)
+CREATE TRIGGER trg_osp_service_principal_insert_check BEFORE INSERT ON organization_service_principals
+BEGIN
+    SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'service';
+END;
+
+CREATE TRIGGER trg_osp_service_principal_update_check BEFORE UPDATE OF principal_id ON organization_service_principals
 BEGIN
     SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
     FROM principals
