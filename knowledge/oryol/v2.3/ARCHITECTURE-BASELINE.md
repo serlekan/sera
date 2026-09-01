@@ -29,9 +29,9 @@ The following 15 canonical documents constitute the proposed Architecture v2.3 b
 
 1. [`workspace-architecture.md`](workspace-architecture.md) — Two-tier platform hierarchy (`Platform -> Core -> Applications`), 7 permanent architecture rules, and Virel financial domain ownership.
 2. [`core-boundaries.md`](core-boundaries.md) — Core platform capabilities vs. product business domains; authoritative security policy ownership (`organization_security_policies`, `organization_ip_allowlist_entries`), email DNS verification, and attachment persistence.
-3. [`multi-tenancy.md`](multi-tenancy.md) — Universal compound foreign key isolation, brokered cross-org grants (`cross_org_grants`), service principal role assignments (`service_principal_role_assignments`), and controlled pilot D1 SLOs.
-4. [`identity-model.md`](identity-model.md) — Strict binary Principal taxonomy (`human`, `service`), authentication factors, IdP global uniqueness, recovery methods, and service principal role assignment bindings.
-5. [`authorization-model.md`](authorization-model.md) — Executable 8-step `authorize({ principal, membership, organization, action, resource, context })` algebra, unified Step 6 coarse-RBAC resolution for humans and service principals, and deterministic Step 8 contextual ABAC algorithm.
+3. [`multi-tenancy.md`](multi-tenancy.md) — Universal compound foreign key isolation, brokered cross-org grants (`cross_org_grants`), compound service account tenant ownership (`(organization_id, principal_id)`), service principal role assignments (`service_principal_role_assignments`), and controlled pilot D1 SLOs.
+4. [`identity-model.md`](identity-model.md) — Strict binary Principal taxonomy (`human`, `service`), authentication factors, IdP global uniqueness, recovery methods, single-tenant service account ownership, and service principal role assignment bindings.
+5. [`authorization-model.md`](authorization-model.md) — Executable 8-step `authorize({ principal, membership, organization, action, resource, context })` algebra, unified Step 6 coarse-RBAC resolution for humans and service principals, dual-signal template validation (`is_system_template = TRUE AND template_key IN ('owner', 'admin')`), and deterministic Step 8 contextual ABAC algorithm.
 6. [`session-security.md`](session-security.md) — D1 authoritative session entities, atomic refresh token family rotation state machine, replay breach defenses, dual-verification revocation SLA, and step-up proof binding.
 7. [`audit-and-events.md`](audit-and-events.md) — Separate Audit vs. Outbox vs. Observability; worker lease locking dispatcher, retry backoffs, aggregate ordering via `aggregate_version`, non-cascading audit logs, append-only privacy overlays, and policy mutation audit actions.
 8. [`cloudflare-platform.md`](cloudflare-platform.md) — Cloudflare edge storage topology mapping Workers, D1, KV, Queues, R2, Vectorize, and Durable Objects phased by rollout.
@@ -40,8 +40,8 @@ The following 15 canonical documents constitute the proposed Architecture v2.3 b
 11. [`search-platform.md`](search-platform.md) — Search contract: derived read model, live authorization post-filtering, sensitive snippet protection, and RAG retrieval alignment.
 12. [`product-integration.md`](product-integration.md) — Outbox-driven integration topology across OryolMail, CRM, Calendar, Drive, and Virel.
 13. [`sera-governance.md`](sera-governance.md) — Standardized 5-file `.sera/` repository layout, multi-signal detection outside `.sera/`, and deterministic fail-closed policy enforcement.
-14. [`adr/ADR-001-step8-security-policy.md`](adr/ADR-001-step8-security-policy.md) — Architectural Decision Record for Core-Owned Security Policy, IP CIDR Allowlisting, and Trusted Device Posture.
-15. [`adr/ADR-002-service-principal-rbac.md`](adr/ADR-002-service-principal-rbac.md) — Architectural Decision Record for Service Principal RBAC, Step 6 Evaluation, and Tenant Role Assignments.
+14. [`adr/ADR-001-step8-security-policy.md`](adr/ADR-001-step8-security-policy.md) — Architectural Decision Record for Core-Owned Security Policy, IP CIDR Allowlisting, Trusted Device Posture, and deterministic internal dispatch denial.
+15. [`adr/ADR-002-service-principal-rbac.md`](adr/ADR-002-service-principal-rbac.md) — Architectural Decision Record for Service Principal RBAC, Step 6 Evaluation, Role Template Invariants, Compound Tenant Ownership, and Migration 0005 Upgrade Contract.
 
 ---
 
@@ -52,3 +52,6 @@ The following 15 canonical documents constitute the proposed Architecture v2.3 b
 - **2026-08-26**: Architecture v2.1 P0 Remediation completed.
 - **2026-08-26**: Final Architecture v2.2 Remediation completed (`e59f28a1abc0392fe3f38ecfe3a3fde8e379c033`).
 - **2026-08-28**: Proposed Architecture v2.3 drafted to resolve Step 8 Contextual ABAC persistence contract (ADR-001) and Service Principal RBAC capability bindings (ADR-002).
+- **2026-08-30**: Adversarial Architecture Review remediations F-1 through F-10 and R-1 through R-10 applied.
+- **2026-09-01**: Service principal role foreign key deletion semantics aligned to `ON DELETE RESTRICT`.
+- **2026-09-01**: Security gate remediation: closed P0-1 system role template forgery, P0-2 service-principal tenant escape, P0-3 Migration 0005 deterministic upgrade contract, and P1 internal execution CIDR contradiction.

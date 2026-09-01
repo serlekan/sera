@@ -17,8 +17,8 @@ Oryol Core provides the single pane of glass for all cross-cutting infrastructur
 ### 1.2 Multi-Tenant Hierarchy & Organization Governance
 - Organization (`org_...`) lifecycle management: `active`, `suspended`, `archived`, `deletion_pending`.
 - Organization Memberships (`mem_...`), Invitations (`inv_...`), and Team structures (`team_...`).
-- Global and custom Role definitions (`rol_...`) and permission bindings.
-- Human role assignments (`membership_role_assignments`) and Service Principal role assignments (`service_principal_role_assignments`).
+- Global system role templates (`Owner`, `Admin`, `Member`) provisioned during organization bootstrapping, and tenant-defined custom Role definitions (`rol_...`) with strict template invariants.
+- Human role assignments (`membership_role_assignments`), Service Account tenant ownership (`service_accounts.organization_id`), and Service Principal role assignments (`service_principal_role_assignments`).
 - Authoritative organization security policies (`organization_security_policies`) and IP allowlist CIDR entries (`organization_ip_allowlist_entries`).
 - Generic Organization Domain Claims (`dom_...`) for cross-application routing.
 

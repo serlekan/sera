@@ -119,18 +119,27 @@ CREATE TABLE organization_permission_registries (
     FOREIGN KEY (organization_id, activated_by_membership_id) REFERENCES memberships(organization_id, id)
 );
 
--- 4. Role Definitions: Organization-Scoped with Immutable System Templates (F-6)
+-- 4. Role Definitions: Organization-Scoped with Immutable System Templates (F-6, P0-1)
 CREATE TABLE role_definitions (
     id TEXT PRIMARY KEY,                       -- rol_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name TEXT NOT NULL,                        -- 'Owner', 'Admin', 'Member', 'CustomRole'
     description TEXT NOT NULL,
     is_system_template BOOLEAN NOT NULL DEFAULT FALSE,
-    template_key TEXT CHECK(template_key IN ('owner', 'admin', 'member') OR template_key IS NULL),
+    template_key TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (is_system_template = 0 AND template_key IS NULL) OR
+        (is_system_template = 1 AND template_key IN ('owner', 'admin', 'member'))
+    ),
     UNIQUE(organization_id, id),
     UNIQUE(organization_id, name)
 );
+
+-- Exactly one system template per template_key per organization (P0-1)
+CREATE UNIQUE INDEX uq_role_definitions_org_template 
+    ON role_definitions(organization_id, template_key) 
+    WHERE template_key IS NOT NULL;
 
 CREATE TRIGGER trg_role_definitions_immutable_template BEFORE UPDATE OF is_system_template, template_key ON role_definitions
 BEGIN
@@ -162,14 +171,16 @@ CREATE TABLE membership_role_assignments (
     UNIQUE(organization_id, id)
 );
 
--- 7. Organization Service Principals: Explicit Tenant-Bound Service Accounts
+-- 7. Organization Service Principals: Explicit Tenant-Bound Service Accounts (P0-2)
 CREATE TABLE organization_service_principals (
     id TEXT PRIMARY KEY,                       -- osp_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    principal_id TEXT NOT NULL,
     name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, principal_id)
+        REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE,
     UNIQUE(organization_id, principal_id),
     UNIQUE(organization_id, id)
 );
@@ -347,7 +358,7 @@ Every evaluation executes in strict linear order:
 
 7. Resolve Fine-Grained Resource ACL / ReBAC Grant
    └─► If action is organization-level or resource is unowned ──► ALLOW(ALLOW_ROLE)
-   └─► If caller holds system template Admin/Owner role (rd.template_key IN ('owner', 'admin')) ──► ALLOW(ALLOW_ROLE)
+   └─► If caller holds system template Admin/Owner role (rd.is_system_template == true and rd.template_key IN ('owner', 'admin')) ──► ALLOW(ALLOW_ROLE)
    └─► If caller is resource owner ──► ALLOW(ALLOW_ROLE)
    └─► If matching `resource_grants` row exists ──► ALLOW(ALLOW_RESOURCE_GRANT)
    └─► If valid `delegated_authority` exists from grantor with resource authority (depth = 1) ──► ALLOW(ALLOW_DELEGATION)
@@ -364,17 +375,19 @@ Every evaluation executes in strict linear order:
          └─► Otherwise: validate context.ipAddress is valid IPv4 or IPv6 format. If invalid ──► DENY(DEFAULT_DENY).
    └─► Sub-step 8.3 (Load Organization Security Policy):
          └─► Query organization_security_policies for organization.id. (Apply defaults if absent).
-   └─► Sub-step 8.4 (MFA Enforcement — Human-only R-4):
+   └─► Sub-step 8.4 (MFA Enforcement — Human-only R-4, P0-1):
          └─► If principal.type == 'human':
                └─► If policy.mfa_enforcement == 'required_all' and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
-               └─► If policy.mfa_enforcement == 'required_admins' and rd.template_key IN ('owner','admin') and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
-   └─► Sub-step 8.5 (IP Allowlist Policy):
-         └─► If context.clientType == 'internal_execution' and policy.allow_internal_dispatch == true: PROCEED.
-         └─► If policy.ip_allowlist_mode != 'disabled' and applies to caller:
+               └─► If policy.mfa_enforcement == 'required_admins' and rd.is_system_template == true and rd.template_key IN ('owner','admin') and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
+   └─► Sub-step 8.5 (IP Allowlist Policy — P1):
+         └─► If context.clientType == 'internal_execution':
+               └─► If policy.allow_internal_dispatch == true: PROCEED to Sub-step 8.7 (IP allowlist and posture bypassed).
+               └─► If policy.allow_internal_dispatch == false: DENY(CONTEXT_INTERNAL_DISPATCH_DENIED).
+         └─► If policy.ip_allowlist_mode != 'disabled' and applies to caller (all callers for 'enforced_all', or rd.is_system_template == true and rd.template_key IN ('owner', 'admin') for 'enforced_admins'):
                └─► Match normalized context.ipAddress against active organization_ip_allowlist_entries (filtered by ip_version).
                └─► If no active entries exist or IP does not match any CIDR ──► DENY(CONTEXT_IP_ALLOWLIST_DENIED).
    └─► Sub-step 8.6 (Device Posture Policy — R-5, R-10):
-         └─► If context.clientType == 'internal_execution' and policy.allow_internal_dispatch == true: PROCEED.
+         └─► If context.clientType == 'internal_execution': Handled in Sub-step 8.5.
          └─► If policy.device_posture_mode != 'disabled':
                └─► If context.devicePosture is missing, or source NOT IN ('cloudflare_zero_trust', 'managed_client_cert'), or verifiedAt age NOT IN [0, 300s] ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
                └─► If policy.device_posture_mode == 'compliant_only' and context.devicePosture.state != 'compliant' ──► DENY(CONTEXT_DEVICE_POSTURE_DENIED).
@@ -394,8 +407,8 @@ Every evaluation executes in strict linear order:
    - *Drive*: `Drive/Space ──► Folder ──► Document`
    - *CRM*: `Account ──► Deal / Contact`
    Permissions propagate down a hierarchy only when the permission definition explicitly specifies `is_inheritable = TRUE`.
-3. **Privilege Escalation Ceiling Invariant (F-5)**:
-   An actor cannot assign roles conferring permissions that the actor does not actively hold, unless the actor holds the immutable system template `Owner` role (`template_key = 'owner'`).
+3. **Privilege Escalation Ceiling Invariant (F-5, P0-1)**:
+   An actor cannot assign roles conferring permissions that the actor does not actively hold, unless the actor holds the immutable system template `Owner` role (`rd.is_system_template = TRUE AND rd.template_key = 'owner'`).
 4. **Trusted vs. Untrusted Contextual Attributes**:
    - **Trusted**: Server-resolved organization, server-resolved membership, authenticated session ID, authoritative resource metadata from D1, Cloudflare connecting IP socket metadata, edge-attested device posture (source-verified and $\le 300$s fresh).
    - **Untrusted**: Arbitrary client request headers, client-supplied organization IDs in body, unverified client ACL assertions. Untrusted client headers are completely ignored.

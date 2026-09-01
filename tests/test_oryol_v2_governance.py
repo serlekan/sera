@@ -426,6 +426,91 @@ class TestOryolFailClosedGovernance(unittest.TestCase):
         self.assertIn(f"Architecture specification commit: `{ORYOL_ARCHITECTURE_SPEC_SHA}`", review_text)
 
 
+class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
+    """Verify that Proposed Architecture v2.3 satisfies all hardened security invariants, template integrity, tenant ownership, and migration contracts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).resolve().parent.parent
+        cls.knowledge_v23 = cls.root / "knowledge" / "oryol" / "v2.3"
+        cls.adr1 = cls.knowledge_v23 / "adr" / "ADR-001-step8-security-policy.md"
+        cls.adr2 = cls.knowledge_v23 / "adr" / "ADR-002-service-principal-rbac.md"
+        cls.auth_model = cls.knowledge_v23 / "authorization-model.md"
+        cls.multi_tenancy = cls.knowledge_v23 / "multi-tenancy.md"
+        cls.identity_model = cls.knowledge_v23 / "identity-model.md"
+
+    def test_non_system_role_cannot_have_template_key(self):
+        """A: Non-system role + template_key is strictly prohibited by canonical schema text."""
+        check_pattern = r"\(is_system_template\s*=\s*0\s+AND\s+template_key\s+IS\s+NULL\)"
+        for doc in [self.adr2, self.auth_model, self.multi_tenancy]:
+            content = doc.read_text(encoding="utf-8")
+            self.assertRegex(content, check_pattern, f"{doc.name} must enforce template_key IS NULL when is_system_template = 0")
+
+    def test_admin_owner_semantics_require_dual_signals(self):
+        """B: Admin/Owner semantics require BOTH is_system_template = TRUE and template_key."""
+        adr1_text = self.adr1.read_text(encoding="utf-8")
+        auth_text = self.auth_model.read_text(encoding="utf-8")
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+
+        # Step 8 MFA check in ADR-001
+        self.assertIn("role.is_system_template === true AND role.template_key IN ('owner', 'admin')", adr1_text)
+        # Step 7 ACL bypass in authorization-model.md
+        self.assertIn("rd.is_system_template == true and rd.template_key IN ('owner', 'admin')", auth_text)
+        # Privilege escalation ceiling in authorization-model.md
+        self.assertIn("rd.is_system_template = TRUE AND rd.template_key = 'owner'", auth_text)
+        # Privilege escalation ceiling in ADR-002
+        self.assertIn("role.is_system_template = TRUE AND role.template_key = 'owner'", adr2_text)
+
+    def test_template_key_uniqueness_per_organization(self):
+        """C: template_key uniqueness per organization is specified via partial unique index."""
+        uq_pattern = r"CREATE UNIQUE INDEX uq_role_definitions_org_template\s+ON role_definitions\(organization_id, template_key\)\s+WHERE template_key IS NOT NULL;"
+        for doc in [self.adr2, self.auth_model, self.multi_tenancy]:
+            content = doc.read_text(encoding="utf-8")
+            self.assertRegex(content, uq_pattern, f"{doc.name} must specify uq_role_definitions_org_template partial index")
+
+    def test_service_accounts_target_schema_contains_organization_ownership(self):
+        """D: service_accounts target schema contains organization ownership (organization_id)."""
+        for doc in [self.adr2, self.identity_model]:
+            content = doc.read_text(encoding="utf-8")
+            self.assertIn("organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT", content)
+            self.assertIn("UNIQUE(organization_id, principal_id)", content)
+
+    def test_organization_service_principals_compound_tenant_binding(self):
+        """E: organization_service_principals has canonical compound tenant ownership binding."""
+        fk_pattern = r"FOREIGN KEY\s*\(organization_id,\s*principal_id\)\s+REFERENCES service_accounts\(organization_id,\s*principal_id\)\s+ON DELETE CASCADE"
+        for doc in [self.adr2, self.auth_model, self.multi_tenancy, self.identity_model]:
+            content = doc.read_text(encoding="utf-8")
+            self.assertRegex(content, fk_pattern, f"{doc.name} must enforce compound FK to service_accounts(organization_id, principal_id)")
+
+    def test_migration_0005_contract_handles_existing_role_definitions(self):
+        """F: Migration 0005 contract explicitly handles existing role_definitions upgrade and deterministic backfill."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        self.assertIn("## 7. Migration 0005 Upgrade Contract", adr2_text)
+        self.assertIn("new_role_definitions", adr2_text)
+        self.assertIn("WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'owner' THEN 'owner'", adr2_text)
+        self.assertIn("ERR_MIGRATION_UNMAPPABLE_SYSTEM_TEMPLATE", adr2_text)
+
+    def test_migration_0005_contract_handles_existing_service_accounts(self):
+        """G: Migration 0005 contract explicitly handles existing service_accounts upgrade."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        self.assertIn("new_service_accounts", adr2_text)
+        self.assertIn("SELECT sa.id, osp.organization_id, sa.principal_id", adr2_text)
+
+    def test_ambiguous_service_account_ownership_fails_closed(self):
+        """H: Ambiguous service-account ownership fails closed during Migration 0005 preflight."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        self.assertIn("ERR_MIGRATION_ORPHAN_SERVICE_ACCOUNT", adr2_text)
+        self.assertIn("ERR_MIGRATION_AMBIGUOUS_SERVICE_ACCOUNT_OWNERSHIP", adr2_text)
+
+    def test_internal_execution_deny_semantics_without_cidr_matching(self):
+        """I: internal_execution with allow_internal_dispatch=false denies instead of performing CIDR matching."""
+        adr1_text = self.adr1.read_text(encoding="utf-8")
+        auth_text = self.auth_model.read_text(encoding="utf-8")
+        self.assertIn("DENY(CONTEXT_INTERNAL_DISPATCH_DENIED)", adr1_text)
+        self.assertIn("DENY(CONTEXT_INTERNAL_DISPATCH_DENIED)", auth_text)
+        self.assertNotIn("must match configured internal CIDR", adr1_text)
+
+
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):
     """Validate that the live OryolMail repository's .sera directory satisfies fail-closed governance."""
 
@@ -449,3 +534,4 @@ class TestOryolMailLiveRepositoryConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

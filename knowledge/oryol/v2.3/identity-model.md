@@ -92,15 +92,18 @@ CREATE TABLE recovery_methods (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 6. Service Accounts (Machine & Automation Identities)
+-- 6. Service Accounts: Explicit Tenant-Bound Machine & Automation Identities (P0-2)
 CREATE TABLE service_accounts (
     id TEXT PRIMARY KEY,                       -- svc_<ulid>
-    principal_id TEXT UNIQUE NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
     description TEXT,
     system_managed BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(principal_id),
+    UNIQUE(organization_id, principal_id),
+    UNIQUE(organization_id, id)
 );
 
 -- 7. Service Account API Credentials (Hashed)
@@ -131,14 +134,16 @@ CREATE TABLE invitations (
     UNIQUE(organization_id, email, status)
 );
 
--- 9. Organization Service Principals: Explicit Tenant-Bound Service Accounts
+-- 9. Organization Service Principals: Explicit Tenant-Bound Service Accounts (P0-2)
 CREATE TABLE organization_service_principals (
     id TEXT PRIMARY KEY,                       -- osp_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    principal_id TEXT NOT NULL,
     name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, principal_id)
+        REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE,
     UNIQUE(organization_id, principal_id),
     UNIQUE(organization_id, id)
 );
@@ -171,3 +176,5 @@ CREATE TABLE service_principal_role_assignments (
    IdP subject bindings enforce global uniqueness across `(provider_type, provider_issuer, provider_subject)` to prevent tenant-spoofing across multi-tenant IdPs.
 4. **Service Principal Role Confinement & Taxonomy**:
    Service principals receive permissions strictly through `service_principal_role_assignments` evaluated against the active registry version. Human memberships and service principals are strictly segregated in the schema.
+5. **Service Account Tenant Confinement (P0-2)**:
+   A service account has exactly one authoritative owning organization in Phase 1 (`service_accounts.organization_id`). `organization_service_principals` enforces a compound foreign key referencing `service_accounts(organization_id, principal_id)`, structurally preventing a service account owned by Organization A from being bound into Organization B.

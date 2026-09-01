@@ -228,7 +228,7 @@ Session validation and token minting dynamically enforce policies configured in 
 
 ### 8.1 MFA Policy Enforcement
 - **`mfa_enforcement = 'required_all'`**: All authenticated sessions for organization members must satisfy multi-factor authentication. Access tokens carry `mfa_verified: true`. If MFA has not been completed, tokens are minted with `mfa_verified: false`, causing Step 8.4 to return `DENY(CONTEXT_MFA_REQUIRED)` on human requests.
-- **`mfa_enforcement = 'required_admins'`**: Applied specifically to human members holding `template_key IN ('owner', 'admin')`.
+- **`mfa_enforcement = 'required_admins'`**: Applied specifically to human members holding an active system template Admin/Owner role (`is_system_template = TRUE AND template_key IN ('owner', 'admin')`). Custom roles cannot trigger or satisfy this rule.
 
 ### 8.2 Dynamic Session Timeout Policies
 - **Idle Timeout**: On every session activity refresh, `account_sessions.last_active_at` is evaluated against `organization_security_policies.session_idle_timeout_seconds` (default: 86,400s / 24h; min: 300s). If `datetime('now') > datetime(last_active_at, '+' || session_idle_timeout_seconds || ' seconds')`, the session is marked `status = 'expired'`.

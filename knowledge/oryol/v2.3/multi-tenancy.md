@@ -81,18 +81,27 @@ CREATE TABLE organization_permission_registries (
     FOREIGN KEY (organization_id, activated_by_membership_id) REFERENCES memberships(organization_id, id)
 );
 
--- 6. Role Definitions: Organization-Scoped with Immutable System Templates (F-6)
+-- 6. Role Definitions: Organization-Scoped with Immutable System Templates (F-6, P0-1)
 CREATE TABLE role_definitions (
     id TEXT PRIMARY KEY,                       -- rol_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name TEXT NOT NULL,                        -- e.g. 'Billing Auditor', 'Support Lead'
     description TEXT NOT NULL,
     is_system_template BOOLEAN NOT NULL DEFAULT FALSE,
-    template_key TEXT CHECK(template_key IN ('owner', 'admin', 'member') OR template_key IS NULL),
+    template_key TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (is_system_template = 0 AND template_key IS NULL) OR
+        (is_system_template = 1 AND template_key IN ('owner', 'admin', 'member'))
+    ),
     UNIQUE(organization_id, id),
     UNIQUE(organization_id, name)
 );
+
+-- Exactly one system template per template_key per organization (P0-1)
+CREATE UNIQUE INDEX uq_role_definitions_org_template 
+    ON role_definitions(organization_id, template_key) 
+    WHERE template_key IS NOT NULL;
 
 CREATE TRIGGER trg_role_definitions_immutable_template BEFORE UPDATE OF is_system_template, template_key ON role_definitions
 BEGIN
@@ -153,14 +162,16 @@ CREATE TABLE invitations (
     FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE
 );
 
--- 11. Organization Service Principals: Explicit Tenant-Bound Service Accounts
+-- 11. Organization Service Principals: Explicit Tenant-Bound Service Accounts (P0-2)
 CREATE TABLE organization_service_principals (
     id TEXT PRIMARY KEY,                       -- osp_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    principal_id TEXT NOT NULL,
     name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, principal_id)
+        REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE,
     UNIQUE(organization_id, principal_id),
     UNIQUE(organization_id, id)
 );
