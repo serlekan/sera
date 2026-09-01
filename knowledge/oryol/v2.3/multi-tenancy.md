@@ -159,7 +159,9 @@ CREATE TABLE invitations (
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
-    FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE
+    FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+    UNIQUE(organization_id, email, status),
+    UNIQUE(organization_id, id)
 );
 
 -- 11. Organization Service Principals: Explicit Tenant-Bound Service Accounts (P0-2)
@@ -275,7 +277,7 @@ CREATE TABLE organization_security_policies (
     version INTEGER NOT NULL DEFAULT 1,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_by_membership_id TEXT,
-    FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id)
+    FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE SET NULL
 );
 
 -- 18. Organization IP Allowlist Entries (ADR-001)
@@ -289,7 +291,7 @@ CREATE TABLE organization_ip_allowlist_entries (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_by_membership_id TEXT NOT NULL,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id),
+    FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
     UNIQUE(organization_id, cidr_block),
     UNIQUE(organization_id, id)
 );

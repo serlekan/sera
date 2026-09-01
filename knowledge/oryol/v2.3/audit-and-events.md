@@ -133,6 +133,10 @@ CREATE TABLE inbox_events (
 > In Phase 1, `audit_events` are **permanently immutable**. The database engine strictly prohibits both `UPDATE` and `DELETE` on `audit_events`.  
 > When a user exercises GDPR/privacy erasure rights, the audit table is **never updated in place**. Instead, an append-only privacy overlay record is inserted into `audit_redactions`. Read and export queries dynamically apply the overlay to mask PII without altering the stored raw audit event bytes.
 
+> [!NOTE]
+> **Audit Actor Taxonomy vs. Binary Identity Principals (A2-4)**:  
+> `audit_events.actor_type` defines audit telemetry classifications. While Oryol Core enforces a strict binary principal taxonomy (`human` vs `service`) at the authentication and authorization layer (`identity-model.md §1`), audit logging categorizes machine actors with higher specificity (`service` for tenant API clients, `ai` for AI Gateway agent operations, and `system` for internal worker/cron tasks). Underlying identity entities for `ai` and `system` operations map strictly onto `service` principals or internal worker runtime.
+
 ```sql
 -- 1. Append-Only Privacy Redaction Overlay
 CREATE TABLE audit_redactions (

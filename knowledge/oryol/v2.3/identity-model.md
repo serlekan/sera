@@ -123,15 +123,17 @@ CREATE TABLE api_credentials (
 CREATE TABLE invitations (
     id TEXT PRIMARY KEY,                       -- inv_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    inviter_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
     email TEXT NOT NULL,
-    token_hash TEXT NOT NULL,                  -- SHA-256 hash of random invite token
-    role_id TEXT NOT NULL REFERENCES role_definitions(id) ON DELETE RESTRICT,
-    member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest')),
+    role_id TEXT NOT NULL,
+    invited_by_membership_id TEXT NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,           -- SHA-256 hash of random invite token
     expires_at DATETIME NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(organization_id, email, status)
+    FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+    UNIQUE(organization_id, email, status),
+    UNIQUE(organization_id, id)
 );
 
 -- 9. Organization Service Principals: Explicit Tenant-Bound Service Accounts (P0-2)

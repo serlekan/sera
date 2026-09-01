@@ -52,7 +52,7 @@ CREATE TABLE organization_security_policies (
     version INTEGER NOT NULL DEFAULT 1,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_by_membership_id TEXT,
-    FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id)
+    FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE SET NULL
 );
 ```
 
@@ -70,7 +70,7 @@ CREATE TABLE organization_ip_allowlist_entries (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_by_membership_id TEXT NOT NULL,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id),
+    FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
     UNIQUE(organization_id, cidr_block),
     UNIQUE(organization_id, id)
 );
@@ -196,9 +196,10 @@ graph TD
        - If active entries list is empty $\to$ **`DENY(CONTEXT_IP_ALLOWLIST_DENIED)`** (fail-closed).
        - Evaluate `context.ipAddress` against each CIDR block with matching `ip_version` using exact bitwise subnet masking.
        - If no active CIDR matches $\to$ **`DENY(CONTEXT_IP_ALLOWLIST_DENIED)`**.
-6. **Sub-step 8.6 (Device Posture Policy Evaluation — F-2, R-5, R-10)**:
+6. **Sub-step 8.6 (Device Posture Policy Evaluation — F-2, R-5, R-10, A2-1)**:
+   - Device posture evaluation applies **exclusively to interactive Human Principals** (`principal.type === 'human'`). Service principals (`principal.type === 'service'`) authenticate via cryptographic machine credentials and do not carry client device posture; posture evaluation is bypassed for service principals.
    - If `context.clientType === 'internal_execution'`: Handled in Sub-step 8.5 (bypassed if `allow_internal_dispatch === true`, denied if `false`).
-   - If `policy.device_posture_mode != 'disabled'`:
+   - If `principal.type === 'human'` AND `policy.device_posture_mode != 'disabled'`:
      - If `context.devicePosture` is absent, or `source NOT IN ('cloudflare_zero_trust', 'managed_client_cert')`, or $(t_{\text{now}} - t_{\text{verifiedAt}}) \notin [0, 300\text{s}]$ $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.
      - If `policy.device_posture_mode = 'compliant_only'` and `context.devicePosture.state != 'compliant'` $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.
      - If `policy.device_posture_mode = 'managed_only'` and `context.devicePosture.state NOT IN ('compliant', 'managed')` $\to$ **`DENY(CONTEXT_DEVICE_POSTURE_DENIED)`**.

@@ -486,15 +486,17 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         """F: Migration 0005 contract explicitly handles existing role_definitions upgrade and deterministic backfill."""
         adr2_text = self.adr2.read_text(encoding="utf-8")
         self.assertIn("## 7. Migration 0005 Upgrade Contract", adr2_text)
-        self.assertIn("new_role_definitions", adr2_text)
+        self.assertIn("ALTER TABLE role_definitions ADD COLUMN template_key TEXT;", adr2_text)
         self.assertIn("WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'owner' THEN 'owner'", adr2_text)
         self.assertIn("ERR_MIGRATION_UNMAPPABLE_SYSTEM_TEMPLATE", adr2_text)
+        self.assertIn("ERR_MIGRATION_DUPLICATE_SYSTEM_TEMPLATE", adr2_text)
 
     def test_migration_0005_contract_handles_existing_service_accounts(self):
         """G: Migration 0005 contract explicitly handles existing service_accounts upgrade."""
         adr2_text = self.adr2.read_text(encoding="utf-8")
-        self.assertIn("new_service_accounts", adr2_text)
-        self.assertIn("SELECT sa.id, osp.organization_id, sa.principal_id", adr2_text)
+        self.assertIn("ALTER TABLE service_accounts ADD COLUMN organization_id TEXT", adr2_text)
+        self.assertIn("UPDATE service_accounts", adr2_text)
+        self.assertIn("SELECT osp.organization_id", adr2_text)
 
     def test_ambiguous_service_account_ownership_fails_closed(self):
         """H: Ambiguous service-account ownership fails closed during Migration 0005 preflight."""

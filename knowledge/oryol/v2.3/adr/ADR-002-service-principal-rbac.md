@@ -303,60 +303,67 @@ graph TD
 ### 7.1 Preamble & Immutability Boundary
 - Accepted migrations `0001` through `0004` are **immutable, sealed, and must never be edited**.
 - Migration `0005_core_security_policies_and_service_rbac.sql` defines the authoritative, deterministic transition from the v2.2 schema to the v2.3 schema.
-- The entire migration executes within a single atomic D1 transaction. Any constraint violation, ambiguity, or unexpected legacy state MUST immediately abort and roll back the entire migration.
+- The entire migration executes within a single atomic D1 transaction (`db.batch()`). Any constraint violation, ambiguity, or unexpected legacy state MUST immediately abort and roll back the entire migration.
+- **Foreign Key Execution Safety (A0-1)**: Because D1 enforces foreign keys, existing tables with inbound references (`role_definitions`, `service_accounts`) MUST NOT be dropped or recreated via table swap, which would trigger `FOREIGN KEY constraint failed` on child tables (`membership_role_assignments`, `invitations`, `role_permissions`). Instead, existing tables evolve in-place via non-destructive `ALTER TABLE ADD COLUMN`, authoritative in-place `UPDATE` backfill, compound index creation, and database validation triggers.
 
-### 7.2 Step 1: `role_definitions` Table Reconstruction & Backfill
-Existing `role_definitions` (from Migration 0002) lacks `template_key`. Because SQLite/D1 does not support adding complex CHECK constraints and partial indexes via simple `ALTER TABLE`, `role_definitions` is upgraded via table reconstruction:
+### 7.2 Step 1: `role_definitions` In-Place Upgrade & Template Integrity (A0-1, A2-3)
+Existing `role_definitions` (from Migration 0002) is referenced by `membership_role_assignments`, `role_permissions`, and `invitations`. It is upgraded in-place without table dropping:
 
-1. **Create Staging Table**:
+1. **Preflight System Template Validations**:
+   - **Duplicate Template Check (A2-3)**: Verify that no organization possesses duplicate template names that would collide:
+     ```sql
+     SELECT organization_id, template_key, COUNT(*)
+     FROM (
+         SELECT organization_id,
+             CASE
+                 WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'owner' THEN 'owner'
+                 WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'admin' THEN 'admin'
+                 WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'member' THEN 'member'
+             END as template_key
+         FROM role_definitions
+         WHERE is_system_template = 1
+     )
+     GROUP BY organization_id, template_key
+     HAVING COUNT(*) > 1;
+     ```
+     If any row returned $\to$ abort with `ERR_MIGRATION_DUPLICATE_SYSTEM_TEMPLATE`.
+   - **Unmappable Template Check**: Verify that all `is_system_template = 1` rows map to valid canonical keys (`owner`, `admin`, `member`):
+     ```sql
+     SELECT COUNT(*) FROM role_definitions
+     WHERE is_system_template = 1 
+       AND LOWER(TRIM(name)) NOT IN ('owner', 'admin', 'member');
+     ```
+     If `> 0` $\to$ abort with `ERR_MIGRATION_UNMAPPABLE_SYSTEM_TEMPLATE`.
+
+2. **In-Place Schema Evolution & Backfill (A0-1)**:
    ```sql
-   CREATE TABLE new_role_definitions (
-       id TEXT PRIMARY KEY,                       -- rol_<ulid>
-       organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-       name TEXT NOT NULL,
-       description TEXT NOT NULL,
-       is_system_template BOOLEAN NOT NULL DEFAULT FALSE,
-       template_key TEXT,
-       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       CHECK (
-           (is_system_template = 0 AND template_key IS NULL) OR
-           (is_system_template = 1 AND template_key IN ('owner', 'admin', 'member'))
-       ),
-       UNIQUE(organization_id, id),
-       UNIQUE(organization_id, name)
-   );
-   ```
+   -- Add nullable template_key column in-place (preserves all child FKs)
+   ALTER TABLE role_definitions ADD COLUMN template_key TEXT;
 
-2. **Deterministic Data Backfill**:
-   Every existing role row is migrated using deterministic template mapping:
-   ```sql
-   INSERT INTO new_role_definitions (id, organization_id, name, description, is_system_template, template_key, created_at)
-   SELECT
-       id,
-       organization_id,
-       name,
-       description,
-       is_system_template,
-       CASE
-           WHEN is_system_template = 0 THEN NULL
-           WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'owner' THEN 'owner'
-           WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'admin' THEN 'admin'
-           WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'member' THEN 'member'
-           ELSE RAISE(FAIL, 'ERR_MIGRATION_UNMAPPABLE_SYSTEM_TEMPLATE: cannot map is_system_template=1 role with unexpected name')
-       END,
-       created_at
-   FROM role_definitions;
-   ```
-   *Fail-Closed Guarantee*: If any existing row has `is_system_template = 1` but does not match one of the canonical names (`Owner`, `Admin`, `Member`), the migration fails closed immediately. No unmappable system templates are ever silently converted to custom roles or assigned null keys.
+   -- Populate template_key deterministically
+   UPDATE role_definitions
+   SET template_key = CASE
+       WHEN is_system_template = 0 THEN NULL
+       WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'owner' THEN 'owner'
+       WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'admin' THEN 'admin'
+       WHEN is_system_template = 1 AND LOWER(TRIM(name)) = 'member' THEN 'member'
+       ELSE NULL
+   END;
 
-3. **Swap Tables & Create Indices / Triggers**:
-   ```sql
-   DROP TABLE role_definitions;
-   ALTER TABLE new_role_definitions RENAME TO role_definitions;
-
+   -- Enforce canonical uniqueness: at most one template_key per org
    CREATE UNIQUE INDEX uq_role_definitions_org_template 
        ON role_definitions(organization_id, template_key) 
        WHERE template_key IS NOT NULL;
+
+   -- Enforce check constraint and template immutability via triggers
+   CREATE TRIGGER trg_role_definitions_template_invariant_insert BEFORE INSERT ON role_definitions
+   BEGIN
+       SELECT RAISE(FAIL, 'ROLE_TEMPLATE_INVALID: template_key must be NULL for custom roles and non-null for system templates')
+       WHERE NOT (
+           (NEW.is_system_template = 0 AND NEW.template_key IS NULL) OR
+           (NEW.is_system_template = 1 AND NEW.template_key IN ('owner', 'admin', 'member'))
+       );
+   END;
 
    CREATE TRIGGER trg_role_definitions_immutable_template 
        BEFORE UPDATE OF is_system_template, template_key ON role_definitions
@@ -365,39 +372,52 @@ Existing `role_definitions` (from Migration 0002) lacks `template_key`. Because 
    END;
    ```
 
-### 7.3 Step 2: `service_accounts` & `organization_service_principals` Compound Tenant Binding Upgrade (P0-2)
-Migration 0001 created `service_accounts` without `organization_id`. In Migration 0005, `service_accounts` is upgraded to be explicitly tenant-owned, and `organization_service_principals` is upgraded with a compound foreign key:
+### 7.3 Step 2: `service_accounts` In-Place Upgrade & `organization_service_principals` Compound Binding (P0-2, A0-1)
+Migration 0001 created `service_accounts` without `organization_id`. In Migration 0005, `service_accounts` evolves in-place to establish tenant ownership, and `organization_service_principals` (which has no child references in v2.2) is upgraded to enforce the compound foreign key:
 
 1. **Preflight Ownership Validation**:
-   Before reconstructing tables, preflight assertions run:
-   - **Orphan Check**: `SELECT COUNT(*) FROM service_accounts sa WHERE NOT EXISTS (SELECT 1 FROM organization_service_principals osp WHERE osp.principal_id = sa.principal_id)`. If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_SERVICE_ACCOUNT`.
-   - **Ambiguity Check**: `SELECT principal_id, COUNT(DISTINCT organization_id) FROM organization_service_principals GROUP BY principal_id HAVING COUNT(DISTINCT organization_id) > 1`. If any row returned $\to$ abort with `ERR_MIGRATION_AMBIGUOUS_SERVICE_ACCOUNT_OWNERSHIP`.
+   - **Orphan Check**:
+     ```sql
+     SELECT COUNT(*) FROM service_accounts sa 
+     WHERE NOT EXISTS (SELECT 1 FROM organization_service_principals osp WHERE osp.principal_id = sa.principal_id);
+     ```
+     If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_SERVICE_ACCOUNT`.
+   - **Ambiguity Check**:
+     ```sql
+     SELECT principal_id, COUNT(DISTINCT organization_id) 
+     FROM organization_service_principals 
+     GROUP BY principal_id 
+     HAVING COUNT(DISTINCT organization_id) > 1;
+     ```
+     If any row returned $\to$ abort with `ERR_MIGRATION_AMBIGUOUS_SERVICE_ACCOUNT_OWNERSHIP`.
 
-2. **Reconstruct `service_accounts`**:
+2. **In-Place Schema Evolution of `service_accounts`**:
    ```sql
-   CREATE TABLE new_service_accounts (
-       id TEXT PRIMARY KEY,                       -- svc_<ulid>
-       organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
-       principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
-       name TEXT NOT NULL,
-       description TEXT,
-       system_managed BOOLEAN NOT NULL DEFAULT FALSE,
-       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       UNIQUE(principal_id),
-       UNIQUE(organization_id, principal_id),
-       UNIQUE(organization_id, id)
+   -- Add organization_id column in-place (preserves incoming FKs)
+   ALTER TABLE service_accounts ADD COLUMN organization_id TEXT REFERENCES organizations(id) ON DELETE RESTRICT;
+
+   -- Authoritatively backfill organization_id from unique OSP binding
+   UPDATE service_accounts
+   SET organization_id = (
+       SELECT osp.organization_id
+       FROM organization_service_principals osp
+       WHERE osp.principal_id = service_accounts.principal_id
    );
 
-   INSERT INTO new_service_accounts (id, organization_id, principal_id, name, description, system_managed, created_at)
-   SELECT sa.id, osp.organization_id, sa.principal_id, sa.name, sa.description, sa.system_managed, sa.created_at
-   FROM service_accounts sa
-   JOIN organization_service_principals osp ON osp.principal_id = sa.principal_id;
+   -- Create compound unique indexes for tenant isolation and relational targeting
+   CREATE UNIQUE INDEX idx_service_accounts_org_principal ON service_accounts(organization_id, principal_id);
+   CREATE UNIQUE INDEX idx_service_accounts_org_id ON service_accounts(organization_id, id);
 
-   DROP TABLE service_accounts;
-   ALTER TABLE new_service_accounts RENAME TO service_accounts;
+   -- Enforce NOT NULL invariant for all future service accounts
+   CREATE TRIGGER trg_service_accounts_org_not_null BEFORE INSERT ON service_accounts
+   BEGIN
+       SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
+       WHERE NEW.organization_id IS NULL;
+   END;
    ```
 
-3. **Reconstruct `organization_service_principals`**:
+3. **Reconstruct `organization_service_principals` (Zero Child Dependencies in v2.2)**:
+   Because `service_principal_role_assignments` does not exist in v2.2, `organization_service_principals` has zero child FK references and can be safely reconstructed inside the batch to bind compound foreign keys:
    ```sql
    CREATE TABLE new_organization_service_principals (
        id TEXT PRIMARY KEY,                       -- osp_<ulid>
@@ -459,12 +479,13 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
    ```sql
    CREATE TABLE organization_security_policies (
        organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
-       ip_allowlist_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(ip_allowlist_mode IN ('disabled', 'enforced_all', 'enforced_admins')),
-       device_posture_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(device_posture_mode IN ('disabled', 'compliant_only', 'managed_only')),
        mfa_enforcement TEXT NOT NULL DEFAULT 'optional' CHECK(mfa_enforcement IN ('optional', 'required_all', 'required_admins')),
+       ip_allowlist_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(ip_allowlist_mode IN ('disabled', 'enforced_all', 'enforced_admins')),
        allow_internal_dispatch BOOLEAN NOT NULL DEFAULT TRUE,
+       device_posture_mode TEXT NOT NULL DEFAULT 'disabled' CHECK(device_posture_mode IN ('disabled', 'compliant_only', 'managed_only')),
        session_idle_timeout_seconds INTEGER NOT NULL DEFAULT 86400 CHECK(session_idle_timeout_seconds >= 300),
        session_absolute_timeout_seconds INTEGER NOT NULL DEFAULT 604800 CHECK(session_absolute_timeout_seconds >= 3600),
+       version INTEGER NOT NULL DEFAULT 1,
        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
        updated_by_membership_id TEXT,
        FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE SET NULL
@@ -474,20 +495,21 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
 3. **`organization_ip_allowlist_entries`**:
    ```sql
    CREATE TABLE organization_ip_allowlist_entries (
-       id TEXT PRIMARY KEY,                       -- ipa_<ulid>
+       id TEXT PRIMARY KEY,                       -- ipl_<ulid>
        organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-       cidr_block TEXT NOT NULL,
+       cidr_block TEXT NOT NULL,                  -- Valid IPv4 (e.g. '198.51.100.0/24') or IPv6 (e.g. '2001:db8::/32')
        ip_version INTEGER NOT NULL CHECK(ip_version IN (4, 6)),
-       description TEXT NOT NULL,
+       label TEXT NOT NULL,                       -- Human readable identifier (e.g. 'Corporate VPN', 'HQ Office')
        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'disabled')),
        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       created_by_membership_id TEXT,
-       FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE SET NULL,
+       created_by_membership_id TEXT NOT NULL,
+       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
        UNIQUE(organization_id, cidr_block),
        UNIQUE(organization_id, id)
    );
 
-   CREATE INDEX idx_oiae_org_active ON organization_ip_allowlist_entries(organization_id, status);
+   CREATE INDEX idx_ip_allowlist_org_status ON organization_ip_allowlist_entries(organization_id, status);
    ```
 
 4. **Principal Type Immutability Trigger**:
