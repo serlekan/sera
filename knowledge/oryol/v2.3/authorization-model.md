@@ -251,8 +251,7 @@ CREATE TABLE organization_security_policies (
     session_absolute_timeout_seconds INTEGER NOT NULL DEFAULT 604800 CHECK(session_absolute_timeout_seconds >= 3600),
     version INTEGER NOT NULL DEFAULT 1,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_by_membership_id TEXT,
-    FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE SET NULL
+    updated_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL
 );
 
 -- 13. Organization IP Allowlist Entries (ADR-001)
@@ -264,9 +263,8 @@ CREATE TABLE organization_ip_allowlist_entries (
     label TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'disabled')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    created_by_membership_id TEXT NOT NULL,
+    created_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
     UNIQUE(organization_id, cidr_block),
     UNIQUE(organization_id, id)
 );

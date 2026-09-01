@@ -512,6 +512,23 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("DENY(CONTEXT_INTERNAL_DISPATCH_DENIED)", auth_text)
         self.assertNotIn("must match configured internal CIDR", adr1_text)
 
+    def test_policy_authorship_fks_use_single_column_set_null(self):
+        """Verify organization_security_policies and IP allowlist use single-column membership FK with ON DELETE SET NULL."""
+        for doc in [self.adr1, self.auth_model, self.multi_tenancy, self.adr2]:
+            content = doc.read_text(encoding="utf-8")
+            self.assertIn("updated_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL", content, f"{doc.name} must use single-column FK for updated_by")
+            self.assertIn("created_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL", content, f"{doc.name} must use single-column FK for created_by")
+
+    def test_invitations_compound_binding_and_migration(self):
+        """Verify invitations table has compound FK to role_definitions and Migration 0005 defines its reconstruction."""
+        for doc in [self.identity_model, self.multi_tenancy]:
+            content = doc.read_text(encoding="utf-8")
+            self.assertIn("FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT", content)
+            self.assertIn("FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE", content)
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        self.assertIn("### 7.4 Step 3: `invitations` Re-Binding & Compound Role Integrity", adr2_text)
+        self.assertIn("ERR_MIGRATION_ORPHAN_INVITATION", adr2_text)
+
 
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):
     """Validate that the live OryolMail repository's .sera directory satisfies fail-closed governance."""

@@ -454,7 +454,59 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
    END;
    ```
 
-### 7.4 Step 3: Creation of New Tables, Indexes, and Global Triggers
+### 7.4 Step 3: `invitations` Re-Binding & Compound Role Integrity (A1-3, 2.3)
+In v2.2 (Migration 0001), `invitations` used a single-column foreign key `role_id REFERENCES role_definitions(id)` and tracked `inviter_principal_id`. In v2.3, `invitations` establishes universal compound tenant isolation `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and binds to `invited_by_membership_id`.
+Because `invitations` has zero child foreign keys referencing it in v2.2, it is reconstructed inside the atomic batch:
+
+1. **Preflight Invitation Validation**:
+   - Verify all existing invitations reference active memberships within the same organization:
+     ```sql
+     SELECT COUNT(*) FROM invitations i
+     WHERE NOT EXISTS (
+         SELECT 1 FROM memberships m 
+         WHERE m.principal_id = i.inviter_principal_id 
+           AND m.organization_id = i.organization_id
+     );
+     ```
+     If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_INVITATION`.
+
+2. **Reconstruct `invitations` Table**:
+   ```sql
+   CREATE TABLE new_invitations (
+       id TEXT PRIMARY KEY,                       -- inv_<ulid>
+       organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+       email TEXT NOT NULL,
+       role_id TEXT NOT NULL,
+       invited_by_membership_id TEXT NOT NULL,
+       token_hash TEXT UNIQUE NOT NULL,           -- SHA-256 hash of random invite token
+       expires_at DATETIME NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
+       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+       FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
+       FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+       UNIQUE(organization_id, email, status),
+       UNIQUE(organization_id, id)
+   );
+
+   INSERT INTO new_invitations (id, organization_id, email, role_id, invited_by_membership_id, token_hash, expires_at, status, created_at)
+   SELECT
+       i.id,
+       i.organization_id,
+       i.email,
+       i.role_id,
+       m.id,
+       i.token_hash,
+       i.expires_at,
+       i.status,
+       i.created_at
+   FROM invitations i
+   JOIN memberships m ON m.principal_id = i.inviter_principal_id AND m.organization_id = i.organization_id;
+
+   DROP TABLE invitations;
+   ALTER TABLE new_invitations RENAME TO invitations;
+   ```
+
+### 7.5 Step 4: Creation of New Tables, Indexes, and Global Triggers
 1. **`service_principal_role_assignments`**:
    ```sql
    CREATE TABLE service_principal_role_assignments (
@@ -487,8 +539,7 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
        session_absolute_timeout_seconds INTEGER NOT NULL DEFAULT 604800 CHECK(session_absolute_timeout_seconds >= 3600),
        version INTEGER NOT NULL DEFAULT 1,
        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       updated_by_membership_id TEXT,
-       FOREIGN KEY (organization_id, updated_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE SET NULL
+       updated_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL
    );
    ```
 
@@ -502,9 +553,8 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
        label TEXT NOT NULL,                       -- Human readable identifier (e.g. 'Corporate VPN', 'HQ Office')
        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'disabled')),
        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       created_by_membership_id TEXT NOT NULL,
+       created_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL,
        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       FOREIGN KEY (organization_id, created_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
        UNIQUE(organization_id, cidr_block),
        UNIQUE(organization_id, id)
    );
@@ -520,5 +570,5 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
    END;
    ```
 
-### 7.5 Atomicity & Fail-Closed Guarantee
+### 7.6 Atomicity & Fail-Closed Guarantee
 If any preflight validation fails, any SQL statement fails, or any constraint is violated, Cloudflare D1 rolls back the entire batch. No intermediate or inconsistent state is ever persisted. Existing production applications and databases remain in their valid Migration 0004 state.
