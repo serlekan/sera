@@ -492,11 +492,33 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("ERR_MIGRATION_DUPLICATE_SYSTEM_TEMPLATE", adr2_text)
 
     def test_migration_0005_contract_handles_existing_service_accounts(self):
-        """G: Migration 0005 contract explicitly handles existing service_accounts upgrade."""
+        """G: Migration 0005 contract explicitly handles existing service_accounts upgrade and triggers."""
         adr2_text = self.adr2.read_text(encoding="utf-8")
         self.assertIn("ALTER TABLE service_accounts ADD COLUMN organization_id TEXT", adr2_text)
         self.assertIn("UPDATE service_accounts", adr2_text)
         self.assertIn("SELECT osp.organization_id", adr2_text)
+        # INSERT non-null enforcement
+        self.assertIn("CREATE TRIGGER trg_service_accounts_org_not_null BEFORE INSERT ON service_accounts", adr2_text)
+        self.assertIn("SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null", adr2_text)
+        # UPDATE ownership immutability enforcement
+        self.assertIn("CREATE TRIGGER trg_service_accounts_org_immutable BEFORE UPDATE OF organization_id ON service_accounts", adr2_text)
+        self.assertIn("SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1", adr2_text)
+
+    def test_service_accounts_ownership_update_immutability(self):
+        """Verify Migration 0005 enforces immutable service account organization ownership on UPDATE."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        identity_text = self.identity_model.read_text(encoding="utf-8")
+        # Ensure contract defines both INSERT and UPDATE triggers
+        self.assertIn("trg_service_accounts_org_not_null", adr2_text)
+        self.assertIn("trg_service_accounts_org_immutable", adr2_text)
+        self.assertIn("BEFORE UPDATE OF organization_id ON service_accounts", adr2_text)
+        self.assertIn("WHERE NEW.organization_id != OLD.organization_id", adr2_text)
+        self.assertIn("WHERE NEW.organization_id IS NULL", adr2_text)
+        # Ensure Phase 1 canonical ownership rule is declared
+        self.assertIn("A service account has exactly one owning organization", adr2_text)
+        self.assertIn("organization ownership is immutable during Phase 1", adr2_text)
+        self.assertIn("Cross-organization transfer of a service account is NOT supported in Phase 1", adr2_text)
+        self.assertIn("Cross-organization transfer of a service account is NOT supported in Phase 1", identity_text)
 
     def test_ambiguous_service_account_ownership_fails_closed(self):
         """H: Ambiguous service-account ownership fails closed during Migration 0005 preflight."""

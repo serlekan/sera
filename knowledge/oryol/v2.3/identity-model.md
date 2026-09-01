@@ -93,6 +93,7 @@ CREATE TABLE recovery_methods (
 );
 
 -- 6. Service Accounts: Explicit Tenant-Bound Machine & Automation Identities (P0-2)
+-- Note: A service account has exactly one owning organization (organization_id), which is required, tenant-authoritative, and immutable in Phase 1 (cross-organization transfer is NOT supported).
 CREATE TABLE service_accounts (
     id TEXT PRIMARY KEY,                       -- svc_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
@@ -178,5 +179,6 @@ CREATE TABLE service_principal_role_assignments (
    IdP subject bindings enforce global uniqueness across `(provider_type, provider_issuer, provider_subject)` to prevent tenant-spoofing across multi-tenant IdPs.
 4. **Service Principal Role Confinement & Taxonomy**:
    Service principals receive permissions strictly through `service_principal_role_assignments` evaluated against the active registry version. Human memberships and service principals are strictly segregated in the schema.
-5. **Service Account Tenant Confinement (P0-2)**:
-   A service account has exactly one authoritative owning organization in Phase 1 (`service_accounts.organization_id`). `organization_service_principals` enforces a compound foreign key referencing `service_accounts(organization_id, principal_id)`, structurally preventing a service account owned by Organization A from being bound into Organization B.
+5. **Service Account Tenant Confinement & Ownership Immutability (P0-2)**:
+   A service account has exactly one authoritative owning organization in Phase 1 (`service_accounts.organization_id`). Once Migration 0005 has backfilled the organization owner, or once a new service account is created, its organization ownership is immutable during Phase 1 (`organization_id` is required, tenant-authoritative, and immutable after creation/backfill). Cross-organization transfer of a service account is NOT supported in Phase 1; any future transfer capability requires a separate architecture decision. Both creation (INSERT) and update (UPDATE) operations are protected by database triggers: `organization_id` cannot be set to NULL on INSERT or UPDATE, and cannot be changed from one organization to another on UPDATE. `organization_service_principals` enforces a compound foreign key referencing `service_accounts(organization_id, principal_id)`, structurally preventing a service account owned by Organization A from being bound into Organization B.
+

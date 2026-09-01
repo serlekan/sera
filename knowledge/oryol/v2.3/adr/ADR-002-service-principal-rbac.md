@@ -100,6 +100,14 @@ CREATE TABLE service_accounts (
 );
 ```
 
+**Canonical Phase-1 Ownership Rule**:
+- A service account has exactly one owning organization (`service_accounts.organization_id`).
+- Once Migration 0005 has backfilled the organization owner, or once a new service account is created, its organization ownership is immutable during Phase 1 (`organization_id` is required, tenant-authoritative, and immutable after creation/backfill).
+- Cross-organization transfer of a service account is NOT supported in Phase 1 (`organization_id` cannot be modified or set to NULL via UPDATE).
+- A future transfer capability requires a separate architecture decision.
+- Both creation and update operations are protected by database triggers: `organization_id` cannot be set to NULL on INSERT or UPDATE, and cannot be changed from one organization to another on UPDATE.
+
+
 #### Table 2c: `organization_service_principals` Compound Tenant Binding (P0-2)
 `organization_service_principals` enforces tenant confinement through a compound foreign key referencing `service_accounts(organization_id, principal_id)`. An attempt to bind a service account owned by Organization A into Organization B fails with a database foreign key constraint violation:
 
@@ -413,6 +421,15 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
    BEGIN
        SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
        WHERE NEW.organization_id IS NULL;
+   END;
+
+   -- Enforce immutable tenant ownership for service accounts (rejects nullification and cross-organization transfer)
+   CREATE TRIGGER trg_service_accounts_org_immutable BEFORE UPDATE OF organization_id ON service_accounts
+   BEGIN
+       SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
+       WHERE NEW.organization_id IS NULL;
+       SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1')
+       WHERE NEW.organization_id != OLD.organization_id;
    END;
    ```
 

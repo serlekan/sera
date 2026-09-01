@@ -172,6 +172,7 @@ CREATE TABLE membership_role_assignments (
 );
 
 -- 7. Organization Service Principals: Explicit Tenant-Bound Service Accounts (P0-2)
+-- Note: A service account has exactly one owning organization (service_accounts.organization_id), which is required, tenant-authoritative, and immutable in Phase 1 (cross-organization transfer is NOT supported).
 CREATE TABLE organization_service_principals (
     id TEXT PRIMARY KEY,                       -- osp_<ulid>
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
