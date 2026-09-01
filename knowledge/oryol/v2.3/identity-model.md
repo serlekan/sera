@@ -153,7 +153,7 @@ CREATE TABLE service_principal_role_assignments (
     FOREIGN KEY (organization_id, organization_service_principal_id)
         REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, role_id)
-        REFERENCES role_definitions(organization_id, id) ON DELETE CASCADE,
+        REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     UNIQUE(organization_id, organization_service_principal_id, role_id),
     UNIQUE(organization_id, id)
 );
