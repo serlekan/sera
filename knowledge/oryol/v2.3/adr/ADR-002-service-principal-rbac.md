@@ -459,7 +459,7 @@ In v2.2 (Migration 0001), `invitations` used a single-column foreign key `role_i
 Because `invitations` has zero child foreign keys referencing it in v2.2, it is reconstructed inside the atomic batch:
 
 1. **Preflight Invitation Validation**:
-   - Verify all existing invitations reference active memberships within the same organization:
+   - Verify all existing invitations reference valid memberships within the same organization:
      ```sql
      SELECT COUNT(*) FROM invitations i
      WHERE NOT EXISTS (
