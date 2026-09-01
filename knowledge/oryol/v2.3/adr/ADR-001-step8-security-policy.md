@@ -76,6 +76,9 @@ CREATE TABLE organization_ip_allowlist_entries (
 CREATE INDEX idx_ip_allowlist_org_status ON organization_ip_allowlist_entries(organization_id, status);
 ```
 
+#### Rationale for Single-Column Authorship Foreign Keys (F3):
+Authorship metadata columns (`updated_by_membership_id` on `organization_security_policies`, `created_by_membership_id` on `organization_ip_allowlist_entries`) intentionally use single-column foreign keys referencing `memberships(id) ON DELETE SET NULL`. This deliberate architectural design guarantees that de-provisioning an authoring administrator sets only the audit pointer to NULL without cascading deletion to allowlist entries (which would lock tenants out) and without NULLing the primary key `organization_id` (which SQLite's compound `SET NULL` behavior would trigger, silently disabling tenant security policies). Same-organization membership validation is authoritatively enforced at the policy mutation service layer.
+
 ---
 
 ### 3.2 Deterministic CIDR Ingestion & IP Normalization Specification (R-6)

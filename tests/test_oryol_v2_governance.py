@@ -528,6 +528,7 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         adr2_text = self.adr2.read_text(encoding="utf-8")
         self.assertIn("### 7.4 Step 3: `invitations` Re-Binding & Compound Role Integrity", adr2_text)
         self.assertIn("ERR_MIGRATION_ORPHAN_INVITATION", adr2_text)
+        self.assertIn("ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE", adr2_text)
 
 
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):

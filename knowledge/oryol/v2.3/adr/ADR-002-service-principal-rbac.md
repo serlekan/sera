@@ -469,6 +469,16 @@ Because `invitations` has zero child foreign keys referencing it in v2.2, it is 
      );
      ```
      If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_INVITATION`.
+   - Verify all existing invitations reference roles defined within the same organization (F1):
+     ```sql
+     SELECT COUNT(*) FROM invitations i
+     WHERE NOT EXISTS (
+         SELECT 1 FROM role_definitions rd
+         WHERE rd.id = i.role_id
+           AND rd.organization_id = i.organization_id
+     );
+     ```
+     If `> 0` $\to$ abort with `ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE`.
 
 2. **Reconstruct `invitations` Table**:
    ```sql
