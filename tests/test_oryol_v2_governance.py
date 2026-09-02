@@ -541,16 +541,70 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
             self.assertIn("updated_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL", content, f"{doc.name} must use single-column FK for updated_by")
             self.assertIn("created_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL", content, f"{doc.name} must use single-column FK for created_by")
 
-    def test_invitations_compound_binding_and_migration(self):
-        """Verify invitations table has compound FK to role_definitions and Migration 0005 defines its reconstruction."""
+    def test_invitations_predecessor_facts_and_member_type_preservation(self):
+        """A, B, C, D, E: Invitations predecessor facts, member_type preservation, and no-op migration contract."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        manifest_path = self.adr2.parent.parent / "predecessor-schema-manifest.md"
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+
+        # A: ADR-002 no longer contains predecessor inviter_principal_id
+        self.assertNotIn("inviter_principal_id", adr2_text)
+
+        # B & C: Predecessor invitations documented with invited_by_membership_id and compound role FK
+        self.assertIn("invited_by_membership_id", adr2_text)
+        self.assertIn("FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)", adr2_text)
+        self.assertIn("FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id)", adr2_text)
+
+        # D: member_type exists in canonical v2.3 invitations schema
         for doc in [self.identity_model, self.multi_tenancy]:
             content = doc.read_text(encoding="utf-8")
-            self.assertIn("FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT", content)
-            self.assertIn("FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE", content)
-        adr2_text = self.adr2.read_text(encoding="utf-8")
-        self.assertIn("### 7.5 Step 3: `invitations` Re-Binding & Compound Role Integrity", adr2_text)
+            self.assertIn("member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest'))", content)
+
+        # E: Migration 0005 does NOT unnecessarily reconstruct invitations
+        self.assertIn("No structural migration required (No-op)", adr2_text)
+        self.assertIn("MUST NOT reconstruct the `invitations` table", adr2_text)
         self.assertIn("ERR_MIGRATION_ORPHAN_INVITATION", adr2_text)
         self.assertIn("ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE", adr2_text)
+
+    def test_predecessor_schema_manifest_and_parent_key_inventory(self):
+        """F, G, H: Parent-key inventory and self-contained predecessor schema manifest."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        manifest_path = self.adr2.parent.parent / "predecessor-schema-manifest.md"
+        self.assertTrue(manifest_path.is_file(), "predecessor-schema-manifest.md must exist")
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+
+        # G: Manifest pins exact Core SHA and migration hashes
+        self.assertIn("ca3fb9c18e8e061c277a3e2f4f009bbc9b961717", manifest_text)
+        self.assertIn("176f5684e75f4f8a5bbd327bf92a3a837441a234", manifest_text)
+        self.assertIn("086164b60e8f0920b27751e40801c45813e74e4b", manifest_text)
+        self.assertIn("31a906726cc9def79848ac7b92d21efa5d89587d", manifest_text)
+        self.assertIn("9755c8bd8b43a3de45c283d25dbec6c910453625", manifest_text)
+
+        # H: Manifest contains authorization deny chain facts
+        self.assertIn("authorization_subjects (Migration 0003)", manifest_text)
+        self.assertIn("explicit_denies (Migration 0003)", manifest_text)
+        self.assertIn("REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE", manifest_text)
+        self.assertIn("REFERENCES authorization_subjects(organization_id, id) ON DELETE CASCADE", manifest_text)
+
+        # F: Parent-key inventory includes required parent keys in both ADR-002 and manifest
+        for text in [adr2_text, manifest_text]:
+            self.assertIn("role_definitions(organization_id, id)", text)
+            self.assertIn("memberships(organization_id, id)", text)
+            self.assertIn("teams(organization_id, id)", text)
+            self.assertIn("resource_registry(organization_id, resource_type, resource_id)", text)
+            self.assertIn("service_accounts(organization_id, principal_id)", text)
+
+    def test_fresh_install_vs_migrated_schema_equivalence(self):
+        """I: Fresh install vs. migrated schema equivalence is explicitly documented."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        self.assertIn("### 7.7 Fresh Install vs Migrated Schema Equivalence", adr2_text)
+        self.assertIn("service_accounts.organization_id", adr2_text)
+        self.assertIn("trg_service_accounts_org_not_null", adr2_text)
+        self.assertIn("trg_service_accounts_org_immutable", adr2_text)
+        self.assertIn("trg_role_definitions_template_invariant_insert", adr2_text)
+        self.assertIn("trg_role_definitions_immutable_template", adr2_text)
+        self.assertIn("### 7.8 Host-Language Preflight vs D1 Batch Execution Mechanics", adr2_text)
+        self.assertIn("db.batch()", adr2_text)
 
     def test_migration_0005_source_of_truth_and_historical_drift(self):
         """J & I: Migration 0005 defines canonical source of truth and reconciles historical service_accounts drift."""
@@ -606,7 +660,7 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("ALTER TABLE new_explicit_denies RENAME TO explicit_denies;", adr2_text)
 
     def test_migration_0005_sqlite_simulation_fixture(self):
-        """Section 10: In-memory SQLite fixture verifying Migration 0005 reconstruction sequence without data loss or FK errors."""
+        """Section 11: In-memory SQLite fixture verifying Migration 0005 reconstruction sequence and invitation preservation."""
         import sqlite3
         con = sqlite3.connect(":memory:")
         con.execute("PRAGMA foreign_keys = ON;")
@@ -616,6 +670,8 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("CREATE TABLE principals (id TEXT PRIMARY KEY, type TEXT CHECK(type IN ('human', 'service')));")
         con.execute("CREATE TABLE memberships (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id), principal_id TEXT REFERENCES principals(id), UNIQUE(organization_id, id));")
         con.execute("CREATE TABLE teams (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id), UNIQUE(organization_id, id));")
+        con.execute("CREATE TABLE role_definitions (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT NOT NULL, is_system_template INTEGER NOT NULL DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(organization_id, id), UNIQUE(organization_id, name));")
+        con.execute("CREATE TABLE invitations (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, email TEXT NOT NULL, role_id TEXT NOT NULL, invited_by_membership_id TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest')), expires_at DATETIME NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')), created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT, FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE, UNIQUE(organization_id, id));")
         con.execute("CREATE TABLE resource_registry (organization_id TEXT REFERENCES organizations(id), resource_type TEXT, resource_id TEXT, PRIMARY KEY(organization_id, resource_type, resource_id));")
         con.execute("CREATE TABLE service_accounts (id TEXT PRIMARY KEY, principal_id TEXT UNIQUE REFERENCES principals(id), name TEXT);")
         con.execute("""CREATE TABLE organization_service_principals (
@@ -658,12 +714,19 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("INSERT INTO organizations VALUES ('org_1', 'Acme');")
         con.execute("INSERT INTO principals VALUES ('prn_svc_1', 'service'), ('prn_hum_1', 'human');")
         con.execute("INSERT INTO memberships VALUES ('mem_1', 'org_1', 'prn_hum_1');")
+        con.execute("INSERT INTO role_definitions VALUES ('rol_1', 'org_1', 'Admin', 'Admin role', 1, CURRENT_TIMESTAMP);")
+        con.execute("INSERT INTO invitations VALUES ('inv_1', 'org_1', 'newbie@acme.com', 'rol_1', 'mem_1', 'hash_invite_123', 'employee', '2026-10-01 00:00:00', 'pending', CURRENT_TIMESTAMP);")
         con.execute("INSERT INTO service_accounts VALUES ('svc_1', 'prn_svc_1', 'Build Worker');")
         con.execute("INSERT INTO organization_service_principals VALUES ('osp_1', 'org_1', 'prn_svc_1', 'Build Worker', 'active', CURRENT_TIMESTAMP);")
         con.execute("INSERT INTO authorization_subjects (id, organization_id, subject_type, organization_service_principal_id) VALUES ('asb_1', 'org_1', 'service_principal', 'osp_1');")
         con.execute("INSERT INTO explicit_denies VALUES ('dny_1', 'org_1', 'asb_1', 'mail.messages.delete', NULL, NULL, CURRENT_TIMESTAMP);")
 
         # Execute migration simulation:
+        # Step 1: role_definitions in-place upgrade
+        con.execute("ALTER TABLE role_definitions ADD COLUMN template_key TEXT;")
+        con.execute("UPDATE role_definitions SET template_key = 'admin' WHERE id = 'rol_1';")
+        con.execute("CREATE UNIQUE INDEX uq_role_definitions_org_template ON role_definitions(organization_id, template_key) WHERE template_key IS NOT NULL;")
+
         # Step 2a: service_accounts in-place evolution
         con.execute("ALTER TABLE service_accounts ADD COLUMN organization_id TEXT REFERENCES organizations(id) ON DELETE RESTRICT;")
         con.execute("UPDATE service_accounts SET organization_id = (SELECT osp.organization_id FROM organization_service_principals osp WHERE osp.principal_id = service_accounts.principal_id);")
@@ -731,13 +794,33 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("ALTER TABLE new_authorization_subjects RENAME TO authorization_subjects;")
         con.execute("ALTER TABLE new_explicit_denies RENAME TO explicit_denies;")
 
+        # Step 3: invitations is a deliberate NO-OP; verify existing row remains completely preserved
+        inv_row = con.execute("SELECT id, organization_id, email, role_id, invited_by_membership_id, token_hash, member_type, status FROM invitations WHERE id = 'inv_1';").fetchone()
+        self.assertEqual(inv_row, ('inv_1', 'org_1', 'newbie@acme.com', 'rol_1', 'mem_1', 'hash_invite_123', 'employee', 'pending'))
+
+        # Step 4: service_principal_role_assignments created
+        con.execute("""CREATE TABLE service_principal_role_assignments (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            organization_service_principal_id TEXT NOT NULL,
+            role_id TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
+            UNIQUE(organization_id, organization_service_principal_id, role_id),
+            UNIQUE(organization_id, id)
+        );""")
+        con.execute("INSERT INTO service_principal_role_assignments VALUES ('sra_1', 'org_1', 'osp_1', 'rol_1', CURRENT_TIMESTAMP);")
+
         # Assert post-migration state:
         # Same IDs exist
         self.assertIsNotNone(con.execute("SELECT 1 FROM organization_service_principals WHERE id = 'osp_1'").fetchone())
         self.assertIsNotNone(con.execute("SELECT 1 FROM authorization_subjects WHERE id = 'asb_1'").fetchone())
         self.assertIsNotNone(con.execute("SELECT 1 FROM explicit_denies WHERE id = 'dny_1'").fetchone())
+        self.assertIsNotNone(con.execute("SELECT 1 FROM invitations WHERE id = 'inv_1'").fetchone())
+        self.assertIsNotNone(con.execute("SELECT 1 FROM service_principal_role_assignments WHERE id = 'sra_1'").fetchone())
 
-        # FK integrity check
+        # FK integrity check: MUST report ZERO violations
         fk_violations = con.execute("PRAGMA foreign_key_check;").fetchall()
         self.assertEqual(len(fk_violations), 0, f"Foreign key check reported violations: {fk_violations}")
 

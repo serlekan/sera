@@ -25,7 +25,7 @@
 
 ## 2. Canonical Architecture v2.3 Document Registry
 
-The following 15 canonical documents constitute the proposed Architecture v2.3 baseline:
+The following 16 canonical documents constitute the proposed Architecture v2.3 baseline:
 
 1. [`workspace-architecture.md`](workspace-architecture.md) — Two-tier platform hierarchy (`Platform -> Core -> Applications`), 7 permanent architecture rules, and Virel financial domain ownership.
 2. [`core-boundaries.md`](core-boundaries.md) — Core platform capabilities vs. product business domains; authoritative security policy ownership (`organization_security_policies`, `organization_ip_allowlist_entries`), email DNS verification, and attachment persistence.
@@ -42,6 +42,7 @@ The following 15 canonical documents constitute the proposed Architecture v2.3 b
 13. [`sera-governance.md`](sera-governance.md) — Standardized 5-file `.sera/` repository layout, multi-signal detection outside `.sera/`, and deterministic fail-closed policy enforcement.
 14. [`adr/ADR-001-step8-security-policy.md`](adr/ADR-001-step8-security-policy.md) — Architectural Decision Record for Core-Owned Security Policy, IP CIDR Allowlisting, Trusted Device Posture, and deterministic internal dispatch denial.
 15. [`adr/ADR-002-service-principal-rbac.md`](adr/ADR-002-service-principal-rbac.md) — Architectural Decision Record for Service Principal RBAC, Step 6 Evaluation, Role Template Invariants, Compound Tenant Ownership, and Migration 0005 Upgrade Contract.
+16. [`predecessor-schema-manifest.md`](predecessor-schema-manifest.md) — Self-contained pinned manifest of the actual accepted executable predecessor database schema (`serlekan/oryol-core` @ `ca3fb9c18e8e061c277a3e2f4f009bbc9b961717`), verbatim DDL excerpts, blob hashes, and compound parent-key inventory.
 
 ---
 
@@ -55,3 +56,4 @@ The following 15 canonical documents constitute the proposed Architecture v2.3 b
 - **2026-08-30**: Adversarial Architecture Review remediations F-1 through F-10 and R-1 through R-10 applied.
 - **2026-09-01**: Service principal role foreign key deletion semantics aligned to `ON DELETE RESTRICT`.
 - **2026-09-01**: Security gate remediation: closed P0-1 system role template forgery, P0-2 service-principal tenant escape, P0-3 Migration 0005 deterministic upgrade contract, and P1 internal execution CIDR contradiction.
+- **2026-09-02**: Migration 0005 dependency-chain remediation: established 7-phase shadow reconstruction algorithm safeguarding authorization subjects and explicit-deny policies from cascading deletion (Finding A); reconciled historical service account tenant ownership drift against accepted Migration 0001 (Finding B); established immutable service account tenant ownership triggers; corrected predecessor invitations schema facts and confirmed invitations preservation as no-op; inventoried compound foreign key parent-key eligibility; added self-contained predecessor schema manifest; documented fresh-install vs. migrated schema equivalence and host preflight vs. D1 batch mechanics.

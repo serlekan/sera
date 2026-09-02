@@ -155,12 +155,12 @@ CREATE TABLE invitations (
     role_id TEXT NOT NULL,
     invited_by_membership_id TEXT NOT NULL,
     token_hash TEXT UNIQUE NOT NULL,
+    member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest')),
     expires_at DATETIME NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
-    UNIQUE(organization_id, email, status),
     UNIQUE(organization_id, id)
 );
 

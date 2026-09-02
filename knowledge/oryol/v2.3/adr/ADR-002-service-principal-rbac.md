@@ -325,7 +325,7 @@ graph TD
 - **Foreign Key Execution Safety (A0-1)**: Because D1 enforces foreign keys, existing tables with inbound references (`role_definitions`, `service_accounts`) MUST NOT be dropped or recreated via simple table swap. Tables evolve via non-destructive in-place `ALTER TABLE ADD COLUMN`, authoritative backfill, compound indexes, triggers, or through deterministic shadow-table reconstruction that migrates the complete dependent chain.
 
 ### 7.2 Predecessor Executable Schema Audit & Inbound Dependency Inventory
-To prevent faulty migration assumptions, Migration 0005 is audited directly against the actual accepted executable migrations in `serlekan/oryol-core` at commit `ca3fb9c18e8e061c277a3e2f4f009bbc9b961717`:
+To prevent faulty migration assumptions, Migration 0005 is audited directly against the actual accepted executable migrations in `serlekan/oryol-core` at commit `ca3fb9c18e8e061c277a3e2f4f009bbc9b961717`. A complete, self-contained verbatim excerpt of all load-bearing predecessor tables and their Git blob hashes is pinned in [predecessor-schema-manifest.md](file:///C:/Users/lekan/Documents/sera/repo/knowledge/oryol/v2.3/predecessor-schema-manifest.md).
 
 | Migration 0005 Assumption | Actual Predecessor Schema Evidence (Core 0001–0004) | v2.2 Architectural Intent | v2.3 Target | Required Upgrade Operation |
 |---|---|---|---|---|
@@ -334,7 +334,22 @@ To prevent faulty migration assumptions, Migration 0005 is audited directly agai
 | `organization_service_principals` compound ownership FK | Migration 0002 defines single-column FK `principal_id REFERENCES principals(id) ON DELETE CASCADE`. | Single-column FK to `principals(id)`. | Compound FK `(organization_id, principal_id) REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE`. | Shadow table reconstruction migrating the full dependent authorization chain. |
 | `authorization_subjects` inbound OSP FK | Migration 0003 defines `FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE`. | Compound FK binding service principals to OSP. | Rebound compound FK to reconstructed `organization_service_principals(organization_id, id)`. | Shadow table reconstruction preserving all subject types (`membership`, `team`, `service_principal`) and IDs. |
 | `explicit_denies` inbound authorization_subject FK | Migration 0003 defines `FOREIGN KEY (organization_id, authorization_subject_id) REFERENCES authorization_subjects(organization_id, id) ON DELETE CASCADE`. | Compound FK binding denies to `authorization_subjects`. | Rebound compound FK to reconstructed `authorization_subjects(organization_id, id)`. | Shadow table reconstruction preserving all explicit-deny IDs and policy rules. |
-| `invitations` role/member structure | Migration 0002 defines single-column `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and `member_type`, binding to `inviter_principal_id`. | Intended compound FKs. | Compound FKs to `role_definitions(organization_id, id)` and `memberships(organization_id, id)`. | Preflight validation and atomic table reconstruction (zero child foreign key references). |
+| `invitations` tenant role/member integrity | Migration 0002 already defines compound FKs `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT` and `FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE`, and preserves `member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest'))`. | Invitation role and inviter attribution are tenant-confined and invitation member classification is retained. | Preserve these invariants with zero schema degradation. | **No structural migration required (No-op)**. Predecessor table is already structurally sound and matches canonical target invariants; existing schema, constraints, and data are preserved untouched. |
+
+#### Canonical Compound Parent-Key Eligibility Inventory
+SQLite requires that parent columns referenced by compound foreign keys must be backed by an explicit `PRIMARY KEY` or `UNIQUE` constraint on the parent table (otherwise raising `foreign key mismatch` at DML time). The following table inventories and verifies parent-key validity for all compound foreign keys interacting with Migration 0005:
+
+| Referenced Parent Table & Key | Predecessor Source Migration | Constraint Type in Predecessor DDL | Child Tables Referencing This Parent Key |
+|---|---|---|---|
+| `role_definitions(organization_id, id)` | `0002_core_tenancy_and_rbac.sql:80` | `UNIQUE(organization_id, id)` | `invitations` (predecessor 0002), `membership_role_assignments` (predecessor 0002), `service_principal_role_assignments` (Migration 0005) |
+| `memberships(organization_id, id)` | `0002_core_tenancy_and_rbac.sql:20` | `UNIQUE(organization_id, id)` | `invitations` (predecessor 0002), `authorization_subjects` (0003 & shadow), `team_memberships` (0002) |
+| `teams(organization_id, id)` | `0002_core_tenancy_and_rbac.sql:30` | `UNIQUE(organization_id, id)` | `authorization_subjects` (0003 & shadow), `team_memberships` (0002) |
+| `organization_service_principals(organization_id, id)` | `0002_core_tenancy_and_rbac.sql:115` | `UNIQUE(organization_id, id)` | `authorization_subjects` (0003 & shadow), `service_principal_role_assignments` (Migration 0005) |
+| `authorization_subjects(organization_id, id)` | `0003_core_resource_registry_and_apps.sql:28` | `UNIQUE(organization_id, id)` | `explicit_denies` (0003 & shadow) |
+| `resource_registry(organization_id, resource_type, resource_id)` | `0003_core_resource_registry_and_apps.sql:13` | `PRIMARY KEY (organization_id, resource_type, resource_id)` | `explicit_denies` (0003 & shadow), `resource_grants` (0003) |
+| `service_accounts(organization_id, principal_id)` | `0005_core_security_policies_and_service_rbac.sql` | `CREATE UNIQUE INDEX idx_service_accounts_org_principal ON service_accounts(organization_id, principal_id);` | `new_organization_service_principals` (Migration 0005 target) |
+
+Every compound parent key referenced by Migration 0005 target DDL is physically backed by an explicit `PRIMARY KEY` or `UNIQUE` constraint in the executable predecessor schema or explicitly created in-place by Migration 0005 prior to referencing.
 
 #### Actual Inbound Foreign Key Inventory for OSP & Authorization Deny Chain
 `organization_service_principals` **DOES HAVE CHILD DEPENDENCIES** in the accepted predecessor schema:
@@ -660,67 +675,38 @@ END;
 3. Validate representative service-principal explicit-deny resolution to confirm policy evaluation executes identically before and after migration.
 Any verification failure immediately rolls back the atomic transaction.
 
-### 7.5 Step 3: `invitations` Re-Binding & Compound Role Integrity (A1-3, 2.3)
-In predecessor Migration 0002, `invitations` used a single-column foreign key `role_id REFERENCES role_definitions(id)` and tracked `inviter_principal_id`. In v2.3, `invitations` establishes universal compound tenant isolation `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and binds to `invited_by_membership_id`.
-Because `invitations` has zero child foreign keys referencing it in the predecessor schema, it is reconstructed inside the atomic batch:
+### 7.5 Step 3: `invitations` Predecessor Equivalence & Preservation (No Structural Migration Required)
+Audit of accepted Migration 0002 confirms that `invitations` in the executable predecessor schema already provides:
+- Compound tenant-scoped role foreign key: `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT`
+- Compound tenant-scoped inviter membership foreign key: `FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE`
+- Member classification preservation: `member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest'))`
+- Tenant-bound primary identification: `id TEXT PRIMARY KEY` with `UNIQUE(organization_id, id)`
+- Cryptographic token hash: `token_hash TEXT UNIQUE NOT NULL`
 
-1. **Preflight Invitation Validation**:
-   - Verify all existing invitations reference valid memberships within the same organization:
-     ```sql
-     SELECT COUNT(*) FROM invitations i
-     WHERE NOT EXISTS (
-         SELECT 1 FROM memberships m 
-         WHERE m.principal_id = i.inviter_principal_id 
-           AND m.organization_id = i.organization_id
-     );
-     ```
-     If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_INVITATION`.
-   - Verify all existing invitations reference roles defined within the same organization (F1):
-     ```sql
-     SELECT COUNT(*) FROM invitations i
-     WHERE NOT EXISTS (
-         SELECT 1 FROM role_definitions rd
-         WHERE rd.id = i.role_id
-           AND rd.organization_id = i.organization_id
-     );
-     ```
-     If `> 0` $\to$ abort with `ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE`.
+#### 1. Architectural Invariant: No Unnecessary Table Reconstruction
+Because the accepted predecessor schema already enforces canonical compound tenant isolation and preserves `member_type`, Migration 0005 **MUST NOT reconstruct the `invitations` table**. Reconstructing an already-correct table without functional or security necessity introduces unneeded operational risk and potential data loss. The existing `invitations` table, its schema, constraints, and all existing records are preserved completely untouched (No-op).
 
-2. **Reconstruct `invitations` Table**:
-   ```sql
-   CREATE TABLE new_invitations (
-       id TEXT PRIMARY KEY,                       -- inv_<ulid>
-       organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-       email TEXT NOT NULL,
-       role_id TEXT NOT NULL,
-       invited_by_membership_id TEXT NOT NULL,
-       token_hash TEXT UNIQUE NOT NULL,           -- SHA-256 hash of random invite token
-       expires_at DATETIME NOT NULL,
-       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'revoked', 'expired')),
-       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
-       FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
-       UNIQUE(organization_id, email, status),
-       UNIQUE(organization_id, id)
-   );
+#### 2. Host-Language Preflight Integrity Validations
+Before executing the structural migration batch, trusted migration orchestration executes the following non-destructive read-only assertions:
+```sql
+-- 1. Verify all existing invitations reference valid memberships within the same organization:
+SELECT COUNT(*) FROM invitations i
+WHERE NOT EXISTS (
+    SELECT 1 FROM memberships m 
+    WHERE m.id = i.invited_by_membership_id 
+      AND m.organization_id = i.organization_id
+);
+-- If > 0 -> abort with ERR_MIGRATION_ORPHAN_INVITATION
 
-   INSERT INTO new_invitations (id, organization_id, email, role_id, invited_by_membership_id, token_hash, expires_at, status, created_at)
-   SELECT
-       i.id,
-       i.organization_id,
-       i.email,
-       i.role_id,
-       m.id,
-       i.token_hash,
-       i.expires_at,
-       i.status,
-       i.created_at
-   FROM invitations i
-   JOIN memberships m ON m.principal_id = i.inviter_principal_id AND m.organization_id = i.organization_id;
-
-   DROP TABLE invitations;
-   ALTER TABLE new_invitations RENAME TO invitations;
-   ```
+-- 2. Verify all existing invitations reference roles defined within the same organization (F1):
+SELECT COUNT(*) FROM invitations i
+WHERE NOT EXISTS (
+    SELECT 1 FROM role_definitions rd
+    WHERE rd.id = i.role_id
+      AND rd.organization_id = i.organization_id
+);
+-- If > 0 -> abort with ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE
+```
 
 ### 7.6 Step 4: Creation of New Tables, Indexes, and Global Triggers
 1. **`service_principal_role_assignments`**:
@@ -786,5 +772,36 @@ Because `invitations` has zero child foreign keys referencing it in the predeces
    END;
    ```
 
-### 7.6 Atomicity & Fail-Closed Guarantee
+### 7.7 Fresh Install vs Migrated Schema Equivalence
+The v2.3 architecture specifications (such as `identity-model.md` and `multi-tenancy.md`) show the canonical target DDL definitions intended for fresh database initialization. For existing production databases, Migration 0005 evolves the actual executable predecessor schema (`0001` through `0004`) to establish 100% equivalent authorization and relational invariants.
+
+Because SQLite / Cloudflare D1 does not allow changing column nullability in place (`ALTER TABLE ALTER COLUMN`) or adding inline table `CHECK` constraints to existing tables, the physical DDL paths differ slightly while runtime security semantics remain strictly identical:
+
+| Feature / Invariant | Fresh Install (Target DDL) | Migrated Schema (Predecessor + Migration 0005) | Invariant Equivalence Guarantee |
+|---|---|---|---|
+| `service_accounts.organization_id` | Column declared `TEXT NOT NULL REFERENCES organizations(id)` inline in `CREATE TABLE`. | `ALTER TABLE ADD COLUMN organization_id TEXT`, backfilled from OSP, compound unique indexes created, and guarded by `trg_service_accounts_org_not_null` (on INSERT) and `trg_service_accounts_org_immutable` (on UPDATE). | Disallows NULL on INSERT, disallows NULL or modification on UPDATE; strictly enforces immutable single-tenant ownership. |
+| `role_definitions` System Template Invariants | Inline table `CHECK ((is_system_template = 0 AND template_key IS NULL) OR (is_system_template = 1 AND template_key IN ('owner', 'admin', 'member')))` in `CREATE TABLE`. | `ALTER TABLE ADD COLUMN template_key TEXT`, backfilled deterministically, unique partial index `uq_role_definitions_org_template`, guarded by `trg_role_definitions_template_invariant_insert` (on INSERT) and `trg_role_definitions_immutable_template` (on UPDATE). | Disallows unmappable templates, disallows custom roles with templates, disallows modifying template designations, enforces at most one of each template key per organization. |
+| `role_definitions` Unique Names | `UNIQUE(organization_id, name)` inline in `CREATE TABLE`. | Predecessor Migration 0002 already defined `UNIQUE(organization_id, name)`. | Preserved untouched from predecessor schema. |
+| `organization_service_principals` Compound Binding | Inline compound FK `(organization_id, principal_id) REFERENCES service_accounts(organization_id, principal_id)` in `CREATE TABLE`. | Reconstructed via shadow table `new_organization_service_principals` with compound FK, verified via parity assertions, and promoted root-to-leaf with taxonomy triggers. | Enforces strict compound tenant isolation; service principals can only bind service accounts in their own tenant. |
+| `invitations` Tenant Binding & Classification | Inline compound FKs to `role_definitions` and `memberships`, `member_type`, and `token_hash`. | Predecessor Migration 0002 already defines compound FKs `(organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and `(organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id)`, plus `member_type`. | Preserved as no-op. Zero difference in schema, FKs, or data between fresh install and migrated database. |
+
+There is zero semantic or authorization divergence between a fresh install and a migrated database.
+
+### 7.8 Host-Language Preflight vs D1 Batch Execution Mechanics
+Migration 0005 execution separates pre-flight validation from atomic batch execution:
+
+1. **Host-Language Preflight Phase (Pre-Batch Guards)**:
+   - Executed by the trusted migration orchestrator (deployment runner / Cloudflare Worker) prior to submitting the DDL batch.
+   - Evaluates read-only semantic queries (`SELECT COUNT(*) ...`) for orphan service accounts, ambiguous ownership, principal taxonomy, authorization subject references, explicit deny integrity, and invitation integrity.
+   - If any query returns a non-zero count, the runner immediately halts deployment with a typed error code (`ERR_MIGRATION_*`) without issuing DDL or mutating database state.
+
+2. **Atomic D1 Batch Execution Phase (`db.batch()`)**:
+   - Executes the deterministic DDL and DML sequence (in-place column additions, backfills, indexes, triggers, shadow table creation, data copy, leaf-to-root drop, and root-to-leaf rename) in a single atomic transaction.
+   - Relies on SQLite engine-level constraint enforcement, compound foreign keys, and trigger raises (`SELECT RAISE(FAIL, ...)`).
+   - If any statement in the batch fails, SQLite / Cloudflare D1 automatically rolls back the entire batch.
+
+3. **Post-Batch Parity Phase**:
+   - The runner re-verifies row count preservation and policy resolution against the pre-batch baseline before marking the migration successful.
+
+### 7.9 Atomicity & Fail-Closed Guarantee
 If any preflight validation fails, any SQL statement fails, or any constraint is violated, Cloudflare D1 rolls back the entire batch. No intermediate or inconsistent state is ever persisted. Existing production applications and databases remain in their valid Migration 0004 state.
