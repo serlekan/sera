@@ -308,13 +308,58 @@ graph TD
 
 ## 7. Migration 0005 Upgrade Contract: `0005_core_security_policies_and_service_rbac.sql` (P0-3)
 
-### 7.1 Preamble & Immutability Boundary
+### 7.1 Preamble, Immutability Boundary & Canonical Source-of-Truth Roles
 - Accepted migrations `0001` through `0004` are **immutable, sealed, and must never be edited**.
-- Migration `0005_core_security_policies_and_service_rbac.sql` defines the authoritative, deterministic transition from the v2.2 schema to the v2.3 schema.
+- Migration `0005_core_security_policies_and_service_rbac.sql` defines the authoritative, deterministic transition from the actual executable `0001`–`0004` predecessor schema to the v2.3 target schema.
 - The entire migration executes within a single atomic D1 transaction (`db.batch()`). Any constraint violation, ambiguity, or unexpected legacy state MUST immediately abort and roll back the entire migration.
-- **Foreign Key Execution Safety (A0-1)**: Because D1 enforces foreign keys, existing tables with inbound references (`role_definitions`, `service_accounts`) MUST NOT be dropped or recreated via table swap, which would trigger `FOREIGN KEY constraint failed` on child tables (`membership_role_assignments`, `invitations`, `role_permissions`). Instead, existing tables evolve in-place via non-destructive `ALTER TABLE ADD COLUMN`, authoritative in-place `UPDATE` backfill, compound index creation, and database validation triggers.
+- **Canonical Migration 0005 Source-of-Truth Roles**:
+  - **A. Frozen Architecture v2.2**: Describes the previously approved **INTENDED** architecture semantics.
+  - **B. Accepted Oryol Core Migrations 0001–0004**: Describe the **ACTUAL EXECUTABLE predecessor database schema**.
+  - **C. Architecture v2.3**: Defines the **TARGET** semantics.
+  - **D. Migration 0005**: MUST deterministically transform the actual executable `0001`–`0004` schema into the v2.3 target while restoring any approved v2.2 invariant that implementation previously omitted.
+  - **E. Accepted Migrations 0001–0004**: Remain permanently immutable.
+- **Historical Architecture / Implementation Drift**:
+  Frozen Architecture v2.2 specified `service_accounts.organization_id` as required tenant ownership (`TEXT NOT NULL`). The accepted executable Core Migration 0001 omitted this column (`service_accounts` was created without `organization_id`). Because migrations 0001–0004 are sealed and immutable, Migration 0005 is the explicit reconciliation point that resolves this historical implementation drift by adding, backfilling, validating, and permanently enforcing `organization_id`.
+- **Lifecycle Invariant vs Migration Mechanism (Preserve Security State)**:
+  `ON DELETE CASCADE` is runtime lifecycle behavior, **NOT a data migration mechanism**. Migration 0005 MUST NEVER intentionally cascade-delete authorization state and then attempt to infer or reconstruct it afterward. Particularly, service-principal explicit denies (`explicit_denies`) and authorization subjects (`authorization_subjects`) are security-critical authorization policy state that must be preserved explicitly before any predecessor table retirement.
+- **Foreign Key Execution Safety (A0-1)**: Because D1 enforces foreign keys, existing tables with inbound references (`role_definitions`, `service_accounts`) MUST NOT be dropped or recreated via simple table swap. Tables evolve via non-destructive in-place `ALTER TABLE ADD COLUMN`, authoritative backfill, compound indexes, triggers, or through deterministic shadow-table reconstruction that migrates the complete dependent chain.
 
-### 7.2 Step 1: `role_definitions` In-Place Upgrade & Template Integrity (A0-1, A2-3)
+### 7.2 Predecessor Executable Schema Audit & Inbound Dependency Inventory
+To prevent faulty migration assumptions, Migration 0005 is audited directly against the actual accepted executable migrations in `serlekan/oryol-core` at commit `ca3fb9c18e8e061c277a3e2f4f009bbc9b961717`:
+
+| Migration 0005 Assumption | Actual Predecessor Schema Evidence (Core 0001–0004) | v2.2 Architectural Intent | v2.3 Target | Required Upgrade Operation |
+|---|---|---|---|---|
+| `role_definitions.template_key` | Migration 0002 defines `role_definitions` with `is_system_template INTEGER NOT NULL DEFAULT 0` but no `template_key` column. | System role template identification (`Owner`, `Admin`, `Member`). | `template_key TEXT` with partial unique index `uq_role_definitions_org_template`. | In-place `ALTER TABLE ADD COLUMN template_key TEXT;`, deterministic `UPDATE` backfill, triggers. |
+| `service_accounts.organization_id` | Migration 0001 defines `service_accounts(id, principal_id, name, description, system_managed, created_at)` omitting `organization_id`. | `organization_id TEXT NOT NULL REFERENCES organizations(id)`. | `organization_id TEXT NOT NULL REFERENCES organizations(id)` immutable in Phase 1. | In-place `ALTER TABLE ADD COLUMN`, backfill from OSP, compound unique indexes, INSERT NOT NULL & UPDATE immutability triggers. |
+| `organization_service_principals` compound ownership FK | Migration 0002 defines single-column FK `principal_id REFERENCES principals(id) ON DELETE CASCADE`. | Single-column FK to `principals(id)`. | Compound FK `(organization_id, principal_id) REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE`. | Shadow table reconstruction migrating the full dependent authorization chain. |
+| `authorization_subjects` inbound OSP FK | Migration 0003 defines `FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE`. | Compound FK binding service principals to OSP. | Rebound compound FK to reconstructed `organization_service_principals(organization_id, id)`. | Shadow table reconstruction preserving all subject types (`membership`, `team`, `service_principal`) and IDs. |
+| `explicit_denies` inbound authorization_subject FK | Migration 0003 defines `FOREIGN KEY (organization_id, authorization_subject_id) REFERENCES authorization_subjects(organization_id, id) ON DELETE CASCADE`. | Compound FK binding denies to `authorization_subjects`. | Rebound compound FK to reconstructed `authorization_subjects(organization_id, id)`. | Shadow table reconstruction preserving all explicit-deny IDs and policy rules. |
+| `invitations` role/member structure | Migration 0002 defines single-column `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and `member_type`, binding to `inviter_principal_id`. | Intended compound FKs. | Compound FKs to `role_definitions(organization_id, id)` and `memberships(organization_id, id)`. | Preflight validation and atomic table reconstruction (zero child foreign key references). |
+
+#### Actual Inbound Foreign Key Inventory for OSP & Authorization Deny Chain
+`organization_service_principals` **DOES HAVE CHILD DEPENDENCIES** in the accepted predecessor schema:
+```text
+organization_service_principals (Migration 0002)
+    ▲
+    │ Inbound FK: (organization_id, organization_service_principal_id) ON DELETE CASCADE
+authorization_subjects (Migration 0003)
+    ▲
+    │ Inbound FK: (organization_id, authorization_subject_id) ON DELETE CASCADE
+explicit_denies (Migration 0003)
+```
+
+**Fatal Risk of Naive OSP Drop**:
+Dropping `organization_service_principals` while child rows exist would either fail closed with `FOREIGN KEY constraint failed` under D1 foreign key enforcement, or, if foreign keys were disabled/cascaded, trigger a cascading deletion: `organization_service_principals → authorization_subjects → explicit_denies`. This would silently erase service-principal explicit-deny policies, creating a catastrophic fail-open vulnerability.
+
+**Hard Security Invariant: Authorization Deny Chain Preservation**:
+Migration 0005 MUST unconditionally preserve:
+1. All `organization_service_principals` IDs (`osp_...`)
+2. All `authorization_subjects` IDs (`asb_...`), including `membership`, `team`, and `service_principal` types
+3. All `explicit_denies` IDs (`dny_...`)
+4. All existing explicit-deny policies and action patterns
+No service-principal deny rule may disappear, change ID, or be weakened during OSP schema evolution.
+
+### 7.3 Step 1: `role_definitions` In-Place Upgrade & Template Integrity (A0-1, A2-3)
 Existing `role_definitions` (from Migration 0002) is referenced by `membership_role_assignments`, `role_permissions`, and `invitations`. It is upgraded in-place without table dropping:
 
 1. **Preflight System Template Validations**:
@@ -380,9 +425,10 @@ Existing `role_definitions` (from Migration 0002) is referenced by `membership_r
    END;
    ```
 
-### 7.3 Step 2: `service_accounts` In-Place Upgrade & `organization_service_principals` Compound Binding (P0-2, A0-1)
-Migration 0001 created `service_accounts` without `organization_id`. In Migration 0005, `service_accounts` evolves in-place to establish tenant ownership, and `organization_service_principals` (which has no child references in v2.2) is upgraded to enforce the compound foreign key:
+### 7.4 Step 2: `service_accounts` In-Place Evolution & Dependent Authorization Deny Chain Reconstruction (P0-2, A0-1)
+Migration 0001 omitted `organization_id` on `service_accounts`. In Migration 0005, `service_accounts` evolves in-place to establish permanent tenant ownership, and `organization_service_principals` along with its downstream dependent authorization chain (`authorization_subjects`, `explicit_denies`) is safely reconstructed using a deterministic 7-phase algorithm:
 
+#### Part 1: `service_accounts` In-Place Evolution
 1. **Preflight Ownership Validation**:
    - **Orphan Check**:
      ```sql
@@ -433,47 +479,190 @@ Migration 0001 created `service_accounts` without `organization_id`. In Migratio
    END;
    ```
 
-3. **Reconstruct `organization_service_principals` (Zero Child Dependencies in v2.2)**:
-   Because `service_principal_role_assignments` does not exist in v2.2, `organization_service_principals` has zero child FK references and can be safely reconstructed inside the batch to bind compound foreign keys:
+#### Part 2: Canonical OSP & Dependent Authorization Deny Chain Reconstruction Strategy
+Because SQLite/D1 cannot alter foreign key constraints in place on `organization_service_principals`, and because dropping OSP directly would trigger catastrophic cascading deletions of authorization subjects and explicit denies, the migration executes a safe shadow-table reconstruction of the complete dependency chain:
+
+##### Phase A — Preflight Validation & Baseline Row Counts
+Before executing any DDL:
+1. **Validate Principal Taxonomy**:
    ```sql
-   CREATE TABLE new_organization_service_principals (
-       id TEXT PRIMARY KEY,                       -- osp_<ulid>
-       organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-       principal_id TEXT NOT NULL,
-       name TEXT NOT NULL,
-       status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
-       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-       FOREIGN KEY (organization_id, principal_id)
-           REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE,
-       UNIQUE(organization_id, principal_id),
-       UNIQUE(organization_id, id)
-   );
-
-   INSERT INTO new_organization_service_principals (id, organization_id, principal_id, name, status, created_at)
-   SELECT id, organization_id, principal_id, name, status, created_at
-   FROM organization_service_principals;
-
-   DROP TABLE organization_service_principals;
-   ALTER TABLE new_organization_service_principals RENAME TO organization_service_principals;
-
-   CREATE TRIGGER trg_osp_service_principal_insert_check BEFORE INSERT ON organization_service_principals
-   BEGIN
-       SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
-       FROM principals
-       WHERE id = NEW.principal_id AND type != 'service';
-   END;
-
-   CREATE TRIGGER trg_osp_service_principal_update_check BEFORE UPDATE OF principal_id ON organization_service_principals
-   BEGIN
-       SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
-       FROM principals
-       WHERE id = NEW.principal_id AND type != 'service';
-   END;
+   SELECT COUNT(*) FROM organization_service_principals osp
+   JOIN principals p ON p.id = osp.principal_id
+   WHERE p.type != 'service';
    ```
+   If `> 0` $\to$ abort with `ERR_MIGRATION_INVALID_OSP_TAXONOMY`.
+2. **Validate OSP Service Account Correspondence**:
+   ```sql
+   SELECT COUNT(*) FROM organization_service_principals osp
+   WHERE NOT EXISTS (SELECT 1 FROM service_accounts sa WHERE sa.principal_id = osp.principal_id);
+   ```
+   If `> 0` $\to$ abort with `ERR_MIGRATION_OSP_MISSING_SERVICE_ACCOUNT`.
+3. **Validate All `authorization_subjects` Inbound References**:
+   ```sql
+   SELECT COUNT(*) FROM authorization_subjects asb
+   WHERE (asb.subject_type = 'membership' AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.id = asb.membership_id AND m.organization_id = asb.organization_id))
+      OR (asb.subject_type = 'team' AND NOT EXISTS (SELECT 1 FROM teams t WHERE t.id = asb.team_id AND t.organization_id = asb.organization_id))
+      OR (asb.subject_type = 'service_principal' AND NOT EXISTS (SELECT 1 FROM organization_service_principals osp WHERE osp.id = asb.organization_service_principal_id AND osp.organization_id = asb.organization_id));
+   ```
+   If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_AUTH_SUBJECT`.
+4. **Validate All `explicit_denies` References**:
+   ```sql
+   SELECT COUNT(*) FROM explicit_denies dny
+   WHERE NOT EXISTS (
+       SELECT 1 FROM authorization_subjects asb 
+       WHERE asb.id = dny.authorization_subject_id 
+         AND asb.organization_id = dny.organization_id
+   );
+   ```
+   If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_EXPLICIT_DENY`.
+5. **Record Preflight Row Count Baseline**:
+   Capture expected counts for `organization_service_principals`, `authorization_subjects`, and `explicit_denies`.
 
-### 7.4 Step 3: `invitations` Re-Binding & Compound Role Integrity (A1-3, 2.3)
-In v2.2 (Migration 0001), `invitations` used a single-column foreign key `role_id REFERENCES role_definitions(id)` and tracked `inviter_principal_id`. In v2.3, `invitations` establishes universal compound tenant isolation `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and binds to `invited_by_membership_id`.
-Because `invitations` has zero child foreign keys referencing it in v2.2, it is reconstructed inside the atomic batch:
+##### Phase B — Create Target Shadow Tables
+Construct shadow tables equipped with target v2.3 compound foreign keys without modifying the live tables:
+```sql
+CREATE TABLE new_organization_service_principals (
+    id TEXT PRIMARY KEY,                       -- osp_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    principal_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, principal_id)
+        REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE,
+    UNIQUE(organization_id, principal_id),
+    UNIQUE(organization_id, id)
+);
+
+CREATE TABLE new_authorization_subjects (
+    id TEXT PRIMARY KEY,                       -- asb_<ulid>
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('membership', 'team', 'service_principal')),
+    membership_id TEXT,
+    team_id TEXT,
+    organization_service_principal_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, team_id) REFERENCES teams(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES new_organization_service_principals(organization_id, id) ON DELETE CASCADE,
+    UNIQUE(organization_id, id),
+    CHECK (
+        (subject_type = 'membership' AND membership_id IS NOT NULL AND team_id IS NULL AND organization_service_principal_id IS NULL) OR
+        (subject_type = 'team' AND team_id IS NOT NULL AND membership_id IS NULL AND organization_service_principal_id IS NULL) OR
+        (subject_type = 'service_principal' AND organization_service_principal_id IS NOT NULL AND membership_id IS NULL AND team_id IS NULL)
+    )
+);
+
+CREATE TABLE new_explicit_denies (
+    id TEXT PRIMARY KEY,                       -- dny_<ulid>
+    organization_id TEXT NOT NULL,
+    authorization_subject_id TEXT NOT NULL,
+    action_pattern TEXT NOT NULL,
+    resource_type TEXT,
+    resource_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (organization_id, authorization_subject_id) REFERENCES new_authorization_subjects(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, resource_type, resource_id) REFERENCES resource_registry(organization_id, resource_type, resource_id) ON DELETE CASCADE,
+    UNIQUE(organization_id, id)
+);
+```
+
+##### Phase C — Copy Data Preserving All IDs, Columns, and Subject Types
+Explicitly copy all existing state into shadow tables, preserving all primary keys:
+```sql
+-- 1. Copy OSP rows
+INSERT INTO new_organization_service_principals (id, organization_id, principal_id, name, status, created_at)
+SELECT id, organization_id, principal_id, name, status, created_at
+FROM organization_service_principals;
+
+-- 2. Copy ALL authorization subjects (membership, team, and service_principal)
+INSERT INTO new_authorization_subjects (id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at)
+SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at
+FROM authorization_subjects;
+
+-- 3. Copy ALL explicit deny policies
+INSERT INTO new_explicit_denies (id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at)
+SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at
+FROM explicit_denies;
+```
+
+##### Phase D — Verify Shadow Parity Before Destructive DDL
+Before retiring any legacy table, strictly verify shadow table completeness:
+```sql
+-- 1. Exact Row Count Parity Check
+SELECT
+    (SELECT COUNT(*) FROM organization_service_principals) == (SELECT COUNT(*) FROM new_organization_service_principals) AS osp_match,
+    (SELECT COUNT(*) FROM authorization_subjects) == (SELECT COUNT(*) FROM new_authorization_subjects) AS asb_match,
+    (SELECT COUNT(*) FROM explicit_denies) == (SELECT COUNT(*) FROM new_explicit_denies) AS dny_match;
+-- If any match != 1 -> abort with ERR_MIGRATION_SHADOW_PARITY_MISMATCH
+
+-- 2. Complete ID Preservation Check
+SELECT COUNT(*) FROM organization_service_principals old_osp
+WHERE NOT EXISTS (SELECT 1 FROM new_organization_service_principals new_osp WHERE new_osp.id = old_osp.id);
+-- If > 0 -> abort with ERR_MIGRATION_SHADOW_ID_LOSS
+
+SELECT COUNT(*) FROM authorization_subjects old_asb
+WHERE NOT EXISTS (SELECT 1 FROM new_authorization_subjects new_asb WHERE new_asb.id = old_asb.id);
+-- If > 0 -> abort with ERR_MIGRATION_SHADOW_ID_LOSS
+
+SELECT COUNT(*) FROM explicit_denies old_dny
+WHERE NOT EXISTS (SELECT 1 FROM new_explicit_denies new_dny WHERE new_dny.id = old_dny.id);
+-- If > 0 -> abort with ERR_MIGRATION_SHADOW_ID_LOSS
+
+-- 3. Relational Targeting Verification
+SELECT COUNT(*) FROM new_authorization_subjects asb
+WHERE asb.subject_type = 'service_principal'
+  AND NOT EXISTS (SELECT 1 FROM new_organization_service_principals osp WHERE osp.id = asb.organization_service_principal_id);
+-- If > 0 -> abort with ERR_MIGRATION_SHADOW_RELATION_MISMATCH
+
+SELECT COUNT(*) FROM new_explicit_denies dny
+WHERE NOT EXISTS (SELECT 1 FROM new_authorization_subjects asb WHERE asb.id = dny.authorization_subject_id);
+-- If > 0 -> abort with ERR_MIGRATION_SHADOW_RELATION_MISMATCH
+```
+
+##### Phase E — Remove Old Chain Leaf-to-Root (Retirement Order)
+Only after shadow parity is fully verified, retire the predecessor tables in strict leaf-to-root order:
+```sql
+-- Leaf-to-root retirement guarantees zero cascading deletion and complies with SQLite FK rules:
+DROP TABLE explicit_denies;
+DROP TABLE authorization_subjects;
+DROP TABLE organization_service_principals;
+```
+*Under no circumstances may a parent table be dropped while dependent child tables exist.*
+
+##### Phase F — Promote Shadow Tables Root-to-Leaf (Rename Order)
+Promote the shadow tables to authoritative tables in root-to-leaf order and recreate triggers:
+```sql
+-- Root-to-leaf promotion:
+ALTER TABLE new_organization_service_principals RENAME TO organization_service_principals;
+ALTER TABLE new_authorization_subjects RENAME TO authorization_subjects;
+ALTER TABLE new_explicit_denies RENAME TO explicit_denies;
+
+-- Recreate canonical service principal taxonomy triggers
+CREATE TRIGGER trg_osp_service_principal_insert_check BEFORE INSERT ON organization_service_principals
+BEGIN
+    SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'service';
+END;
+
+CREATE TRIGGER trg_osp_service_principal_update_check BEFORE UPDATE OF principal_id ON organization_service_principals
+BEGIN
+    SELECT RAISE(FAIL, 'OSP_PRINCIPAL_TYPE_INVALID: organization_service_principals may only bind service principals')
+    FROM principals
+    WHERE id = NEW.principal_id AND type != 'service';
+END;
+```
+
+##### Phase G — Post-Migration Parity Verification
+1. Re-verify row counts for all three tables match the initial preflight baseline.
+2. Execute `PRAGMA foreign_key_check;` to assert zero foreign key constraint violations across the entire database.
+3. Validate representative service-principal explicit-deny resolution to confirm policy evaluation executes identically before and after migration.
+Any verification failure immediately rolls back the atomic transaction.
+
+### 7.5 Step 3: `invitations` Re-Binding & Compound Role Integrity (A1-3, 2.3)
+In predecessor Migration 0002, `invitations` used a single-column foreign key `role_id REFERENCES role_definitions(id)` and tracked `inviter_principal_id`. In v2.3, `invitations` establishes universal compound tenant isolation `FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and binds to `invited_by_membership_id`.
+Because `invitations` has zero child foreign keys referencing it in the predecessor schema, it is reconstructed inside the atomic batch:
 
 1. **Preflight Invitation Validation**:
    - Verify all existing invitations reference valid memberships within the same organization:
@@ -533,7 +722,7 @@ Because `invitations` has zero child foreign keys referencing it in v2.2, it is 
    ALTER TABLE new_invitations RENAME TO invitations;
    ```
 
-### 7.5 Step 4: Creation of New Tables, Indexes, and Global Triggers
+### 7.6 Step 4: Creation of New Tables, Indexes, and Global Triggers
 1. **`service_principal_role_assignments`**:
    ```sql
    CREATE TABLE service_principal_role_assignments (

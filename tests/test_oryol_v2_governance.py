@@ -548,9 +548,209 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
             self.assertIn("FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT", content)
             self.assertIn("FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE", content)
         adr2_text = self.adr2.read_text(encoding="utf-8")
-        self.assertIn("### 7.4 Step 3: `invitations` Re-Binding & Compound Role Integrity", adr2_text)
+        self.assertIn("### 7.5 Step 3: `invitations` Re-Binding & Compound Role Integrity", adr2_text)
         self.assertIn("ERR_MIGRATION_ORPHAN_INVITATION", adr2_text)
         self.assertIn("ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE", adr2_text)
+
+    def test_migration_0005_source_of_truth_and_historical_drift(self):
+        """J & I: Migration 0005 defines canonical source of truth and reconciles historical service_accounts drift."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        # Identifies actual accepted migrations 0001-0004 as executable predecessor schema
+        self.assertIn("Accepted migrations `0001` through `0004` are **immutable, sealed, and must never be edited**", adr2_text)
+        self.assertIn("ACTUAL EXECUTABLE predecessor database schema", adr2_text)
+        self.assertIn("Frozen Architecture v2.2**: Describes the previously approved **INTENDED** architecture semantics", adr2_text)
+        self.assertIn("Architecture v2.3**: Defines the **TARGET** semantics", adr2_text)
+        # Explicitly documents historical drift
+        self.assertIn("Historical Architecture / Implementation Drift", adr2_text)
+        self.assertIn("Frozen Architecture v2.2 specified `service_accounts.organization_id` as required tenant ownership", adr2_text)
+        self.assertIn("The accepted executable Core Migration 0001 omitted this column", adr2_text)
+        self.assertIn("Migration 0005 is the explicit reconciliation point", adr2_text)
+
+    def test_migration_0005_inbound_fk_inventory_and_child_dependencies(self):
+        """A, B, C: ADR-002 inventories inbound FKs, names authorization_subjects & explicit_denies, and rejects zero-child OSP claim."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        # Must NOT claim OSP has zero child dependencies
+        self.assertNotIn("organization_service_principals has zero child", adr2_text)
+        self.assertNotIn("organization_service_principals (Zero Child Dependencies", adr2_text)
+        # Must explicitly state OSP DOES HAVE child dependencies
+        self.assertIn("`organization_service_principals` **DOES HAVE CHILD DEPENDENCIES**", adr2_text)
+        # Inbound dependency chain names authorization_subjects and explicit_denies
+        self.assertIn("authorization_subjects (Migration 0003)", adr2_text)
+        self.assertIn("explicit_denies (Migration 0003)", adr2_text)
+        self.assertIn("Inbound FK: (organization_id, organization_service_principal_id) ON DELETE CASCADE", adr2_text)
+        self.assertIn("Inbound FK: (organization_id, authorization_subject_id) ON DELETE CASCADE", adr2_text)
+        # Disallow using cascade as migration mechanism
+        self.assertIn("ON DELETE CASCADE` is runtime lifecycle behavior, **NOT a data migration mechanism**", adr2_text)
+
+    def test_migration_0005_authorization_deny_chain_preservation_contract(self):
+        """D, E, F, G, H: Migration contract preserves all IDs, mandates shadow parity and leaf-to-root drop order."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+        # ID preservation
+        self.assertIn("All `organization_service_principals` IDs", adr2_text)
+        self.assertIn("All `authorization_subjects` IDs", adr2_text)
+        self.assertIn("All `explicit_denies` IDs", adr2_text)
+        # Shadow parity verification before destructive DDL
+        self.assertIn("##### Phase D — Verify Shadow Parity Before Destructive DDL", adr2_text)
+        self.assertIn("ERR_MIGRATION_SHADOW_PARITY_MISMATCH", adr2_text)
+        self.assertIn("ERR_MIGRATION_SHADOW_ID_LOSS", adr2_text)
+        self.assertIn("ERR_MIGRATION_SHADOW_RELATION_MISMATCH", adr2_text)
+        # Leaf-to-root retirement order
+        self.assertIn("##### Phase E — Remove Old Chain Leaf-to-Root (Retirement Order)", adr2_text)
+        self.assertIn("DROP TABLE explicit_denies;", adr2_text)
+        self.assertIn("DROP TABLE authorization_subjects;", adr2_text)
+        self.assertIn("DROP TABLE organization_service_principals;", adr2_text)
+        # Root-to-leaf promotion order
+        self.assertIn("##### Phase F — Promote Shadow Tables Root-to-Leaf (Rename Order)", adr2_text)
+        self.assertIn("ALTER TABLE new_organization_service_principals RENAME TO organization_service_principals;", adr2_text)
+        self.assertIn("ALTER TABLE new_authorization_subjects RENAME TO authorization_subjects;", adr2_text)
+        self.assertIn("ALTER TABLE new_explicit_denies RENAME TO explicit_denies;", adr2_text)
+
+    def test_migration_0005_sqlite_simulation_fixture(self):
+        """Section 10: In-memory SQLite fixture verifying Migration 0005 reconstruction sequence without data loss or FK errors."""
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("PRAGMA foreign_keys = ON;")
+
+        # Predecessor schema 0001-0004
+        con.execute("CREATE TABLE organizations (id TEXT PRIMARY KEY, name TEXT);")
+        con.execute("CREATE TABLE principals (id TEXT PRIMARY KEY, type TEXT CHECK(type IN ('human', 'service')));")
+        con.execute("CREATE TABLE memberships (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id), principal_id TEXT REFERENCES principals(id), UNIQUE(organization_id, id));")
+        con.execute("CREATE TABLE teams (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id), UNIQUE(organization_id, id));")
+        con.execute("CREATE TABLE resource_registry (organization_id TEXT REFERENCES organizations(id), resource_type TEXT, resource_id TEXT, PRIMARY KEY(organization_id, resource_type, resource_id));")
+        con.execute("CREATE TABLE service_accounts (id TEXT PRIMARY KEY, principal_id TEXT UNIQUE REFERENCES principals(id), name TEXT);")
+        con.execute("""CREATE TABLE organization_service_principals (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(organization_id, principal_id),
+            UNIQUE(organization_id, id)
+        );""")
+        con.execute("""CREATE TABLE authorization_subjects (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            subject_type TEXT NOT NULL CHECK(subject_type IN ('membership', 'team', 'service_principal')),
+            membership_id TEXT,
+            team_id TEXT,
+            organization_service_principal_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, team_id) REFERENCES teams(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES organization_service_principals(organization_id, id) ON DELETE CASCADE,
+            UNIQUE(organization_id, id)
+        );""")
+        con.execute("""CREATE TABLE explicit_denies (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL,
+            authorization_subject_id TEXT NOT NULL,
+            action_pattern TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id, authorization_subject_id) REFERENCES authorization_subjects(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, resource_type, resource_id) REFERENCES resource_registry(organization_id, resource_type, resource_id) ON DELETE CASCADE,
+            UNIQUE(organization_id, id)
+        );""")
+
+        # Seed data
+        con.execute("INSERT INTO organizations VALUES ('org_1', 'Acme');")
+        con.execute("INSERT INTO principals VALUES ('prn_svc_1', 'service'), ('prn_hum_1', 'human');")
+        con.execute("INSERT INTO memberships VALUES ('mem_1', 'org_1', 'prn_hum_1');")
+        con.execute("INSERT INTO service_accounts VALUES ('svc_1', 'prn_svc_1', 'Build Worker');")
+        con.execute("INSERT INTO organization_service_principals VALUES ('osp_1', 'org_1', 'prn_svc_1', 'Build Worker', 'active', CURRENT_TIMESTAMP);")
+        con.execute("INSERT INTO authorization_subjects (id, organization_id, subject_type, organization_service_principal_id) VALUES ('asb_1', 'org_1', 'service_principal', 'osp_1');")
+        con.execute("INSERT INTO explicit_denies VALUES ('dny_1', 'org_1', 'asb_1', 'mail.messages.delete', NULL, NULL, CURRENT_TIMESTAMP);")
+
+        # Execute migration simulation:
+        # Step 2a: service_accounts in-place evolution
+        con.execute("ALTER TABLE service_accounts ADD COLUMN organization_id TEXT REFERENCES organizations(id) ON DELETE RESTRICT;")
+        con.execute("UPDATE service_accounts SET organization_id = (SELECT osp.organization_id FROM organization_service_principals osp WHERE osp.principal_id = service_accounts.principal_id);")
+        con.execute("CREATE UNIQUE INDEX idx_service_accounts_org_principal ON service_accounts(organization_id, principal_id);")
+        con.execute("CREATE UNIQUE INDEX idx_service_accounts_org_id ON service_accounts(organization_id, id);")
+
+        # Step 2b: Create shadow tables
+        con.execute("""CREATE TABLE new_organization_service_principals (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id, principal_id) REFERENCES service_accounts(organization_id, principal_id) ON DELETE CASCADE,
+            UNIQUE(organization_id, principal_id),
+            UNIQUE(organization_id, id)
+        );""")
+        con.execute("""CREATE TABLE new_authorization_subjects (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            subject_type TEXT NOT NULL CHECK(subject_type IN ('membership', 'team', 'service_principal')),
+            membership_id TEXT,
+            team_id TEXT,
+            organization_service_principal_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id, membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, team_id) REFERENCES teams(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, organization_service_principal_id) REFERENCES new_organization_service_principals(organization_id, id) ON DELETE CASCADE,
+            UNIQUE(organization_id, id)
+        );""")
+        con.execute("""CREATE TABLE new_explicit_denies (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL,
+            authorization_subject_id TEXT NOT NULL,
+            action_pattern TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id, authorization_subject_id) REFERENCES new_authorization_subjects(organization_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (organization_id, resource_type, resource_id) REFERENCES resource_registry(organization_id, resource_type, resource_id) ON DELETE CASCADE,
+            UNIQUE(organization_id, id)
+        );""")
+
+        # Step 2c: Copy data
+        con.execute("INSERT INTO new_organization_service_principals SELECT id, organization_id, principal_id, name, status, created_at FROM organization_service_principals;")
+        con.execute("INSERT INTO new_authorization_subjects SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects;")
+        con.execute("INSERT INTO new_explicit_denies SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies;")
+
+        # Step 2d: Parity checks
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM organization_service_principals").fetchone()[0],
+                         con.execute("SELECT COUNT(*) FROM new_organization_service_principals").fetchone()[0])
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM authorization_subjects").fetchone()[0],
+                         con.execute("SELECT COUNT(*) FROM new_authorization_subjects").fetchone()[0])
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM explicit_denies").fetchone()[0],
+                         con.execute("SELECT COUNT(*) FROM new_explicit_denies").fetchone()[0])
+
+        # Step 2e: Remove old chain leaf-to-root
+        con.execute("DROP TABLE explicit_denies;")
+        con.execute("DROP TABLE authorization_subjects;")
+        con.execute("DROP TABLE organization_service_principals;")
+
+        # Step 2f: Promote shadow tables root-to-leaf
+        con.execute("ALTER TABLE new_organization_service_principals RENAME TO organization_service_principals;")
+        con.execute("ALTER TABLE new_authorization_subjects RENAME TO authorization_subjects;")
+        con.execute("ALTER TABLE new_explicit_denies RENAME TO explicit_denies;")
+
+        # Assert post-migration state:
+        # Same IDs exist
+        self.assertIsNotNone(con.execute("SELECT 1 FROM organization_service_principals WHERE id = 'osp_1'").fetchone())
+        self.assertIsNotNone(con.execute("SELECT 1 FROM authorization_subjects WHERE id = 'asb_1'").fetchone())
+        self.assertIsNotNone(con.execute("SELECT 1 FROM explicit_denies WHERE id = 'dny_1'").fetchone())
+
+        # FK integrity check
+        fk_violations = con.execute("PRAGMA foreign_key_check;").fetchall()
+        self.assertEqual(len(fk_violations), 0, f"Foreign key check reported violations: {fk_violations}")
+
+        # Policy resolution succeeds
+        row = con.execute("""
+            SELECT dny.id, dny.action_pattern, asb.subject_type, osp.name, sa.name
+            FROM explicit_denies dny
+            JOIN authorization_subjects asb ON asb.id = dny.authorization_subject_id
+            JOIN organization_service_principals osp ON osp.id = asb.organization_service_principal_id
+            JOIN service_accounts sa ON sa.organization_id = osp.organization_id AND sa.principal_id = osp.principal_id
+            WHERE dny.id = 'dny_1';
+        """).fetchone()
+        self.assertEqual(row, ('dny_1', 'mail.messages.delete', 'service_principal', 'Build Worker', 'Build Worker'))
 
 
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):
