@@ -125,7 +125,7 @@ CREATE TABLE invitations (
 
 *Predecessor Audit Notes*:
 1. `role_definitions` already carries `UNIQUE(organization_id, id)` and `UNIQUE(organization_id, name)`. It defines `is_system_template` without `template_key`.
-2. `invitations` already binds via **compound foreign keys**: `(organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and `(organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id)`. It preserves `member_type`.
+2. `invitations` already binds via **compound foreign keys**: `(organization_id, role_id) REFERENCES role_definitions(organization_id, id)` and `(organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id)`. It preserves `member_type`. Predecessor Migration 0002 omitted `UNIQUE(organization_id, email, status)`, which Migration 0005 restores via preflight duplicate validation and in-place `CREATE UNIQUE INDEX uq_invitations_org_email_status ON invitations(organization_id, email, status);` without table reconstruction.
 3. `organization_service_principals` already carries `UNIQUE(organization_id, id)` and `UNIQUE(organization_id, principal_id)`.
 
 ---

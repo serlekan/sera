@@ -542,29 +542,55 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
             self.assertIn("created_by_membership_id TEXT REFERENCES memberships(id) ON DELETE SET NULL", content, f"{doc.name} must use single-column FK for created_by")
 
     def test_invitations_predecessor_facts_and_member_type_preservation(self):
-        """A, B, C, D, E: Invitations predecessor facts, member_type preservation, and no-op migration contract."""
+        """A, B, C: Invitations predecessor facts, member_type preservation, in-place uniqueness, and no-reconstruction contract."""
         adr2_text = self.adr2.read_text(encoding="utf-8")
         manifest_path = self.adr2.parent.parent / "predecessor-schema-manifest.md"
         manifest_text = manifest_path.read_text(encoding="utf-8")
 
-        # A: ADR-002 no longer contains predecessor inviter_principal_id
+        # ADR-002 no longer contains predecessor inviter_principal_id
         self.assertNotIn("inviter_principal_id", adr2_text)
 
-        # B & C: Predecessor invitations documented with invited_by_membership_id and compound role FK
+        # Predecessor invitations documented with invited_by_membership_id and compound role FK
         self.assertIn("invited_by_membership_id", adr2_text)
         self.assertIn("FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id)", adr2_text)
         self.assertIn("FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id)", adr2_text)
 
-        # D: member_type exists in canonical v2.3 invitations schema
+        # member_type and UNIQUE(organization_id, email, status) exist in canonical v2.3 invitations schema
         for doc in [self.identity_model, self.multi_tenancy]:
             content = doc.read_text(encoding="utf-8")
             self.assertIn("member_type TEXT NOT NULL DEFAULT 'employee' CHECK(member_type IN ('employee', 'contractor', 'guest'))", content)
+            self.assertIn("UNIQUE(organization_id, email, status)", content)
 
-        # E: Migration 0005 does NOT unnecessarily reconstruct invitations
-        self.assertIn("No structural migration required (No-op)", adr2_text)
+        # Migration 0005 adds uniqueness in place and does NOT reconstruct the invitations table
+        self.assertIn("No table reconstruction required", adr2_text)
         self.assertIn("MUST NOT reconstruct the `invitations` table", adr2_text)
+        self.assertIn("uq_invitations_org_email_status", adr2_text)
+        self.assertIn("ERR_MIGRATION_DUPLICATE_INVITATION_STATE", adr2_text)
         self.assertIn("ERR_MIGRATION_ORPHAN_INVITATION", adr2_text)
         self.assertIn("ERR_MIGRATION_CROSS_ORG_INVITATION_ROLE", adr2_text)
+
+    def test_migration_0005_atomic_batch_and_assertion_mechanics(self):
+        """D, E, F, G: In-batch assertion table, parity before drop, confirmation semantics, and host preflight outside batch."""
+        adr2_text = self.adr2.read_text(encoding="utf-8")
+
+        # D: Phase D defines actual in-batch failure assertions via _migration_assert table with CHECK(value = 1)
+        self.assertIn("CREATE TABLE _migration_assert (", adr2_text)
+        self.assertIn("value INTEGER NOT NULL CHECK(value = 1)", adr2_text)
+        self.assertIn("INSERT INTO _migration_assert(value)", adr2_text)
+        self.assertIn("DROP TABLE _migration_assert;", adr2_text)
+
+        # E: Parity assertions execute before old deny-chain tables are dropped
+        phase_d_idx = adr2_text.index("##### Phase D — Atomic In-Batch Parity Assertions Before Destructive DDL")
+        phase_e_idx = adr2_text.index("##### Phase E — Remove Old Chain Leaf-to-Root (Retirement Order)")
+        self.assertLess(phase_d_idx, phase_e_idx, "Phase D assertions must execute strictly before Phase E table drops")
+
+        # F: Post-batch checks are NOT described as rollback-capable
+        self.assertIn("##### Phase G — Post-Batch Confirmation", adr2_text)
+        self.assertIn("Post-batch checks execute on the committed database and cannot roll back", adr2_text)
+        self.assertIn("MIGRATION_POSTCONDITION_FAILURE", adr2_text)
+
+        # G: Host preflight is explicitly outside db.batch
+        self.assertIn("Host-Language Preflight Phase (Pre-Batch Guards, Outside `db.batch`)", adr2_text)
 
     def test_predecessor_schema_manifest_and_parent_key_inventory(self):
         """F, G, H: Parent-key inventory and self-contained predecessor schema manifest."""
@@ -604,7 +630,7 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("trg_role_definitions_template_invariant_insert", adr2_text)
         self.assertIn("trg_role_definitions_immutable_template", adr2_text)
         self.assertIn("### 7.8 Host-Language Preflight vs D1 Batch Execution Mechanics", adr2_text)
-        self.assertIn("db.batch()", adr2_text)
+        self.assertIn("db.batch", adr2_text)
 
     def test_migration_0005_source_of_truth_and_historical_drift(self):
         """J & I: Migration 0005 defines canonical source of truth and reconciles historical service_accounts drift."""
@@ -643,11 +669,6 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("All `organization_service_principals` IDs", adr2_text)
         self.assertIn("All `authorization_subjects` IDs", adr2_text)
         self.assertIn("All `explicit_denies` IDs", adr2_text)
-        # Shadow parity verification before destructive DDL
-        self.assertIn("##### Phase D — Verify Shadow Parity Before Destructive DDL", adr2_text)
-        self.assertIn("ERR_MIGRATION_SHADOW_PARITY_MISMATCH", adr2_text)
-        self.assertIn("ERR_MIGRATION_SHADOW_ID_LOSS", adr2_text)
-        self.assertIn("ERR_MIGRATION_SHADOW_RELATION_MISMATCH", adr2_text)
         # Leaf-to-root retirement order
         self.assertIn("##### Phase E — Remove Old Chain Leaf-to-Root (Retirement Order)", adr2_text)
         self.assertIn("DROP TABLE explicit_denies;", adr2_text)
@@ -660,7 +681,7 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("ALTER TABLE new_explicit_denies RENAME TO explicit_denies;", adr2_text)
 
     def test_migration_0005_sqlite_simulation_fixture(self):
-        """Section 11: In-memory SQLite fixture verifying Migration 0005 reconstruction sequence and invitation preservation."""
+        """Section 4: In-memory SQLite fixture verifying Migration 0005 in-batch assertion checkpoint and invitation uniqueness."""
         import sqlite3
         con = sqlite3.connect(":memory:")
         con.execute("PRAGMA foreign_keys = ON;")
@@ -776,13 +797,35 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("INSERT INTO new_authorization_subjects SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects;")
         con.execute("INSERT INTO new_explicit_denies SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies;")
 
-        # Step 2d: Parity checks
-        self.assertEqual(con.execute("SELECT COUNT(*) FROM organization_service_principals").fetchone()[0],
-                         con.execute("SELECT COUNT(*) FROM new_organization_service_principals").fetchone()[0])
-        self.assertEqual(con.execute("SELECT COUNT(*) FROM authorization_subjects").fetchone()[0],
-                         con.execute("SELECT COUNT(*) FROM new_authorization_subjects").fetchone()[0])
-        self.assertEqual(con.execute("SELECT COUNT(*) FROM explicit_denies").fetchone()[0],
-                         con.execute("SELECT COUNT(*) FROM new_explicit_denies").fetchone()[0])
+        # Step 2d: In-batch assertion checkpoint table
+        con.execute("CREATE TABLE _migration_assert (value INTEGER NOT NULL CHECK(value = 1));")
+        # 1. Row count parity
+        con.execute("""
+            INSERT INTO _migration_assert(value)
+            SELECT CASE
+                WHEN (SELECT COUNT(*) FROM organization_service_principals) = (SELECT COUNT(*) FROM new_organization_service_principals)
+                 AND (SELECT COUNT(*) FROM authorization_subjects) = (SELECT COUNT(*) FROM new_authorization_subjects)
+                 AND (SELECT COUNT(*) FROM explicit_denies) = (SELECT COUNT(*) FROM new_explicit_denies)
+                THEN 1 ELSE 0 END;
+        """)
+        # 2. ID preservation
+        con.execute("""
+            INSERT INTO _migration_assert(value)
+            SELECT CASE
+                WHEN NOT EXISTS (SELECT 1 FROM organization_service_principals o WHERE NOT EXISTS (SELECT 1 FROM new_organization_service_principals n WHERE n.id = o.id))
+                 AND NOT EXISTS (SELECT 1 FROM authorization_subjects o WHERE NOT EXISTS (SELECT 1 FROM new_authorization_subjects n WHERE n.id = o.id))
+                 AND NOT EXISTS (SELECT 1 FROM explicit_denies o WHERE NOT EXISTS (SELECT 1 FROM new_explicit_denies n WHERE n.id = o.id))
+                THEN 1 ELSE 0 END;
+        """)
+        # 3. Relational targeting
+        con.execute("""
+            INSERT INTO _migration_assert(value)
+            SELECT CASE
+                WHEN NOT EXISTS (SELECT 1 FROM new_authorization_subjects asb WHERE asb.subject_type = 'service_principal' AND NOT EXISTS (SELECT 1 FROM new_organization_service_principals osp WHERE osp.id = asb.organization_service_principal_id))
+                 AND NOT EXISTS (SELECT 1 FROM new_explicit_denies dny WHERE NOT EXISTS (SELECT 1 FROM new_authorization_subjects asb WHERE asb.id = dny.authorization_subject_id))
+                THEN 1 ELSE 0 END;
+        """)
+        con.execute("DROP TABLE _migration_assert;")
 
         # Step 2e: Remove old chain leaf-to-root
         con.execute("DROP TABLE explicit_denies;")
@@ -794,7 +837,8 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("ALTER TABLE new_authorization_subjects RENAME TO authorization_subjects;")
         con.execute("ALTER TABLE new_explicit_denies RENAME TO explicit_denies;")
 
-        # Step 3: invitations is a deliberate NO-OP; verify existing row remains completely preserved
+        # Step 3: invitations uniqueness restored in-place (Case 1: unique state succeeds)
+        con.execute("CREATE UNIQUE INDEX uq_invitations_org_email_status ON invitations(organization_id, email, status);")
         inv_row = con.execute("SELECT id, organization_id, email, role_id, invited_by_membership_id, token_hash, member_type, status FROM invitations WHERE id = 'inv_1';").fetchone()
         self.assertEqual(inv_row, ('inv_1', 'org_1', 'newbie@acme.com', 'rol_1', 'mem_1', 'hash_invite_123', 'employee', 'pending'))
 
@@ -813,7 +857,6 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("INSERT INTO service_principal_role_assignments VALUES ('sra_1', 'org_1', 'osp_1', 'rol_1', CURRENT_TIMESTAMP);")
 
         # Assert post-migration state:
-        # Same IDs exist
         self.assertIsNotNone(con.execute("SELECT 1 FROM organization_service_principals WHERE id = 'osp_1'").fetchone())
         self.assertIsNotNone(con.execute("SELECT 1 FROM authorization_subjects WHERE id = 'asb_1'").fetchone())
         self.assertIsNotNone(con.execute("SELECT 1 FROM explicit_denies WHERE id = 'dny_1'").fetchone())
@@ -834,6 +877,82 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
             WHERE dny.id = 'dny_1';
         """).fetchone()
         self.assertEqual(row, ('dny_1', 'mail.messages.delete', 'service_principal', 'Build Worker', 'Build Worker'))
+
+    def test_migration_0005_invitations_duplicate_state_refusal(self):
+        """Case 2: Predecessor duplicate invitation state triggers ERR_MIGRATION_DUPLICATE_INVITATION_STATE and halts."""
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE organizations (id TEXT PRIMARY KEY);")
+        con.execute("CREATE TABLE memberships (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id));")
+        con.execute("CREATE TABLE role_definitions (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id));")
+        con.execute("CREATE TABLE invitations (id TEXT PRIMARY KEY, organization_id TEXT, email TEXT, role_id TEXT, invited_by_membership_id TEXT, token_hash TEXT, member_type TEXT, expires_at DATETIME, status TEXT, created_at DATETIME);")
+
+        con.execute("INSERT INTO organizations VALUES ('org_1');")
+        con.execute("INSERT INTO memberships VALUES ('mem_1', 'org_1');")
+        con.execute("INSERT INTO role_definitions VALUES ('rol_1', 'org_1');")
+        # Insert two duplicate (org_1, duplicate@acme.com, pending) invitations:
+        con.execute("INSERT INTO invitations VALUES ('inv_1', 'org_1', 'duplicate@acme.com', 'rol_1', 'mem_1', 'tok_1', 'employee', '2026-10-01', 'pending', CURRENT_TIMESTAMP);")
+        con.execute("INSERT INTO invitations VALUES ('inv_2', 'org_1', 'duplicate@acme.com', 'rol_1', 'mem_1', 'tok_2', 'employee', '2026-10-01', 'pending', CURRENT_TIMESTAMP);")
+
+        # Preflight query
+        duplicates = con.execute("""
+            SELECT organization_id, email, status, COUNT(*)
+            FROM invitations
+            GROUP BY organization_id, email, status
+            HAVING COUNT(*) > 1;
+        """).fetchall()
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(duplicates[0], ('org_1', 'duplicate@acme.com', 'pending', 2))
+        # Migration runner refuses to issue DDL
+        preflight_error = "ERR_MIGRATION_DUPLICATE_INVITATION_STATE" if len(duplicates) > 0 else None
+        self.assertEqual(preflight_error, "ERR_MIGRATION_DUPLICATE_INVITATION_STATE")
+
+    def test_migration_0005_in_batch_assertion_failure_aborts_transaction(self):
+        """Phase D in-batch assertion failure raises IntegrityError and prevents table retirement."""
+        import sqlite3
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        con.execute("PRAGMA foreign_keys = ON;")
+
+        # Predecessor tables
+        con.execute("CREATE TABLE organization_service_principals (id TEXT PRIMARY KEY, name TEXT);")
+        con.execute("CREATE TABLE authorization_subjects (id TEXT PRIMARY KEY, name TEXT);")
+        con.execute("CREATE TABLE explicit_denies (id TEXT PRIMARY KEY, name TEXT);")
+
+        # Seed data
+        con.execute("INSERT INTO organization_service_principals VALUES ('osp_1', 'Worker');")
+        con.execute("INSERT INTO authorization_subjects VALUES ('asb_1', 'Subject');")
+        con.execute("INSERT INTO explicit_denies VALUES ('dny_1', 'Deny');")
+
+        # Shadow tables
+        con.execute("CREATE TABLE new_organization_service_principals (id TEXT PRIMARY KEY, name TEXT);")
+        con.execute("CREATE TABLE new_authorization_subjects (id TEXT PRIMARY KEY, name TEXT);")
+        con.execute("CREATE TABLE new_explicit_denies (id TEXT PRIMARY KEY, name TEXT);")
+
+        # Introduce intentional mismatch: copy OSP and authorization_subjects, but NOT explicit_denies
+        con.execute("INSERT INTO new_organization_service_principals SELECT id, name FROM organization_service_principals;")
+        con.execute("INSERT INTO new_authorization_subjects SELECT id, name FROM authorization_subjects;")
+        # new_explicit_denies left empty!
+
+        # Assertion table check inside transaction
+        con.execute("BEGIN TRANSACTION;")
+        con.execute("CREATE TABLE _migration_assert (value INTEGER NOT NULL CHECK(value = 1));")
+
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("""
+                INSERT INTO _migration_assert(value)
+                SELECT CASE
+                    WHEN (SELECT COUNT(*) FROM organization_service_principals) = (SELECT COUNT(*) FROM new_organization_service_principals)
+                     AND (SELECT COUNT(*) FROM authorization_subjects) = (SELECT COUNT(*) FROM new_authorization_subjects)
+                     AND (SELECT COUNT(*) FROM explicit_denies) = (SELECT COUNT(*) FROM new_explicit_denies)
+                    THEN 1 ELSE 0 END;
+            """)
+        self.assertIn("CHECK constraint failed", str(ctx.exception))
+        con.execute("ROLLBACK;")
+
+        # Verify old tables were NOT dropped and data is intact
+        self.assertIsNotNone(con.execute("SELECT 1 FROM explicit_denies WHERE id = 'dny_1'").fetchone())
+        self.assertIsNotNone(con.execute("SELECT 1 FROM authorization_subjects WHERE id = 'asb_1'").fetchone())
+        self.assertIsNotNone(con.execute("SELECT 1 FROM organization_service_principals WHERE id = 'osp_1'").fetchone())
 
 
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):

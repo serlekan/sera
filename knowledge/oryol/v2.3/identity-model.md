@@ -134,6 +134,7 @@ CREATE TABLE invitations (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (organization_id, role_id) REFERENCES role_definitions(organization_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (organization_id, invited_by_membership_id) REFERENCES memberships(organization_id, id) ON DELETE CASCADE,
+    UNIQUE(organization_id, email, status),
     UNIQUE(organization_id, id)
 );
 
