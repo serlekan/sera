@@ -341,7 +341,20 @@ Every evaluation executes in strict linear order:
 
 5. Apply Explicit Deny Rules
    └─► Query `explicit_denies` matching subject (membership, team, or service_principal).
-   └─► If matching deny rule found ──► DENY(EXPLICIT_DENY)
+   └─► For each candidate deny rule:
+         └─► Validate `action_pattern` syntax:
+               └─► Phase-1 Action-Pattern Grammar:
+                     └─► Exact action: e.g. `core.domains.manage`, `mail.messages.delete` (matches only exact canonical action string).
+                     └─► Service wildcard: `<service>.*` (e.g. `mail.*` matches every action with service prefix `mail.`).
+                     └─► Disallowed: `*`, `mail.messages.*`, `mail*`, regex, multiple wildcards.
+               └─► If `action_pattern` is malformed ──► TERMINAL DENY(EXPLICIT_DENY_INVALID_PATTERN) (fail closed; malformed deny rows are never skipped).
+         └─► Validate and resolve resource scoping:
+               └─► If `resource_type IS NULL AND resource_id IS NOT NULL` ──► TERMINAL DENY(EXPLICIT_DENY_INVALID_RESOURCE_SCOPE) (invalid stored shape fails closed).
+               └─► If `resource_type IS NULL AND resource_id IS NULL`: matches all actions on all resources within the organization, including organization-level actions.
+               └─► If `resource_type == requested.resource_type AND resource_id IS NULL`: matches all resources of that type within the organization.
+               └─► If `resource_type == requested.resource_type AND resource_id == requested.resource_id`: matches only the exact resource.
+               └─► If requested action is organization-level (no resource requested): only organization-wide deny rules (`resource_type IS NULL AND resource_id IS NULL`) apply.
+         └─► If action pattern matches AND resource scoping matches ──► TERMINAL DENY(EXPLICIT_DENY).
 
 6. Resolve Coarse RBAC Capability (ADR-002)
    └─► Query `organization_permission_registries` for active `registry_version`.
@@ -370,7 +383,8 @@ Every evaluation executes in strict linear order:
          └─► Query authorization_versions for organization.id.
          └─► If context.tokenAuthorizationVersion != db.version ──► DENY(AUTHORIZATION_VERSION_STALE)
    └─► Sub-step 8.2 (Edge Context Structural Validation):
-         └─► If context.clientType == 'internal_execution': validate context.ipAddress == 'internal:worker_runtime'.
+         └─► If context.clientType == 'internal_execution':
+               └─► If context.ipAddress != 'internal:worker_runtime' ──► TERMINAL DENY(CONTEXT_INTERNAL_CONTEXT_INVALID) (request immediately rejected; never reaches Sub-step 8.5).
          └─► Otherwise: validate context.ipAddress is valid IPv4 or IPv6 format. If invalid ──► DENY(DEFAULT_DENY).
    └─► Sub-step 8.3 (Load Organization Security Policy):
          └─► Query organization_security_policies for organization.id. (Apply defaults if absent).
@@ -380,6 +394,7 @@ Every evaluation executes in strict linear order:
                └─► If policy.mfa_enforcement == 'required_admins' and rd.is_system_template == true and rd.template_key IN ('owner','admin') and context.mfaVerified != true ──► DENY(CONTEXT_MFA_REQUIRED).
    └─► Sub-step 8.5 (IP Allowlist Policy — P1):
          └─► If context.clientType == 'internal_execution':
+               └─► (Precondition: Step 8.2 already validated context.ipAddress == 'internal:worker_runtime' successfully).
                └─► If policy.allow_internal_dispatch == true: PROCEED to Sub-step 8.7 (IP allowlist and posture bypassed).
                └─► If policy.allow_internal_dispatch == false: DENY(CONTEXT_INTERNAL_DISPATCH_DENIED).
          └─► If policy.ip_allowlist_mode != 'disabled' and applies to caller (all callers for 'enforced_all', or rd.is_system_template == true and rd.template_key IN ('owner', 'admin') for 'enforced_admins'):

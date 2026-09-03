@@ -217,3 +217,18 @@ SQLite requires that columns referenced by foreign keys must be backed by a `PRI
 | `service_accounts(organization_id, principal_id)` | `0005_core_security_policies_and_service_rbac.sql` | `CREATE UNIQUE INDEX idx_service_accounts_org_principal ON service_accounts(organization_id, principal_id);` | `new_organization_service_principals` (Migration 0005 target) |
 
 Every compound parent key referenced by Migration 0005 target DDL is physically backed by an explicit `PRIMARY KEY` or `UNIQUE` constraint in the executable predecessor schema or explicitly created in-place by Migration 0005 prior to referencing.
+
+---
+
+## 5. Predecessor Secondary Index Audit on Reconstructed Tables
+
+A strict audit of the actual accepted executable migrations (`0001` through `0004`) in `serlekan/oryol-core` was performed to verify whether any user-created secondary indexes existed on the three tables undergoing shadow reconstruction:
+- Accepted migration `0002_core_tenancy_and_rbac.sql` creates only:
+  - `idx_memberships_org ON memberships(organization_id)`
+  - `idx_teams_org ON teams(organization_id)`
+  - `idx_role_defs_org ON role_definitions(organization_id)`
+- Accepted migration `0003_core_resource_registry_and_apps.sql` creates only:
+  - `idx_resource_reg_app ON resource_registry(application_id)`
+  - `idx_app_inst_org ON application_installations(organization_id)`
+- **Audit Result**: `organization_service_principals`, `authorization_subjects`, and `explicit_denies` have **NONE** (zero user-created secondary indexes exist on these tables in predecessor DDL; all indexing was provided strictly by SQLite's internal backing for their `PRIMARY KEY` and `UNIQUE` constraints).
+- **Preservation Contract**: The reconstructed shadow tables carry identical `PRIMARY KEY` and `UNIQUE` constraints, automatically generating identical internal backing indexes upon promotion. Zero user-created secondary indexes were lost, and NONE are artificially invented.

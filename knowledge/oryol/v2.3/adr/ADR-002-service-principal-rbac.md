@@ -354,6 +354,13 @@ SQLite requires that parent columns referenced by compound foreign keys must be 
 
 Every compound parent key referenced by Migration 0005 target DDL is physically backed by an explicit `PRIMARY KEY` or `UNIQUE` constraint in the executable predecessor schema or explicitly created in-place by Migration 0005 prior to referencing.
 
+#### Predecessor Secondary Index Audit on Reconstructed Tables
+A strict audit of the actual accepted executable migrations (`0001` through `0004`) in `serlekan/oryol-core` was performed to verify whether any user-created secondary indexes existed on the three tables undergoing shadow reconstruction:
+- Accepted migration `0002_core_tenancy_and_rbac.sql` creates only: `idx_memberships_org`, `idx_teams_org`, and `idx_role_defs_org`.
+- Accepted migration `0003_core_resource_registry_and_apps.sql` creates only: `idx_resource_reg_app` and `idx_app_inst_org`.
+- **Audit Result**: `organization_service_principals`, `authorization_subjects`, and `explicit_denies` have **NONE** (zero user-created secondary indexes exist on these tables in predecessor DDL; all indexing was provided strictly by SQLite's internal backing for their `PRIMARY KEY` and `UNIQUE` constraints).
+- **Preservation Contract**: The reconstructed shadow tables carry identical `PRIMARY KEY` and `UNIQUE` constraints, automatically generating identical internal backing indexes upon promotion. Zero user-created secondary indexes were lost, and NONE are artificially invented.
+
 #### Actual Inbound Foreign Key Inventory for OSP & Authorization Deny Chain
 `organization_service_principals` **DOES HAVE CHILD DEPENDENCIES** in the accepted predecessor schema:
 ```text
@@ -426,6 +433,38 @@ Existing `role_definitions` (from Migration 0002) is referenced by `membership_r
        ON role_definitions(organization_id, template_key) 
        WHERE template_key IS NOT NULL;
 
+   -- In-batch template backfill assertion checkpoint (protects against TOCTOU between preflight and batch)
+   CREATE TABLE _migration_assert_templates (
+       value INTEGER NOT NULL CHECK(value = 1)
+   );
+
+   INSERT INTO _migration_assert_templates(value)
+   SELECT CASE
+       -- Every role row satisfies the template invariant:
+       WHEN (
+           SELECT COUNT(*) FROM role_definitions
+           WHERE (
+               CASE
+                   WHEN is_system_template = 0 AND template_key IS NULL THEN 1
+                   WHEN is_system_template = 1 AND template_key IN ('owner', 'admin', 'member') THEN 1
+                   ELSE 0
+               END
+           ) = 0
+       ) = 0
+       -- And at most one of each template_key per organization:
+       AND (
+           SELECT COUNT(*) FROM (
+               SELECT organization_id, template_key
+               FROM role_definitions
+               WHERE template_key IS NOT NULL
+               GROUP BY organization_id, template_key
+               HAVING COUNT(*) > 1
+           )
+       ) = 0
+       THEN 1 ELSE 0 END;
+
+   DROP TABLE _migration_assert_templates;
+
    -- Enforce check constraint and template immutability via triggers
    CREATE TRIGGER trg_role_definitions_template_invariant_insert BEFORE INSERT ON role_definitions
    BEGIN
@@ -442,6 +481,9 @@ Existing `role_definitions` (from Migration 0002) is referenced by `membership_r
        SELECT RAISE(FAIL, 'ROLE_TEMPLATE_IMMUTABLE: cannot modify system template designation');
    END;
    ```
+
+#### System-Template Creation Trust Boundary
+Tenant-facing / generic role creation APIs MUST NOT accept `is_system_template` or `template_key` from client-controlled input. Generic role creation handlers always set `is_system_template = 0` and `template_key = NULL`. System templates (`owner`, `admin`, `member`) are provisioned exclusively through the trusted internal organization-bootstrap path. The database trigger `trg_role_definitions_template_invariant_insert` enforces row shape, `trg_role_definitions_immutable_template` prevents subsequent modification, and the trusted Core mutation boundary strictly prevents client submission of system-template fields.
 
 ### 7.4 Step 2: `service_accounts` In-Place Evolution & Dependent Authorization Deny Chain Reconstruction (P0-2, A0-1)
 Migration 0001 omitted `organization_id` on `service_accounts`. In Migration 0005, `service_accounts` evolves in-place to establish permanent tenant ownership, and `organization_service_principals` along with its downstream dependent authorization chain (`authorization_subjects`, `explicit_denies`) is safely reconstructed using a deterministic 7-phase algorithm:
@@ -493,8 +535,33 @@ Migration 0001 omitted `organization_id` on `service_accounts`. In Migration 000
        SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
        WHERE NEW.organization_id IS NULL;
        SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1')
-       WHERE NEW.organization_id != OLD.organization_id;
+       WHERE NEW.organization_id IS NOT OLD.organization_id;
    END;
+
+   -- In-batch ownership assertion checkpoint (protects against TOCTOU between preflight and batch)
+   CREATE TABLE _migration_assert_ownership (
+       value INTEGER NOT NULL CHECK(value = 1)
+   );
+
+   INSERT INTO _migration_assert_ownership(value)
+   SELECT CASE
+       -- A: No service account has organization_id IS NULL:
+       WHEN (SELECT COUNT(*) FROM service_accounts WHERE organization_id IS NULL) = 0
+       -- B: Every service account's organization_id agrees with its authoritative OSP binding:
+        AND NOT EXISTS (
+            SELECT 1 FROM service_accounts sa
+            JOIN organization_service_principals osp ON osp.principal_id = sa.principal_id
+            WHERE sa.organization_id != osp.organization_id
+        )
+       -- C: No principal resolves to more than one organization:
+        AND (
+            SELECT COUNT(*) FROM (
+                SELECT principal_id FROM organization_service_principals GROUP BY principal_id HAVING COUNT(DISTINCT organization_id) > 1
+            )
+        ) = 0
+       THEN 1 ELSE 0 END;
+
+   DROP TABLE _migration_assert_ownership;
    ```
 
 #### Part 2: Canonical OSP & Dependent Authorization Deny Chain Reconstruction Strategy
@@ -533,7 +600,22 @@ Before executing any DDL:
    );
    ```
    If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_EXPLICIT_DENY`.
-5. **Record Preflight Row Count Baseline**:
+5. **Validate All `explicit_denies.action_pattern` Grammar**:
+   ```sql
+   -- Reject malformed wildcards or non-canonical pattern shapes (must be exact action or '<service>.*'):
+   SELECT COUNT(*) FROM explicit_denies dny
+   WHERE dny.action_pattern NOT LIKE '%.*'
+     AND dny.action_pattern LIKE '%*%';
+   ```
+   If `> 0` $\to$ abort with `ERR_MIGRATION_INVALID_DENY_PATTERN`.
+6. **Validate All `explicit_denies` Resource Scopes**:
+   ```sql
+   -- Reject invalid shape: resource_type IS NULL but resource_id IS NOT NULL:
+   SELECT COUNT(*) FROM explicit_denies dny
+   WHERE dny.resource_type IS NULL AND dny.resource_id IS NOT NULL;
+   ```
+   If `> 0` $\to$ abort with `ERR_MIGRATION_INVALID_DENY_RESOURCE_SCOPE`.
+7. **Record Preflight Row Count Baseline**:
    Capture expected counts for `organization_service_principals`, `authorization_subjects`, and `explicit_denies`.
 
 ##### Phase B — Create Target Shadow Tables
@@ -667,6 +749,52 @@ SELECT CASE
     WHEN NOT EXISTS (
         SELECT 1 FROM new_explicit_denies dny
         WHERE NOT EXISTS (SELECT 1 FROM new_authorization_subjects asb WHERE asb.id = dny.authorization_subject_id)
+    )
+    THEN 1 ELSE 0 END;
+
+-- 4. Assert Full Bidirectional Tuple Content Parity (Symmetric EXCEPT across all columns):
+-- organization_service_principals
+INSERT INTO _migration_assert(value)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT id, organization_id, principal_id, name, status, created_at FROM organization_service_principals
+        EXCEPT
+        SELECT id, organization_id, principal_id, name, status, created_at FROM new_organization_service_principals
+    )
+    AND NOT EXISTS (
+        SELECT id, organization_id, principal_id, name, status, created_at FROM new_organization_service_principals
+        EXCEPT
+        SELECT id, organization_id, principal_id, name, status, created_at FROM organization_service_principals
+    )
+    THEN 1 ELSE 0 END;
+
+-- authorization_subjects
+INSERT INTO _migration_assert(value)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects
+        EXCEPT
+        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM new_authorization_subjects
+    )
+    AND NOT EXISTS (
+        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM new_authorization_subjects
+        EXCEPT
+        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects
+    )
+    THEN 1 ELSE 0 END;
+
+-- explicit_denies
+INSERT INTO _migration_assert(value)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies
+        EXCEPT
+        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM new_explicit_denies
+    )
+    AND NOT EXISTS (
+        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM new_explicit_denies
+        EXCEPT
+        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies
     )
     THEN 1 ELSE 0 END;
 
@@ -839,7 +967,7 @@ Because SQLite / Cloudflare D1 does not allow changing column nullability in pla
 
 | Feature / Invariant | Fresh Install (Target DDL) | Migrated Schema (Predecessor + Migration 0005) | Invariant Equivalence Guarantee |
 |---|---|---|---|
-| `service_accounts.organization_id` | Column declared `TEXT NOT NULL REFERENCES organizations(id)` inline in `CREATE TABLE`. | `ALTER TABLE ADD COLUMN organization_id TEXT`, backfilled from OSP, compound unique indexes created, and guarded by `trg_service_accounts_org_not_null` (on INSERT) and `trg_service_accounts_org_immutable` (on UPDATE). | Disallows NULL on INSERT, disallows NULL or modification on UPDATE; strictly enforces immutable single-tenant ownership. |
+| `service_accounts.organization_id` | Column declared `TEXT NOT NULL REFERENCES organizations(id)` inline in `CREATE TABLE`, guarded by `trg_service_accounts_org_immutable` on UPDATE. | `ALTER TABLE ADD COLUMN organization_id TEXT`, backfilled from OSP, compound unique indexes created, and guarded by `trg_service_accounts_org_not_null` (on INSERT) and `trg_service_accounts_org_immutable` (on UPDATE). | Disallows NULL on INSERT, disallows NULL or modification on UPDATE via SQLite null-safe `WHERE NEW.organization_id IS NOT OLD.organization_id;` check; strictly enforces immutable single-tenant ownership. |
 | `role_definitions` System Template Invariants | Inline table `CHECK ((is_system_template = 0 AND template_key IS NULL) OR (is_system_template = 1 AND template_key IN ('owner', 'admin', 'member')))` in `CREATE TABLE`. | `ALTER TABLE ADD COLUMN template_key TEXT`, backfilled deterministically, unique partial index `uq_role_definitions_org_template`, guarded by `trg_role_definitions_template_invariant_insert` (on INSERT) and `trg_role_definitions_immutable_template` (on UPDATE). | Disallows unmappable templates, disallows custom roles with templates, disallows modifying template designations, enforces at most one of each template key per organization. |
 | `role_definitions` Unique Names | `UNIQUE(organization_id, name)` inline in `CREATE TABLE`. | Predecessor Migration 0002 already defined `UNIQUE(organization_id, name)`. | Preserved untouched from predecessor schema. |
 | `organization_service_principals` Compound Binding | Inline compound FK `(organization_id, principal_id) REFERENCES service_accounts(organization_id, principal_id)` in `CREATE TABLE`. | Reconstructed via shadow table `new_organization_service_principals` with compound FK, verified via parity assertions, and promoted root-to-leaf with taxonomy triggers. | Enforces strict compound tenant isolation; service principals can only bind service accounts in their own tenant. |
@@ -852,7 +980,7 @@ Migration 0005 execution separates pre-flight validation, atomic batch execution
 
 1. **Host-Language Preflight Phase (Pre-Batch Guards, Outside `db.batch`)**:
    - Executed by the trusted migration orchestrator (deployment runner / Cloudflare Worker) prior to submitting the DDL batch.
-   - Evaluates read-only semantic queries (`SELECT COUNT(*) ...`) for orphan service accounts, ambiguous ownership, principal taxonomy, authorization subject references, explicit deny integrity, and duplicate invitation status states.
+   - Evaluates read-only semantic queries (`SELECT COUNT(*) ...`) for orphan service accounts, ambiguous ownership, principal taxonomy, authorization subject references, explicit deny integrity, deny action-pattern grammar, invalid deny resource shapes, and duplicate invitation status states.
    - If any query returns a non-zero count, the runner immediately halts deployment with a typed error code (`ERR_MIGRATION_*`) without issuing DDL or mutating database state. No transaction rollback claim is needed because no database mutation occurred.
 
 2. **Atomic D1 Batch Execution Phase (`db.batch([...])`)**:

@@ -172,7 +172,8 @@ graph TD
    - Query `authorization_versions.version` for `organization_id`.
    - If `context.tokenAuthorizationVersion != db.version` $\to$ **`DENY(AUTHORIZATION_VERSION_STALE)`**.
 2. **Sub-step 8.2 (Edge Context Structural Validation — F-7)**:
-   - If `context.clientType === 'internal_execution'`: Validate `context.ipAddress === 'internal:worker_runtime'`.
+   - If `context.clientType === 'internal_execution'`:
+     - If `context.ipAddress !== 'internal:worker_runtime'` $\to$ immediately **`DENY(CONTEXT_INTERNAL_CONTEXT_INVALID)`** (TERMINAL; execution immediately halts, request never reaches Sub-step 8.5).
    - Otherwise: Validate that `context.ipAddress` is a non-empty, well-formed IPv4 or IPv6 address string. If invalid, empty, or unparseable $\to$ **`DENY(DEFAULT_DENY)`**.
 3. **Sub-step 8.3 (Load Organization Security Policy)**:
    - Query `organization_security_policies` for `organization_id`.

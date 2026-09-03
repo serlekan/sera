@@ -512,7 +512,7 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIn("trg_service_accounts_org_not_null", adr2_text)
         self.assertIn("trg_service_accounts_org_immutable", adr2_text)
         self.assertIn("BEFORE UPDATE OF organization_id ON service_accounts", adr2_text)
-        self.assertIn("WHERE NEW.organization_id != OLD.organization_id", adr2_text)
+        self.assertIn("WHERE NEW.organization_id IS NOT OLD.organization_id", adr2_text)
         self.assertIn("WHERE NEW.organization_id IS NULL", adr2_text)
         # Ensure Phase 1 canonical ownership rule is declared
         self.assertIn("A service account has exactly one owning organization", adr2_text)
@@ -748,11 +748,66 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         con.execute("UPDATE role_definitions SET template_key = 'admin' WHERE id = 'rol_1';")
         con.execute("CREATE UNIQUE INDEX uq_role_definitions_org_template ON role_definitions(organization_id, template_key) WHERE template_key IS NOT NULL;")
 
+        # In-batch template assertion checkpoint
+        con.execute("CREATE TABLE _migration_assert_templates (value INTEGER NOT NULL CHECK(value = 1));")
+        con.execute("""
+            INSERT INTO _migration_assert_templates(value)
+            SELECT CASE
+                WHEN (
+                    SELECT COUNT(*) FROM role_definitions
+                    WHERE (
+                        CASE
+                            WHEN is_system_template = 0 AND template_key IS NULL THEN 1
+                            WHEN is_system_template = 1 AND template_key IN ('owner', 'admin', 'member') THEN 1
+                            ELSE 0
+                        END
+                    ) = 0
+                ) = 0
+                AND (
+                    SELECT COUNT(*) FROM (
+                        SELECT organization_id, template_key FROM role_definitions WHERE template_key IS NOT NULL GROUP BY organization_id, template_key HAVING COUNT(*) > 1
+                    )
+                ) = 0
+                THEN 1 ELSE 0 END;
+        """)
+        con.execute("DROP TABLE _migration_assert_templates;")
+
         # Step 2a: service_accounts in-place evolution
         con.execute("ALTER TABLE service_accounts ADD COLUMN organization_id TEXT REFERENCES organizations(id) ON DELETE RESTRICT;")
         con.execute("UPDATE service_accounts SET organization_id = (SELECT osp.organization_id FROM organization_service_principals osp WHERE osp.principal_id = service_accounts.principal_id);")
         con.execute("CREATE UNIQUE INDEX idx_service_accounts_org_principal ON service_accounts(organization_id, principal_id);")
         con.execute("CREATE UNIQUE INDEX idx_service_accounts_org_id ON service_accounts(organization_id, id);")
+
+        # In-batch ownership assertion checkpoint
+        con.execute("CREATE TABLE _migration_assert_ownership (value INTEGER NOT NULL CHECK(value = 1));")
+        con.execute("""
+            INSERT INTO _migration_assert_ownership(value)
+            SELECT CASE
+                WHEN (SELECT COUNT(*) FROM service_accounts WHERE organization_id IS NULL) = 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM service_accounts sa
+                     JOIN organization_service_principals osp ON osp.principal_id = sa.principal_id
+                     WHERE sa.organization_id != osp.organization_id
+                 )
+                 AND (
+                     SELECT COUNT(*) FROM (
+                         SELECT principal_id FROM organization_service_principals GROUP BY principal_id HAVING COUNT(DISTINCT organization_id) > 1
+                     )
+                 ) = 0
+                THEN 1 ELSE 0 END;
+        """)
+        con.execute("DROP TABLE _migration_assert_ownership;")
+
+        # Triggers with null-safe identity comparison
+        con.execute("""
+            CREATE TRIGGER trg_service_accounts_org_immutable BEFORE UPDATE OF organization_id ON service_accounts
+            BEGIN
+                SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
+                WHERE NEW.organization_id IS NULL;
+                SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1')
+                WHERE NEW.organization_id IS NOT OLD.organization_id;
+            END;
+        """)
 
         # Step 2b: Create shadow tables
         con.execute("""CREATE TABLE new_organization_service_principals (
@@ -823,6 +878,42 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
             SELECT CASE
                 WHEN NOT EXISTS (SELECT 1 FROM new_authorization_subjects asb WHERE asb.subject_type = 'service_principal' AND NOT EXISTS (SELECT 1 FROM new_organization_service_principals osp WHERE osp.id = asb.organization_service_principal_id))
                  AND NOT EXISTS (SELECT 1 FROM new_explicit_denies dny WHERE NOT EXISTS (SELECT 1 FROM new_authorization_subjects asb WHERE asb.id = dny.authorization_subject_id))
+                THEN 1 ELSE 0 END;
+        """)
+        # 4. Bidirectional full-tuple content parity (symmetric EXCEPT across all columns)
+        con.execute("""
+            INSERT INTO _migration_assert(value)
+            SELECT CASE
+                WHEN NOT EXISTS (
+                    SELECT id, organization_id, principal_id, name, status, created_at FROM organization_service_principals
+                    EXCEPT
+                    SELECT id, organization_id, principal_id, name, status, created_at FROM new_organization_service_principals
+                )
+                AND NOT EXISTS (
+                    SELECT id, organization_id, principal_id, name, status, created_at FROM new_organization_service_principals
+                    EXCEPT
+                    SELECT id, organization_id, principal_id, name, status, created_at FROM organization_service_principals
+                )
+                AND NOT EXISTS (
+                    SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects
+                    EXCEPT
+                    SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM new_authorization_subjects
+                )
+                AND NOT EXISTS (
+                    SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM new_authorization_subjects
+                    EXCEPT
+                    SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects
+                )
+                AND NOT EXISTS (
+                    SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies
+                    EXCEPT
+                    SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM new_explicit_denies
+                )
+                AND NOT EXISTS (
+                    SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM new_explicit_denies
+                    EXCEPT
+                    SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies
+                )
                 THEN 1 ELSE 0 END;
         """)
         con.execute("DROP TABLE _migration_assert;")
@@ -953,6 +1044,361 @@ class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
         self.assertIsNotNone(con.execute("SELECT 1 FROM explicit_denies WHERE id = 'dny_1'").fetchone())
         self.assertIsNotNone(con.execute("SELECT 1 FROM authorization_subjects WHERE id = 'asb_1'").fetchone())
         self.assertIsNotNone(con.execute("SELECT 1 FROM organization_service_principals WHERE id = 'osp_1'").fetchone())
+
+
+class TestOryolV23FinalSecurityClosure(unittest.TestCase):
+    """Behavioral regression test suite for proposed Oryol Architecture v2.3 Final Security Closure."""
+
+    def test_migrated_service_account_null_to_org_rejected(self):
+        """Test 1: Migrated service account UPDATE from NULL to org is rejected by null-safe trigger."""
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE organizations (id TEXT PRIMARY KEY);")
+        con.execute("CREATE TABLE service_accounts (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id), principal_id TEXT UNIQUE);")
+        con.execute("""
+            CREATE TRIGGER trg_service_accounts_org_immutable BEFORE UPDATE OF organization_id ON service_accounts
+            BEGIN
+                SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
+                WHERE NEW.organization_id IS NULL;
+                SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1')
+                WHERE NEW.organization_id IS NOT OLD.organization_id;
+            END;
+        """)
+        con.execute("INSERT INTO organizations VALUES ('org_a');")
+        # Legacy/pre-backfill state: organization_id is NULL
+        con.execute("INSERT INTO service_accounts VALUES ('sa_1', NULL, 'prn_1');")
+
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("UPDATE service_accounts SET organization_id = 'org_a' WHERE id = 'sa_1';")
+        self.assertIn("SERVICE_ACCOUNT_ORG_IMMUTABLE", str(ctx.exception))
+        row = con.execute("SELECT organization_id FROM service_accounts WHERE id = 'sa_1';").fetchone()
+        self.assertIsNone(row[0])
+
+    def test_migrated_service_account_org_a_to_org_b_rejected(self):
+        """Test 2: Migrated service account UPDATE from org_a to org_b or to NULL is rejected."""
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE organizations (id TEXT PRIMARY KEY);")
+        con.execute("CREATE TABLE service_accounts (id TEXT PRIMARY KEY, organization_id TEXT REFERENCES organizations(id), principal_id TEXT UNIQUE);")
+        con.execute("""
+            CREATE TRIGGER trg_service_accounts_org_immutable BEFORE UPDATE OF organization_id ON service_accounts
+            BEGIN
+                SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null')
+                WHERE NEW.organization_id IS NULL;
+                SELECT RAISE(FAIL, 'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1')
+                WHERE NEW.organization_id IS NOT OLD.organization_id;
+            END;
+        """)
+        con.execute("INSERT INTO organizations VALUES ('org_a'), ('org_b');")
+        con.execute("INSERT INTO service_accounts VALUES ('sa_1', 'org_a', 'prn_1');")
+
+        # Org A -> Org B
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("UPDATE service_accounts SET organization_id = 'org_b' WHERE id = 'sa_1';")
+        self.assertIn("SERVICE_ACCOUNT_ORG_IMMUTABLE", str(ctx.exception))
+
+        # Org A -> NULL
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("UPDATE service_accounts SET organization_id = NULL WHERE id = 'sa_1';")
+        self.assertIn("SERVICE_ACCOUNT_ORG_REQUIRED", str(ctx.exception))
+
+        row = con.execute("SELECT organization_id FROM service_accounts WHERE id = 'sa_1';").fetchone()
+        self.assertEqual(row[0], 'org_a')
+
+    def test_fresh_install_service_account_org_a_to_org_b_rejected(self):
+        """Test 3: Canonical fresh-install service_accounts DDL & triggers reject org_a -> org_b."""
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE organizations (id TEXT PRIMARY KEY);")
+        con.execute("CREATE TABLE principals (id TEXT PRIMARY KEY);")
+        con.execute("""
+            CREATE TABLE service_accounts (
+                id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+                principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+                name TEXT NOT NULL,
+                description TEXT,
+                system_managed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(principal_id),
+                UNIQUE(organization_id, principal_id),
+                UNIQUE(organization_id, id)
+            );
+        """)
+        con.execute("""
+            CREATE TRIGGER trg_service_accounts_org_immutable
+            BEFORE UPDATE OF organization_id ON service_accounts
+            BEGIN
+                SELECT RAISE(
+                    FAIL,
+                    'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null'
+                )
+                WHERE NEW.organization_id IS NULL;
+
+                SELECT RAISE(
+                    FAIL,
+                    'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1'
+                )
+                WHERE NEW.organization_id IS NOT OLD.organization_id;
+            END;
+        """)
+        con.execute("INSERT INTO organizations VALUES ('org_a'), ('org_b');")
+        con.execute("INSERT INTO principals VALUES ('prn_1');")
+        con.execute("INSERT INTO service_accounts (id, organization_id, principal_id, name) VALUES ('sa_1', 'org_a', 'prn_1', 'Bot');")
+
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("UPDATE service_accounts SET organization_id = 'org_b' WHERE id = 'sa_1';")
+        self.assertIn("SERVICE_ACCOUNT_ORG_IMMUTABLE", str(ctx.exception))
+        row = con.execute("SELECT organization_id FROM service_accounts WHERE id = 'sa_1';").fetchone()
+        self.assertEqual(row[0], 'org_a')
+
+    def test_in_batch_assertion_null_service_account_ownership_aborts_transaction(self):
+        """Test 4: In-batch assertion checkpoint _migration_assert_ownership aborts if service account has NULL organization_id."""
+        import sqlite3
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        con.execute("CREATE TABLE service_accounts (id TEXT PRIMARY KEY, organization_id TEXT, principal_id TEXT);")
+        con.execute("CREATE TABLE organization_service_principals (id TEXT PRIMARY KEY, organization_id TEXT, principal_id TEXT);")
+        con.execute("INSERT INTO service_accounts VALUES ('sa_1', NULL, 'prn_1');")
+        con.execute("INSERT INTO organization_service_principals VALUES ('osp_1', 'org_a', 'prn_1');")
+
+        con.execute("BEGIN TRANSACTION;")
+        con.execute("CREATE TABLE _migration_assert_ownership (value INTEGER NOT NULL CHECK(value = 1));")
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("""
+                INSERT INTO _migration_assert_ownership(value)
+                SELECT CASE
+                    WHEN (SELECT COUNT(*) FROM service_accounts WHERE organization_id IS NULL) = 0
+                     AND NOT EXISTS (
+                         SELECT 1 FROM service_accounts sa
+                         JOIN organization_service_principals osp ON osp.principal_id = sa.principal_id
+                         WHERE sa.organization_id != osp.organization_id
+                     )
+                     AND (
+                         SELECT COUNT(*) FROM (
+                             SELECT principal_id FROM organization_service_principals GROUP BY principal_id HAVING COUNT(DISTINCT organization_id) > 1
+                         )
+                     ) = 0
+                    THEN 1 ELSE 0 END;
+            """)
+        self.assertIn("CHECK constraint failed", str(ctx.exception))
+        con.execute("ROLLBACK;")
+
+    def test_role_template_backfill_system_role_invalid_aborts_batch(self):
+        """Test 5: In-batch assertion _migration_assert_templates aborts if system template has NULL or invalid template_key."""
+        import sqlite3
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        con.execute("CREATE TABLE role_definitions (id TEXT PRIMARY KEY, organization_id TEXT, name TEXT, is_system_template INTEGER, template_key TEXT);")
+        # System template with invalid key or NULL:
+        con.execute("INSERT INTO role_definitions VALUES ('rol_1', 'org_1', 'Custom System', 1, NULL);")
+
+        con.execute("BEGIN TRANSACTION;")
+        con.execute("CREATE TABLE _migration_assert_templates (value INTEGER NOT NULL CHECK(value = 1));")
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("""
+                INSERT INTO _migration_assert_templates(value)
+                SELECT CASE
+                    WHEN (
+                        SELECT COUNT(*) FROM role_definitions
+                        WHERE (
+                            CASE
+                                WHEN is_system_template = 0 AND template_key IS NULL THEN 1
+                                WHEN is_system_template = 1 AND template_key IN ('owner', 'admin', 'member') THEN 1
+                                ELSE 0
+                            END
+                        ) = 0
+                    ) = 0
+                    AND (
+                        SELECT COUNT(*) FROM (
+                            SELECT organization_id, template_key
+                            FROM role_definitions
+                            WHERE template_key IS NOT NULL
+                            GROUP BY organization_id, template_key
+                            HAVING COUNT(*) > 1
+                        )
+                    ) = 0
+                    THEN 1 ELSE 0 END;
+            """)
+        self.assertIn("CHECK constraint failed", str(ctx.exception))
+        con.execute("ROLLBACK;")
+
+    def test_deny_chain_parity_modified_action_pattern_fails_transaction(self):
+        """Test 6: Deny-chain Phase D symmetric EXCEPT assertion aborts and rolls back if shadow deny action_pattern was modified."""
+        import sqlite3
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        con.execute("CREATE TABLE explicit_denies (id TEXT PRIMARY KEY, organization_id TEXT, authorization_subject_id TEXT, action_pattern TEXT, resource_type TEXT, resource_id TEXT, created_at TEXT);")
+        con.execute("CREATE TABLE new_explicit_denies (id TEXT PRIMARY KEY, organization_id TEXT, authorization_subject_id TEXT, action_pattern TEXT, resource_type TEXT, resource_id TEXT, created_at TEXT);")
+
+        # Original: mail.messages.delete
+        con.execute("INSERT INTO explicit_denies VALUES ('dny_1', 'org_1', 'asb_1', 'mail.messages.delete', NULL, NULL, '2026-01-01');")
+        # Shadow corrupted: mail.messages.read
+        con.execute("INSERT INTO new_explicit_denies VALUES ('dny_1', 'org_1', 'asb_1', 'mail.messages.read', NULL, NULL, '2026-01-01');")
+
+        con.execute("BEGIN TRANSACTION;")
+        con.execute("CREATE TABLE _migration_assert (value INTEGER NOT NULL CHECK(value = 1));")
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("""
+                INSERT INTO _migration_assert(value)
+                SELECT CASE
+                    WHEN NOT EXISTS (
+                        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies
+                        EXCEPT
+                        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM new_explicit_denies
+                    )
+                    AND NOT EXISTS (
+                        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM new_explicit_denies
+                        EXCEPT
+                        SELECT id, organization_id, authorization_subject_id, action_pattern, resource_type, resource_id, created_at FROM explicit_denies
+                    )
+                    THEN 1 ELSE 0 END;
+            """)
+        self.assertIn("CHECK constraint failed", str(ctx.exception))
+        con.execute("ROLLBACK;")
+        # Predecessor table preserved
+        row = con.execute("SELECT action_pattern FROM explicit_denies WHERE id = 'dny_1';").fetchone()
+        self.assertEqual(row[0], 'mail.messages.delete')
+
+    def test_deny_chain_parity_modified_authorization_subject_fails_transaction(self):
+        """Test 7: Deny-chain Phase D symmetric EXCEPT assertion aborts if shadow authorization subject semantics changed."""
+        import sqlite3
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        con.execute("CREATE TABLE authorization_subjects (id TEXT PRIMARY KEY, organization_id TEXT, subject_type TEXT, membership_id TEXT, team_id TEXT, organization_service_principal_id TEXT, created_at TEXT);")
+        con.execute("CREATE TABLE new_authorization_subjects (id TEXT PRIMARY KEY, organization_id TEXT, subject_type TEXT, membership_id TEXT, team_id TEXT, organization_service_principal_id TEXT, created_at TEXT);")
+
+        con.execute("INSERT INTO authorization_subjects VALUES ('asb_1', 'org_1', 'service_principal', NULL, NULL, 'osp_1', '2026-01-01');")
+        # Shadow corrupted: changed target or subject_type
+        con.execute("INSERT INTO new_authorization_subjects VALUES ('asb_1', 'org_1', 'membership', 'mem_1', NULL, NULL, '2026-01-01');")
+
+        con.execute("BEGIN TRANSACTION;")
+        con.execute("CREATE TABLE _migration_assert (value INTEGER NOT NULL CHECK(value = 1));")
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
+            con.execute("""
+                INSERT INTO _migration_assert(value)
+                SELECT CASE
+                    WHEN NOT EXISTS (
+                        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects
+                        EXCEPT
+                        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM new_authorization_subjects
+                    )
+                    AND NOT EXISTS (
+                        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM new_authorization_subjects
+                        EXCEPT
+                        SELECT id, organization_id, subject_type, membership_id, team_id, organization_service_principal_id, created_at FROM authorization_subjects
+                    )
+                    THEN 1 ELSE 0 END;
+            """)
+        self.assertIn("CHECK constraint failed", str(ctx.exception))
+        con.execute("ROLLBACK;")
+        # Predecessor table preserved
+        row = con.execute("SELECT subject_type, organization_service_principal_id FROM authorization_subjects WHERE id = 'asb_1';").fetchone()
+        self.assertEqual(row, ('service_principal', 'osp_1'))
+
+    def test_step8_internal_execution_wrong_sentinel_denies_terminally(self):
+        """Test 8: Step 8.2 internal_execution with invalid IP sentinel immediately returns TERMINAL DENY(CONTEXT_INTERNAL_CONTEXT_INVALID)."""
+        def evaluate_step8(context, policy, current_version=1):
+            # Sub-step 8.1
+            if context.get("tokenAuthorizationVersion") != current_version:
+                return "DENY(AUTHORIZATION_VERSION_STALE)"
+            # Sub-step 8.2 (TERMINAL)
+            if context.get("clientType") == "internal_execution":
+                if context.get("ipAddress") != "internal:worker_runtime":
+                    return "DENY(CONTEXT_INTERNAL_CONTEXT_INVALID)"
+            # Sub-step 8.5
+            if context.get("clientType") == "internal_execution":
+                if policy.get("allow_internal_dispatch") is True:
+                    return "ALLOW(ALLOW_ROLE)"
+                return "DENY(CONTEXT_INTERNAL_DISPATCH_DENIED)"
+            return "ALLOW(ALLOW_ROLE)"
+
+        context = {
+            "clientType": "internal_execution",
+            "ipAddress": "198.51.100.23", # Attacker supplied IP
+            "tokenAuthorizationVersion": 1,
+        }
+        policy = {
+            "allow_internal_dispatch": True, # Even with dispatch allowed, wrong sentinel must fail terminally!
+        }
+        decision = evaluate_step8(context, policy)
+        self.assertEqual(decision, "DENY(CONTEXT_INTERNAL_CONTEXT_INVALID)")
+
+    def test_explicit_deny_exact_action_match(self):
+        """Test 9: Explicit deny exact action pattern matching semantics."""
+        def evaluate_explicit_deny(rule, req_action, req_res_type=None, req_res_id=None):
+            pattern = rule["action_pattern"]
+            if pattern.endswith(".*"):
+                prefix = pattern[:-1]
+                action_match = req_action.startswith(prefix)
+            else:
+                action_match = (req_action == pattern)
+
+            if not action_match:
+                return "ALLOW"
+
+            r_type = rule.get("resource_type")
+            r_id = rule.get("resource_id")
+            if r_type is None and r_id is None:
+                return "DENY(EXPLICIT_DENY)"
+            if r_type == req_res_type and r_id is None:
+                return "DENY(EXPLICIT_DENY)"
+            if r_type == req_res_type and r_id == req_res_id:
+                return "DENY(EXPLICIT_DENY)"
+            return "ALLOW"
+
+        rule = {"action_pattern": "mail.messages.delete", "resource_type": None, "resource_id": None}
+        self.assertEqual(evaluate_explicit_deny(rule, "mail.messages.delete"), "DENY(EXPLICIT_DENY)")
+        self.assertEqual(evaluate_explicit_deny(rule, "mail.messages.read"), "ALLOW")
+        self.assertEqual(evaluate_explicit_deny(rule, "core.domains.manage"), "ALLOW")
+
+    def test_explicit_deny_service_wildcard_match(self):
+        """Test 10: Explicit deny service wildcard (<service>.*) pattern matching semantics."""
+        def evaluate_explicit_deny(rule, req_action, req_res_type=None, req_res_id=None):
+            pattern = rule["action_pattern"]
+            if pattern.endswith(".*"):
+                prefix = pattern[:-1]
+                action_match = req_action.startswith(prefix)
+            else:
+                action_match = (req_action == pattern)
+
+            if not action_match:
+                return "ALLOW"
+            return "DENY(EXPLICIT_DENY)"
+
+        rule = {"action_pattern": "mail.*", "resource_type": None, "resource_id": None}
+        self.assertEqual(evaluate_explicit_deny(rule, "mail.messages.delete"), "DENY(EXPLICIT_DENY)")
+        self.assertEqual(evaluate_explicit_deny(rule, "mail.threads.read"), "DENY(EXPLICIT_DENY)")
+        self.assertEqual(evaluate_explicit_deny(rule, "core.domains.manage"), "ALLOW")
+
+    def test_malformed_deny_pattern_fails_closed(self):
+        """Test 11: Malformed action_pattern fails closed with DENY(EXPLICIT_DENY_INVALID_PATTERN)."""
+        def validate_and_match_pattern(pattern, req_action):
+            import re
+            valid_exact = bool(re.match(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)+$", pattern)) and ("*" not in pattern)
+            valid_service_wildcard = bool(re.match(r"^[a-z0-9_-]+\.\*$", pattern))
+
+            if not (valid_exact or valid_service_wildcard):
+                return "DENY(EXPLICIT_DENY_INVALID_PATTERN)"
+            return "PROCEED"
+
+        malformed_patterns = ["*", "mail.messages.*", "mail*", "mail.*.delete", "regex:.*"]
+        for p in malformed_patterns:
+            result = validate_and_match_pattern(p, "mail.messages.delete")
+            self.assertEqual(result, "DENY(EXPLICIT_DENY_INVALID_PATTERN)", f"Pattern {p} did not fail closed")
+
+    def test_invalid_resource_deny_shape_fails_closed(self):
+        """Test 12: Invalid stored deny shape (resource_type IS NULL but resource_id IS NOT NULL) fails closed."""
+        def evaluate_deny_resource_scoping(rule, req_type, req_id):
+            r_type = rule.get("resource_type")
+            r_id = rule.get("resource_id")
+            if r_type is None and r_id is not None:
+                return "DENY(EXPLICIT_DENY_INVALID_RESOURCE_SCOPE)"
+            if r_type is None and r_id is None:
+                return "DENY(EXPLICIT_DENY)"
+            if r_type == req_type and (r_id is None or r_id == req_id):
+                return "DENY(EXPLICIT_DENY)"
+            return "ALLOW"
+
+        corrupted_rule = {"action_pattern": "mail.messages.delete", "resource_type": None, "resource_id": "msg_42"}
+        result = evaluate_deny_resource_scoping(corrupted_rule, "message", "msg_42")
+        self.assertEqual(result, "DENY(EXPLICIT_DENY_INVALID_RESOURCE_SCOPE)")
 
 
 class TestOryolMailLiveRepositoryConfig(unittest.TestCase):

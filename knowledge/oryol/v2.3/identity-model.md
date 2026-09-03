@@ -107,6 +107,23 @@ CREATE TABLE service_accounts (
     UNIQUE(organization_id, id)
 );
 
+-- Fresh-install service account tenant ownership immutability trigger (P0)
+CREATE TRIGGER trg_service_accounts_org_immutable
+BEFORE UPDATE OF organization_id ON service_accounts
+BEGIN
+    SELECT RAISE(
+        FAIL,
+        'SERVICE_ACCOUNT_ORG_REQUIRED: organization_id must not be null'
+    )
+    WHERE NEW.organization_id IS NULL;
+
+    SELECT RAISE(
+        FAIL,
+        'SERVICE_ACCOUNT_ORG_IMMUTABLE: service account organization ownership is immutable in Phase 1'
+    )
+    WHERE NEW.organization_id IS NOT OLD.organization_id;
+END;
+
 -- 7. Service Account API Credentials (Hashed)
 CREATE TABLE api_credentials (
     id TEXT PRIMARY KEY,                       -- apic_<ulid>
@@ -181,5 +198,7 @@ CREATE TABLE service_principal_role_assignments (
 4. **Service Principal Role Confinement & Taxonomy**:
    Service principals receive permissions strictly through `service_principal_role_assignments` evaluated against the active registry version. Human memberships and service principals are strictly segregated in the schema.
 5. **Service Account Tenant Confinement & Ownership Immutability (P0-2)**:
-   A service account has exactly one authoritative owning organization in Phase 1 (`service_accounts.organization_id`). Once Migration 0005 has backfilled the organization owner, or once a new service account is created, its organization ownership is immutable during Phase 1 (`organization_id` is required, tenant-authoritative, and immutable after creation/backfill). Cross-organization transfer of a service account is NOT supported in Phase 1; any future transfer capability requires a separate architecture decision. Both creation (INSERT) and update (UPDATE) operations are protected by database triggers: `organization_id` cannot be set to NULL on INSERT or UPDATE, and cannot be changed from one organization to another on UPDATE. `organization_service_principals` enforces a compound foreign key referencing `service_accounts(organization_id, principal_id)`, structurally preventing a service account owned by Organization A from being bound into Organization B.
+   A service account has exactly one authoritative owning organization in Phase 1 (`service_accounts.organization_id`). Once Migration 0005 has backfilled the organization owner, or once a new service account is created, its organization ownership is immutable during Phase 1 (`organization_id` is required, tenant-authoritative, and immutable after creation/backfill). Cross-organization transfer of a service account is NOT supported in Phase 1; any future transfer capability requires a separate architecture decision. Both creation (INSERT) and update (UPDATE) operations are protected by database triggers with SQLite null-safe comparison (`WHERE NEW.organization_id IS NOT OLD.organization_id;` and `WHERE NEW.organization_id IS NULL;`): `organization_id` cannot be set to NULL on INSERT or UPDATE, and cannot be changed from one organization to another on UPDATE (rejecting Org A $\to$ Org B, Org A $\to$ NULL, and NULL $\to$ Org B). `organization_service_principals` enforces a compound foreign key referencing `service_accounts(organization_id, principal_id)`, structurally preventing a service account owned by Organization A from being bound into Organization B.
+6. **System-Template Provisioning & Trust Boundary Invariant**:
+   Tenant-facing role creation APIs MUST NOT accept `is_system_template` or `template_key` from client-controlled input; tenant-created roles always set `is_system_template = 0` and `template_key = NULL`. System templates (`owner`, `admin`, `member`) are provisioned exclusively through the trusted internal organization-bootstrap path. The database trigger `trg_role_definitions_template_invariant_insert` enforces row shape, `trg_role_definitions_immutable_template` prevents subsequent modification, and the trusted Core mutation boundary strictly prevents client submission of system-template fields.
 
