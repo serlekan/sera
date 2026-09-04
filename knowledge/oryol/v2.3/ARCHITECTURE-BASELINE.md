@@ -1,13 +1,13 @@
 # Oryol Workspace Architecture Baseline v2.3
 
 **Version**: 2.3  
-**Status**: PROPOSED ARCHITECTURE BASELINE (v2.3) — Subject to Independent Architecture Review  
-**Date**: 2026-08-28  
+**Status**: APPROVED ARCHITECTURE BASELINE (v2.3) — APPROVED FOR IMPLEMENTATION  
+**Date**: 2026-08-28 (Activated: 2026-09-04)  
 **Ecosystem**: Oryol Workspace Platform (`serlekan/sera`, `serlekan/oryol-mail`, `serlekan/oryol-core`)  
 **SERA Governance Version**: `0.4.2`  
 **Previous Baseline Version**: `2.2`  
 **Previous Baseline SHA**: `e59f28a1abc0392fe3f38ecfe3a3fde8e379c033`  
-**Accepted Specification SHA**: Assigned externally after approval  
+**Accepted Specification SHA**: `bc3df742d16f3a49b53f417482ae328f8f053264`  
 
 ---
 
@@ -59,3 +59,4 @@ The following 16 canonical documents constitute the proposed Architecture v2.3 b
 - **2026-09-02**: Migration 0005 dependency-chain and transaction-semantics closure: established 7-phase shadow reconstruction algorithm safeguarding authorization subjects and explicit-deny policies from cascading deletion (Finding A); reconciled historical service account tenant ownership drift against accepted Migration 0001 (Finding B); established immutable service account tenant ownership triggers; corrected predecessor invitations schema facts and preserved invitations without destructive reconstruction; restored Frozen v2.2 invitation uniqueness `UNIQUE(organization_id, email, status)` via preflight duplicate detection and in-place unique index; implemented in-batch assertion failure mechanics (`_migration_assert`) guaranteeing rollback before table retirement; clarified post-batch confirmation semantics without false rollback claims; inventoried compound foreign key parent-key eligibility; added self-contained predecessor schema manifest; documented fresh-install vs. migrated schema equivalence.
 - **2026-09-03**: Final Security Closure: upgraded service account ownership immutability triggers to SQLite null-safe identity semantics (`WHERE NEW.organization_id IS NOT OLD.organization_id;`) on both fresh-install and migrated paths (P0); added in-batch service account ownership assertions (`_migration_assert_ownership`); added in-batch role template backfill assertions (`_migration_assert_templates`); formally bounded tenant role creation against client-supplied system template fields; upgraded Phase D deny-chain shadow parity to bidirectional full-tuple equality via symmetric `EXCEPT` across all columns of OSP, authorization subjects, and explicit denies; established deterministic Phase-1 action-pattern grammar (exact and `<service>.*`) with fail-closed malformed pattern and invalid resource scope handling; hardened Step 8.2 with immediate terminal denial `DENY(CONTEXT_INTERNAL_CONTEXT_INVALID)` for invalid internal execution sentinels; audited predecessor secondary indexes confirming zero lost indexes.
 - **2026-09-04**: Explicit Deny Grammar Canonicalization: unified Phase-1 action-pattern grammar (`^[a-z0-9_-]+(\.[a-z0-9_-]+)+$` exact, `^[a-z0-9_-]+\.\*$` service wildcard) across mutation validation, Migration 0005 host-language preflight (`ERR_MIGRATION_INVALID_DENY_PATTERN`), and runtime evaluation (`DENY(EXPLICIT_DENY_INVALID_PATTERN)`); replaced weak SQL LIKE preflight approximation with deterministic host-language validation rejecting `mail.messages.*`, `mail.*.*`, unanchored wildcards, and dot-less identifiers.
+- **2026-09-04**: Architecture v2.3 Specification Accepted and Activated: Promoted exact reviewed specification commit `bc3df742d16f3a49b53f417482ae328f8f053264` (tree `a62c470acf3caba1e6753e7705522330584f5ae5`) to `main` following dual assured reviews: Claude Opus 5 (`APPROVED FOR IMPLEMENTATION`) and GPT Luna (`APPROVED FOR IMPLEMENTATION / SHIP`, session `01a06b83-b0b8-7362-86df-22e9c36eb81c`). Activated in SERA runtime as active architecture baseline v2.3.

@@ -425,6 +425,11 @@ class TestOryolFailClosedGovernance(unittest.TestCase):
         self.assertIn(f"Architecture baseline version: `{ORYOL_ARCHITECTURE_BASELINE_VERSION}`", review_text)
         self.assertIn(f"Architecture specification commit: `{ORYOL_ARCHITECTURE_SPEC_SHA}`", review_text)
 
+    def test_active_oryol_architecture_baseline_constants(self):
+        """Verify that SERA actively binds Oryol repositories to Architecture v2.3 and accepted spec SHA."""
+        self.assertEqual(ORYOL_ARCHITECTURE_BASELINE_VERSION, "2.3")
+        self.assertEqual(ORYOL_ARCHITECTURE_SPEC_SHA, "bc3df742d16f3a49b53f417482ae328f8f053264")
+
 
 class TestOryolV23GovernanceAndSecurityInvariants(unittest.TestCase):
     """Verify that Proposed Architecture v2.3 satisfies all hardened security invariants, template integrity, tenant ownership, and migration contracts."""
