@@ -1378,10 +1378,81 @@ class TestOryolV23FinalSecurityClosure(unittest.TestCase):
                 return "DENY(EXPLICIT_DENY_INVALID_PATTERN)"
             return "PROCEED"
 
-        malformed_patterns = ["*", "mail.messages.*", "mail*", "mail.*.delete", "regex:.*"]
+        malformed_patterns = [
+            "*",
+            "mail",
+            "foo",
+            "mail*",
+            "mail.messages.*",
+            "mail.*.*",
+            "mail..delete",
+            ".mail.delete",
+            "mail.delete.",
+            "mail.**",
+            "regex:.*",
+            "mail.(read|delete)",
+        ]
         for p in malformed_patterns:
             result = validate_and_match_pattern(p, "mail.messages.delete")
             self.assertEqual(result, "DENY(EXPLICIT_DENY_INVALID_PATTERN)", f"Pattern {p} did not fail closed")
+
+    def test_migration_0005_host_preflight_deny_pattern_validation(self):
+        """Test 13: Migration 0005 host preflight evaluates canonical grammar; rejects malformed patterns before DDL."""
+        import re
+        import sqlite3
+
+        def validate_action_pattern_grammar(pattern: str) -> bool:
+            valid_exact = bool(re.match(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)+$", pattern)) and ("*" not in pattern)
+            valid_service_wildcard = bool(re.match(r"^[a-z0-9_-]+\.\*$", pattern))
+            return valid_exact or valid_service_wildcard
+
+        def run_migration_0005_preflight(con: sqlite3.Connection):
+            rows = con.execute("SELECT id, organization_id, action_pattern FROM explicit_denies;").fetchall()
+            for row in rows:
+                pattern = row[2]
+                if not validate_action_pattern_grammar(pattern):
+                    raise RuntimeError(f"ERR_MIGRATION_INVALID_DENY_PATTERN: malformed action_pattern '{pattern}' on id {row[0]}")
+            return "PREFLIGHT_OK"
+
+        # Case 1: Valid patterns all succeed
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE explicit_denies (id TEXT PRIMARY KEY, organization_id TEXT, action_pattern TEXT);")
+        valid_patterns = ["mail.messages.delete", "core.domains.manage", "mail.*", "core.*"]
+        for idx, p in enumerate(valid_patterns):
+            con.execute("INSERT INTO explicit_denies VALUES (?, 'org_1', ?);", (f"dny_{idx}", p))
+
+        status = run_migration_0005_preflight(con)
+        self.assertEqual(status, "PREFLIGHT_OK")
+
+        # Case 2: Every invalid pattern raises ERR_MIGRATION_INVALID_DENY_PATTERN and stops before DDL
+        invalid_patterns = [
+            "*",
+            "mail",
+            "foo",
+            "mail*",
+            "mail.messages.*",
+            "mail.*.*",
+            "mail..delete",
+            ".mail.delete",
+            "mail.delete.",
+            "mail.**",
+            "regex:.*",
+            "mail.(read|delete)",
+        ]
+
+        for p in invalid_patterns:
+            bad_con = sqlite3.connect(":memory:")
+            bad_con.execute("CREATE TABLE explicit_denies (id TEXT PRIMARY KEY, organization_id TEXT, action_pattern TEXT);")
+            bad_con.execute("INSERT INTO explicit_denies VALUES ('dny_bad', 'org_1', ?);", (p,))
+            ddl_executed = False
+
+            with self.assertRaises(RuntimeError) as ctx:
+                run_migration_0005_preflight(bad_con)
+                # DDL should NEVER be issued if preflight raises:
+                ddl_executed = True
+
+            self.assertFalse(ddl_executed, f"Migration DDL was issued despite invalid pattern {p}")
+            self.assertIn("ERR_MIGRATION_INVALID_DENY_PATTERN", str(ctx.exception))
 
     def test_invalid_resource_deny_shape_fails_closed(self):
         """Test 12: Invalid stored deny shape (resource_type IS NULL but resource_id IS NOT NULL) fails closed."""

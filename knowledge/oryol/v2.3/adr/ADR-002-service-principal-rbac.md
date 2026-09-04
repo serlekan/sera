@@ -259,8 +259,15 @@ graph TD
 
 1. **Shared Registry & Role Definitions**:
    Service principals evaluate against the **exact same** `permission_definitions`, `role_definitions`, and `role_permissions` as human members. No bespoke "service-only" permission registry is introduced.
-2. **Explicit Deny Precedence (Step 5)**:
-   Explicit denies configured on service principals (`authorization_subjects WHERE subject_type = 'service_principal'`) execute at Step 5 and unconditionally override any role permission granted via `service_principal_role_assignments`.
+2. **Explicit Deny Precedence & Canonical Action-Pattern Grammar (Step 5)**:
+   Explicit denies configured on service principals (`authorization_subjects WHERE subject_type = 'service_principal'`) execute at Step 5 and unconditionally override any role permission granted via `service_principal_role_assignments`. All explicit-deny rules enforce the single canonical Phase-1 action-pattern grammar:
+   - **Exact action**: `^[a-z0-9_-]+(\.[a-z0-9_-]+)+$` (with no `*`, e.g. `core.domains.manage`, `mail.messages.delete`). Matches only the exact canonical action string.
+   - **Service wildcard**: `^[a-z0-9_-]+\.\*$` (e.g. `mail.*`, `core.*`). Matches every action whose exact service prefix matches `<service>.`.
+   No other wildcard or malformed forms (e.g. `*`, `mail`, `foo`, `mail*`, `mail.messages.*`, `mail.*.*`, `mail..delete`, `.mail.delete`, `mail.delete.`, `mail.**`, regex) are permitted.
+   - **Mutation Validation**: Mutation APIs reject malformed patterns before persistence.
+   - **Migration Preflight**: Migration 0005 host preflight evaluates all existing patterns against this exact grammar and aborts before DDL with `ERR_MIGRATION_INVALID_DENY_PATTERN` if any row is malformed.
+   - **Runtime Evaluation**: If an invalid pattern is encountered for an applicable subject, evaluation terminates immediately with `DENY(EXPLICIT_DENY_INVALID_PATTERN)`.
+   The three layers share this single deterministic definition.
 3. **Step 7 Fine-Grained Resource Evaluation & Immutable Template Matching (F-6, P0-1)**:
    - Organization-wide non-resource actions succeed upon passing Step 6 coarse-RBAC and Step 8 contextual ABAC.
    - Privately owned resources require explicit resource grants (`resource_grants`) or unowned resource status. Service principals holding system template Admin/Owner roles (`rd.is_system_template = TRUE AND rd.template_key IN ('owner', 'admin')`) bypass private ACLs identically to human administrators.
@@ -600,14 +607,22 @@ Before executing any DDL:
    );
    ```
    If `> 0` $\to$ abort with `ERR_MIGRATION_ORPHAN_EXPLICIT_DENY`.
-5. **Validate All `explicit_denies.action_pattern` Grammar**:
+5. **Validate All `explicit_denies.action_pattern` Values via Canonical Host-Language Validator**:
+   Migration 0005 host preflight runs outside `db.batch` in trusted migration orchestration. Rather than relying on insufficient SQL LIKE approximations, the migration runner reads all existing explicit-deny rows:
    ```sql
-   -- Reject malformed wildcards or non-canonical pattern shapes (must be exact action or '<service>.*'):
-   SELECT COUNT(*) FROM explicit_denies dny
-   WHERE dny.action_pattern NOT LIKE '%.*'
-     AND dny.action_pattern LIKE '%*%';
+   SELECT id, organization_id, action_pattern FROM explicit_denies;
    ```
-   If `> 0` $\to$ abort with `ERR_MIGRATION_INVALID_DENY_PATTERN`.
+   and validates every `action_pattern` against the exact canonical Phase-1 grammar:
+   - **Exact action**: `^[a-z0-9_-]+(\.[a-z0-9_-]+)+$` (with no `*`)
+   - **Service wildcard**: `^[a-z0-9_-]+\.\*$`
+   
+   **Strict Enforcement Rules**:
+   - **MUST ACCEPT**: `mail.messages.delete`, `core.domains.manage`, `mail.*`, `core.*`
+   - **MUST REJECT**: `*`, `mail`, `foo`, `mail*`, `mail.messages.*`, `mail.*.*`, `mail..delete`, `.mail.delete`, `mail.delete.`, `mail.**`, `regex:.*`, `mail.(read|delete)`, unanchored wildcards, multiple wildcards.
+   
+   If ANY existing row is malformed, the orchestrator immediately halts deployment before issuing any DDL with:
+   **`ERR_MIGRATION_INVALID_DENY_PATTERN`**.
+   The orchestrator MUST NOT delete, rewrite, normalize, or silently skip the row.
 6. **Validate All `explicit_denies` Resource Scopes**:
    ```sql
    -- Reject invalid shape: resource_type IS NULL but resource_id IS NOT NULL:
@@ -980,8 +995,9 @@ Migration 0005 execution separates pre-flight validation, atomic batch execution
 
 1. **Host-Language Preflight Phase (Pre-Batch Guards, Outside `db.batch`)**:
    - Executed by the trusted migration orchestrator (deployment runner / Cloudflare Worker) prior to submitting the DDL batch.
-   - Evaluates read-only semantic queries (`SELECT COUNT(*) ...`) for orphan service accounts, ambiguous ownership, principal taxonomy, authorization subject references, explicit deny integrity, deny action-pattern grammar, invalid deny resource shapes, and duplicate invitation status states.
-   - If any query returns a non-zero count, the runner immediately halts deployment with a typed error code (`ERR_MIGRATION_*`) without issuing DDL or mutating database state. No transaction rollback claim is needed because no database mutation occurred.
+   - Evaluates read-only semantic queries (`SELECT COUNT(*) ...`) for orphan service accounts, ambiguous ownership, principal taxonomy, authorization subject references, explicit deny integrity, invalid deny resource shapes, and duplicate invitation status states.
+   - Evaluates host-language canonical regex validation over all existing `explicit_denies.action_pattern` values against exact action `^[a-z0-9_-]+(\.[a-z0-9_-]+)+$` and service wildcard `^[a-z0-9_-]+\.\*$`, strictly rejecting malformed patterns (`*`, `mail`, `mail.messages.*`, `mail.*.*`, regex, etc.).
+   - If any query returns a non-zero count or any pattern is malformed, the runner immediately halts deployment with a typed error code (`ERR_MIGRATION_*`) without issuing DDL or mutating database state. No transaction rollback claim is needed because no database mutation occurred.
 
 2. **Atomic D1 Batch Execution Phase (`db.batch([...])`)**:
    - Executes the deterministic DDL and DML sequence (in-place column additions, backfills, indexes, triggers, shadow table creation, data copy, in-batch assertion checkpoint, leaf-to-root drop, and root-to-leaf rename) in a single atomic transaction.

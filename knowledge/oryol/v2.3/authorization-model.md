@@ -343,10 +343,10 @@ Every evaluation executes in strict linear order:
    └─► Query `explicit_denies` matching subject (membership, team, or service_principal).
    └─► For each candidate deny rule:
          └─► Validate `action_pattern` syntax:
-               └─► Phase-1 Action-Pattern Grammar:
-                     └─► Exact action: e.g. `core.domains.manage`, `mail.messages.delete` (matches only exact canonical action string).
-                     └─► Service wildcard: `<service>.*` (e.g. `mail.*` matches every action with service prefix `mail.`).
-                     └─► Disallowed: `*`, `mail.messages.*`, `mail*`, regex, multiple wildcards.
+               └─► Phase-1 Canonical Action-Pattern Grammar:
+                     └─► Exact action: `^[a-z0-9_-]+(\.[a-z0-9_-]+)+$` (with no `*`, e.g. `core.domains.manage`, `mail.messages.delete`). Matches only exact canonical action string.
+                     └─► Service wildcard: `^[a-z0-9_-]+\.\*$` (e.g. `mail.*`, `core.*`). Matches every action whose exact service prefix matches `<service>.`.
+                     └─► Disallowed: `*`, `mail`, `foo`, `mail*`, `mail.messages.*`, `mail.*.*`, `mail..delete`, `.mail.delete`, `mail.delete.`, `mail.**`, `regex:.*`, `mail.(read|delete)`, unanchored wildcards, multiple wildcards.
                └─► If `action_pattern` is malformed ──► TERMINAL DENY(EXPLICIT_DENY_INVALID_PATTERN) (fail closed; malformed deny rows are never skipped).
          └─► Validate and resolve resource scoping:
                └─► If `resource_type IS NULL AND resource_id IS NOT NULL` ──► TERMINAL DENY(EXPLICIT_DENY_INVALID_RESOURCE_SCOPE) (invalid stored shape fails closed).
