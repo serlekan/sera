@@ -11,17 +11,24 @@ import json
 import math
 import os
 import re
+import socket
+import threading
+import time
 from collections.abc import Collection, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 MAX_JSON_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 8
 MAX_JSON_KEYS = 128
 MAX_STRING_CHARS = 4096
+LOCK_RETRY_ATTEMPTS = 3
+LOCK_RETRY_DELAY_SECONDS = 0.01
+STALE_LOCK_AGE = 3600
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
@@ -58,6 +65,10 @@ class SchemaError(RuntimeError):
     """A fail-closed schema, canonicalization, or validation error."""
 
 
+class LockHeld(RuntimeError):
+    """Raised when lock acquisition or lock ordering must fail closed."""
+
+
 @dataclass(frozen=True)
 class ReasonCode:
     code: str
@@ -66,6 +77,26 @@ class ReasonCode:
     blocking: bool
     evidence_refs: tuple[str, ...]
     action: str
+
+
+@dataclass
+class TaskLockGuard:
+    """Proof of live in-process ownership for an atomic lock directory."""
+
+    lock_dir: Path
+    protected_root: Path
+    kind: str
+    owner_thread_id: int
+    held: bool = True
+
+    def protects(self, path: Path) -> bool:
+        if not self.held or threading.get_ident() != self.owner_thread_id:
+            return False
+        candidate = Path(path).resolve()
+        if self.kind == "task":
+            return candidate.is_relative_to(self.protected_root)
+        registry = self.protected_root / "execution-evidence-sources.jsonl"
+        return candidate == registry.resolve()
 
 
 EMPTY_LEDGER_FINGERPRINT = hashlib.sha256(b"sera:ledger:empty\x1f0").hexdigest()
@@ -266,6 +297,144 @@ def require_bounded_str(
     if any(ord(char) < 32 for char in value):
         raise SchemaError(f"{field_name} must not contain control characters")
     return value
+
+
+_LOCK_STATE = threading.local()
+
+
+def _held_guards() -> list[TaskLockGuard]:
+    guards = getattr(_LOCK_STATE, "guards", None)
+    if guards is None:
+        guards = []
+        _LOCK_STATE.guards = guards
+    return guards
+
+
+def _lock_error(label: str, lock_dir: Path) -> LockHeld:
+    detail = ""
+    metadata_path = lock_dir / "owner.json"
+    try:
+        detail = metadata_path.read_text(encoding="utf-8")[:512].strip()
+    except OSError:
+        pass
+    suffix = f" Owner metadata: {detail}" if detail else ""
+    return LockHeld(
+        f"{label} is locked by another SERA operation at {lock_dir}; "
+        f"inspect and remove it manually only after confirming no operation is active.{suffix}"
+    )
+
+
+@contextmanager
+def _directory_lock(
+    lock_dir: Path,
+    protected_root: Path,
+    *,
+    kind: str,
+    label: str,
+) -> Iterator[TaskLockGuard]:
+    stack = _held_guards()
+    for existing in stack:
+        if existing.kind != kind:
+            raise LockHeld("task and registry locks must never be held simultaneously")
+        if existing.lock_dir == lock_dir:
+            raise _lock_error(label, lock_dir)
+
+    acquired = False
+    for attempt in range(LOCK_RETRY_ATTEMPTS):
+        try:
+            os.mkdir(lock_dir)
+            acquired = True
+            break
+        except FileExistsError as exc:
+            if attempt + 1 == LOCK_RETRY_ATTEMPTS:
+                raise _lock_error(label, lock_dir) from exc
+            time.sleep(LOCK_RETRY_DELAY_SECONDS)
+    if not acquired:
+        raise _lock_error(label, lock_dir)
+
+    metadata = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "acquired_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    metadata_path = lock_dir / "owner.json"
+    try:
+        metadata_path.write_text(canonical_json(metadata) + "\n", encoding="utf-8")
+    except BaseException:
+        os.rmdir(lock_dir)
+        raise
+
+    guard = TaskLockGuard(
+        lock_dir=lock_dir.resolve(),
+        protected_root=protected_root.resolve(),
+        kind=kind,
+        owner_thread_id=threading.get_ident(),
+    )
+    stack.append(guard)
+    try:
+        yield guard
+    finally:
+        guard.held = False
+        stack.remove(guard)
+        metadata_path.unlink()
+        os.rmdir(lock_dir)
+
+
+@contextmanager
+def task_lock(task_dir: Path) -> Iterator[TaskLockGuard]:
+    """Acquire the task mutation lock; task→registry nesting is forbidden."""
+    task_path = Path(task_dir).resolve()
+    if not task_path.is_dir():
+        raise SchemaError(f"task directory does not exist: {task_path}")
+    with _directory_lock(task_path / ".lock", task_path, kind="task", label="task") as guard:
+        yield guard
+
+
+@contextmanager
+def registry_lock(root: Path) -> Iterator[TaskLockGuard]:
+    """Acquire the repository registry lock without nesting a task lock."""
+    registry_root = Path(root).resolve() / ".sera"
+    if not registry_root.is_dir():
+        raise SchemaError(f"SERA registry directory does not exist: {registry_root}")
+    with _directory_lock(
+        registry_root / ".registry.lock",
+        registry_root,
+        kind="registry",
+        label="registry",
+    ) as guard:
+        yield guard
+
+
+def _resolved_registration_hash(registration: Any) -> str:
+    if isinstance(registration, str):
+        return require_hash(registration, "registration_hash")
+    if isinstance(registration, Mapping):
+        return require_hash(registration.get("registration_hash"), "registration_hash")
+    raise SchemaError("registration reader must return a hash or registration object")
+
+
+@contextmanager
+def with_registration_then_task(
+    root: Path,
+    task_dir: Path,
+    registration_hash: str,
+    *,
+    registration_reader: Callable[[Path, str], Any],
+) -> Iterator[tuple[Any, TaskLockGuard]]:
+    """Resolve under registry lock, release, take task lock, and re-read."""
+    expected = require_hash(registration_hash, "registration_hash")
+    with registry_lock(root):
+        captured = registration_reader(Path(root), expected)
+        captured_hash = _resolved_registration_hash(captured)
+        if captured_hash != expected:
+            raise SchemaError("registration hash does not match requested registration")
+
+    with task_lock(task_dir) as guard:
+        current = registration_reader(Path(root), expected)
+        current_hash = _resolved_registration_hash(current)
+        if current_hash != captured_hash:
+            raise SchemaError("registration changed before task lock")
+        yield current, guard
 
 
 def _normalized_record(
