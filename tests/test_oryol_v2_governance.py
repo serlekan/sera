@@ -1498,6 +1498,379 @@ class TestOryolMailLiveRepositoryConfig(unittest.TestCase):
         self.assertIn("verification", policies)
 
 
+ORYOL_V23_ACTIVATION_SHA = "78c349ba7e9b9954ac96bf3b18fbc0ded600bc23"
+ORYOL_V23_ACCEPTED_SPEC_SHA = "bc3df742d16f3a49b53f417482ae328f8f053264"
+
+V24_CANONICAL_DOCS = [
+    "workspace-architecture.md", "core-boundaries.md", "multi-tenancy.md", "identity-model.md",
+    "authorization-model.md", "session-security.md", "audit-and-events.md", "cloudflare-platform.md",
+    "data-lifecycle.md", "ai-platform.md", "search-platform.md", "product-integration.md",
+    "sera-governance.md", "predecessor-schema-manifest.md", "ARCHITECTURE-BASELINE.md",
+    "IMPLEMENTATION-OBLIGATIONS.md",
+]
+V24_ADRS = [
+    "ADR-001-step8-security-policy.md", "ADR-002-service-principal-rbac.md",
+    "ADR-003-reserved-owner-authority.md", "ADR-004-session-policy-and-refresh-recovery.md",
+    "ADR-005-migration-verification-and-recovery.md", "ADR-006-event-version-semantics.md",
+]
+V24_DELTA_DOCS = [
+    "identity-model.md", "authorization-model.md", "session-security.md",
+    "audit-and-events.md", "data-lifecycle.md", "sera-governance.md",
+]
+
+
+class TestOryolV24ProposedArchitecture(unittest.TestCase):
+    """Prove Proposed Architecture v2.4: v2.3 frozen, v2.4 registry complete, ADR-003/004/005/006 invariants present, proposal isolation holds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).resolve().parent.parent
+        cls.v23 = cls.root / "knowledge" / "oryol" / "v2.3"
+        cls.v24 = cls.root / "knowledge" / "oryol" / "v2.4"
+        cls.v2 = cls.root / "knowledge" / "oryol" / "v2"
+
+    def _text(self, *parts: str) -> str:
+        p = self.v24.joinpath(*parts)
+        self.assertTrue(p.is_file(), f"Missing v2.4 document: {'/'.join(parts)}")
+        return p.read_text(encoding="utf-8")
+
+    # ---- v2.3 / v2 predecessor immutability ----
+
+    def test_v23_corpus_is_byte_for_byte_frozen_vs_activation(self):
+        """v2.3 must have zero diff versus the activation commit; predecessor is historical accepted evidence."""
+        try:
+            merge_base = run_git(self.root, "merge-base", ORYOL_V23_ACTIVATION_SHA, "HEAD").strip()
+        except RuntimeError as exc:
+            self.skipTest(f"activation commit not available in this checkout: {exc}")
+        self.assertEqual(
+            merge_base, ORYOL_V23_ACTIVATION_SHA,
+            "the v2.3 activation commit must be an ancestor of HEAD (branch from origin/main)",
+        )
+        diff = run_git(self.root, "diff", "--name-only", ORYOL_V23_ACTIVATION_SHA, "HEAD",
+                       "--", "knowledge/oryol/v2.3").strip()
+        self.assertEqual(diff, "", f"knowledge/oryol/v2.3 MUST be frozen; changed files:\n{diff}")
+
+    def test_v2_2_corpus_untouched(self):
+        diff = run_git(self.root, "diff", "--name-only", ORYOL_V23_ACTIVATION_SHA, "HEAD",
+                       "--", "knowledge/oryol/v2").strip()
+        self.assertEqual(diff, "", f"knowledge/oryol/v2 (v2.2) MUST remain untouched; changed:\n{diff}")
+
+    def test_v24_only_adds_expected_paths(self):
+        """The revision adds only v2.4 knowledge + governance test changes; it does not touch Oryol Core or product code."""
+        changed = [line for line in run_git(self.root, "diff", "--name-only",
+                                            ORYOL_V23_ACTIVATION_SHA, "HEAD").splitlines() if line.strip()]
+        for path in changed:
+            self.assertTrue(
+                path.startswith("knowledge/oryol/v2.4/") or path == "tests/test_oryol_v2_governance.py",
+                f"Unexpected change outside the v2.4 proposal surface: {path}",
+            )
+
+    # ---- v2.4 registry completeness ----
+
+    def test_v24_directory_and_all_documents_exist(self):
+        self.assertTrue(self.v24.is_dir(), "knowledge/oryol/v2.4 must exist")
+        for name in V24_CANONICAL_DOCS:
+            p = self.v24 / name
+            self.assertTrue(p.is_file(), f"Missing v2.4 canonical doc: {name}")
+            self.assertGreater(len(p.read_text(encoding="utf-8")), 200, f"{name} unexpectedly small")
+        for name in V24_ADRS:
+            p = self.v24 / "adr" / name
+            self.assertTrue(p.is_file(), f"Missing v2.4 ADR: {name}")
+
+    def test_v24_status_is_proposed_not_active(self):
+        base = self._text("ARCHITECTURE-BASELINE.md")
+        self.assertIn("PROPOSED ARCHITECTURE BASELINE (v2.4)", base)
+        status_line = next(ln for ln in base.splitlines() if ln.startswith("**Status**"))
+        self.assertIn("PROPOSED", status_line)
+        self.assertNotIn("APPROVED", status_line)
+        self.assertNotIn("ACTIVE", status_line)
+        for name in V24_DELTA_DOCS:
+            self.assertIn("PROPOSED ARCHITECTURE BASELINE (v2.4)", self._text(name),
+                          f"{name} must be marked PROPOSED v2.4")
+
+    def test_v24_registry_references_every_document_on_disk(self):
+        base = self._text("ARCHITECTURE-BASELINE.md")
+        for name in V24_CANONICAL_DOCS + [f"adr/{a}" for a in V24_ADRS]:
+            if name == "ARCHITECTURE-BASELINE.md":
+                continue
+            self.assertIn(f"]({name})", base,
+                          f"ARCHITECTURE-BASELINE.md registry must link {name}")
+        # every markdown file present under v2.4 is accounted for in the registry
+        on_disk = sorted(p.relative_to(self.v24).as_posix() for p in self.v24.rglob("*.md")
+                         if p.name != "ARCHITECTURE-BASELINE.md")
+        for rel in on_disk:
+            self.assertIn(f"]({rel})", base, f"Registry omits an on-disk document: {rel}")
+
+    def test_v24_carry_forward_docs_reference_predecessor(self):
+        for name in ["workspace-architecture.md", "core-boundaries.md", "multi-tenancy.md",
+                     "cloudflare-platform.md", "ai-platform.md", "search-platform.md",
+                     "product-integration.md", "predecessor-schema-manifest.md"]:
+            t = self._text(name)
+            self.assertIn(f"../v2.3/{name}", t, f"{name} must reference its v2.3 predecessor")
+            self.assertIn("no semantic change", t.lower())
+        for a in ["ADR-001-step8-security-policy.md", "ADR-002-service-principal-rbac.md"]:
+            t = self._text("adr", a)
+            self.assertIn(f"../../v2.3/adr/{a}", t)
+
+    def test_v24_delta_docs_declare_carry_forward_and_cite_adr(self):
+        for name, adr in [("identity-model.md", "ADR-003"), ("authorization-model.md", "ADR-003"),
+                          ("session-security.md", "ADR-004"), ("audit-and-events.md", "ADR-006"),
+                          ("data-lifecycle.md", "ADR-005")]:
+            t = self._text(name)
+            self.assertIn(f"../v2.3/{name}", t, f"{name} must reference v2.3 predecessor")
+            self.assertRegex(t, r"[Cc]arr(y|ied)[- ]?[Ff]orward", f"{name} must declare carry-forward")
+            self.assertIn(adr, t, f"{name} must cite {adr}")
+
+    def test_proposal_isolation_active_constants_unchanged(self):
+        self.assertEqual(ORYOL_ARCHITECTURE_BASELINE_VERSION, "2.3")
+        self.assertEqual(ORYOL_ARCHITECTURE_SPEC_SHA, ORYOL_V23_ACCEPTED_SPEC_SHA)
+        self.assertEqual(SERA_GOVERNANCE_VERSION, "0.4.2")
+        gov = self._text("sera-governance.md")
+        self.assertIn("ARCHITECTURE_PROPOSAL_ISOLATION", gov)
+        self.assertIn('ORYOL_ARCHITECTURE_BASELINE_VERSION` stays `2.3`', gov)
+
+    def test_no_regression_of_historical_v23_findings(self):
+        base = self._text("ARCHITECTURE-BASELINE.md")
+        for token in ["explicit deny precedence", "Step 6 mandatory RBAC", "service principal RBAC",
+                      "resource ACL sequencing", "delegation constraints", "cross-org constraints",
+                      "Step 8 contextual policy", "trusted-edge semantics",
+                      "`authorization_version` / `security_version` separation",
+                      "Migration 0005 shadow parity", "invitation integrity",
+                      "system-template dual signals", "no client-controlled system templates"]:
+            self.assertIn(token, base, f"v2.4 baseline must record no-regression of: {token}")
+        auth = self._text("authorization-model.md")
+        self.assertIn("is_system_template = TRUE AND template_key IN ('owner', 'admin')", auth)
+        self.assertIn("No regression", auth)
+
+    # ---- ADR-003 ----
+
+    def test_adr003_reserved_owner_authority_invariants(self):
+        t = self._text("adr", "ADR-003-reserved-owner-authority.md")
+        self.assertIn("RESERVED_OWNER_AUTHORITY", t)
+        self.assertIn("ORG_MUST_HAVE_ACTIVE_HUMAN_OWNER", t)
+        # 1. Owner is reserved authority, not a permission bundle
+        self.assertRegex(t, r"reserved (organization )?authority")
+        self.assertIn("not a permission bundle", t)
+        # 2. permission-set equivalence must not confer/assign Owner
+        self.assertIn("OWNER_ASSIGNMENT_REQUIRES_OWNER", t)
+        self.assertRegex(t, r"[Pp]ermission-[Ss]et [Ee]quivalence")
+        # reserved-authority gate precedes the containment test
+        self.assertIn("actorHoldsReservedOwnerAuthority", t)
+        self.assertIn("never inspects permission sets", t)
+        # 3. who may assign / transfer / remove
+        for kw in ["Assign `Owner`", "Transfer `Owner`", "Remove `Owner`"]:
+            self.assertIn(kw, t)
+        self.assertRegex(t, r"No platform ?/ ?support ?/ ?Anthropic actor")
+        # 4. Admin = permission-defined template, no intrinsic reserved authority
+        self.assertIn("Admin` = permission-defined system template", t)
+        self.assertIn("no intrinsic reserved authority", t.lower())
+        # 5. atomic last-owner protection across every operation class
+        for op in ["role removal", "membership deactivation", "membership removal",
+                   "membership downgrade", "ownership transfer", "bulk membership operation",
+                   "concurrent Owner"]:
+            self.assertIn(op.lower(), t.lower(), f"ADR-003 must bind last-Owner protection to: {op}")
+        self.assertIn("post-image", t)
+        self.assertIn("_owner_assert", t)
+        # 6. active org invariant: at least one active HUMAN membership, is_system_template TRUE, template_key 'owner'
+        self.assertIn("is_system_template = 1", t)
+        self.assertIn("template_key = 'owner'", t)
+        self.assertIn("p.type = 'human'", t)
+        self.assertIn("active_human_owner_count", t)
+        # 7. service principals never satisfy the invariant
+        self.assertIn("trg_sra_reject_owner_template", t)
+        self.assertRegex(t, r"[Ss]ervice [Pp]rincipals? (MUST )?[Nn]ever")
+        # 8. ownership transfer transaction
+        self.assertRegex(t, r"[Tt]ransfer [Tt]ransaction")
+        for step in ["validate source owner", "destination", "active human", "prove",
+                     "authorization_versions", "audit", "outbox", "atomically"]:
+            self.assertIn(step, t.lower())
+        # 9. canonical errors
+        for err in ["LAST_OWNER_PROTECTION_VIOLATION", "OWNER_ASSIGNMENT_REQUIRES_OWNER",
+                    "OWNER_TRANSFER_TARGET_INVALID"]:
+            self.assertIn(err, t)
+        # 10. adversarial concurrency
+        self.assertIn("owner_mutation_seq", t)
+        self.assertIn("OWNER_MUTATION_CONFLICT", t)
+        self.assertRegex(t, r"[Aa]dversarial [Cc]oncurrency")
+        # structured decisions/invariants/open-questions section
+        for h in ["### Decisions", "### Invariants", "### Open Questions"]:
+            self.assertIn(h, t)
+
+    def test_adr003_amends_authorization_and_identity_models(self):
+        auth = self._text("authorization-model.md")
+        self.assertIn("Reserved-authority gate", auth)
+        self.assertIn("DENY(OWNER_ASSIGNMENT_REQUIRES_OWNER)", auth)
+        self.assertIn("Permission-set equivalence is never a path to `Owner`", auth)
+        ident = self._text("identity-model.md")
+        self.assertIn("ORG_MUST_HAVE_ACTIVE_HUMAN_OWNER", ident)
+        self.assertIn("RESERVED_OWNER_AUTHORITY", ident)
+        self.assertRegex(ident, r"[Ss]uperseded by ADR-003")
+
+    # ---- ADR-004 ----
+
+    def test_adr004_executable_timeout_and_recovery_rules(self):
+        t = self._text("adr", "ADR-004-session-policy-and-refresh-recovery.md")
+        # session layers + decoupling
+        self.assertIn("SESSION_LAYER_SEPARATION", t)
+        for layer in ["global identity session", "organization authorization session", "refresh family"]:
+            self.assertIn(layer.lower(), t.lower())
+        self.assertRegex(t, r"unintentionally shorten another tenant|shorten .* another tenant|another tenant's")
+        # idle timeout: exact timestamps + rate-limited heartbeat + no write amplification
+        self.assertIn("account_sessions.last_active_at", t)
+        self.assertIn("SESSION_ACTIVITY_HEARTBEAT", t)
+        self.assertRegex(t, r"rate-limited heartbeat")
+        self.assertRegex(t, r"[Ww]rite amplification")
+        self.assertIn("never on every authorized request", t)
+        # absolute timeout: immutable created_at anchor, no refresh extension
+        self.assertIn("SESSION_ABSOLUTE_ANCHOR", t)
+        self.assertIn("account_sessions.created_at", t)
+        self.assertRegex(t, r"[Nn]o refresh (may )?extend")
+        self.assertIn("GLOBAL_SESSION_ABSOLUTE_CAP_SECONDS", t)
+        # multi-org principal executable rules
+        self.assertRegex(t, r"[Mm]ulti-?[Oo]rganization")
+        self.assertIn("org_access", t)
+        self.assertIn("/v1/auth/org-token", t)
+        self.assertRegex(t, r"membership.{0,40}(added|removed|remove)")
+        self.assertRegex(t, r'[Ss]trictest')  # discusses & rejects strictest-policy coupling
+        # refresh rotation / delivery failure
+        self.assertIn("REFRESH_EVENT_SEPARATION", t)
+        self.assertRegex(t, r"(?i)before[^\n]*consuming the refresh")
+        self.assertIn("credential rotation success", t.lower())
+        self.assertIn("exchange success", t.lower())
+        self.assertRegex(t, r"(response )?(transport|delivery) (loss|success)")
+        self.assertIn("signing failure", t.lower())
+        self.assertRegex(t, r"separate endpoint")
+        self.assertIn("/v1/auth/org-token", t)
+        self.assertIn("/v1/auth/refresh/recover", t)
+        self.assertIn("SUCCESSOR_RECOVERY_WINDOW_SECONDS", t)
+        self.assertRegex(t, r"[Nn]o permissive replay grace")
+        self.assertIn("idempoten", t.lower())
+        # sensitive session operations: complete authoritative check
+        self.assertIn("SENSITIVE_OP_AUTHORITATIVE_VALIDATION", t)
+        for chk in ["presenting session", "principal_id == token.principal_id",
+                    "session_ownership_violation", "status == 'active'", "expires_at",
+                    "security_version", "memberships(org, principal)"]:
+            self.assertIn(chk.lower(), t.lower())
+        for h in ["### Decisions", "### Invariants", "### Open Questions"]:
+            self.assertIn(h, t)
+
+    def test_adr004_session_security_delta_zero_table_change(self):
+        t = self._text("session-security.md")
+        self.assertIn("Zero table changes", t)
+        self.assertIn("SESSION_ABSOLUTE_ANCHOR", t)
+        self.assertIn("SESSION_ACTIVITY_HEARTBEAT", t)
+        self.assertIn("SENSITIVE_OP_AUTHORITATIVE_VALIDATION", t)
+        self.assertRegex(t, r"[Nn]o permissive replay grace|replay defense .* intact|Account-Level Replay Defense")
+
+    # ---- ADR-005 ----
+
+    def test_adr005_durable_quarantine_and_retry_rules(self):
+        t = self._text("adr", "ADR-005-migration-verification-and-recovery.md")
+        for state in ["PRE_MIGRATION", "MIGRATING", "MIGRATED_UNVERIFIED", "VERIFIED",
+                      "VERIFICATION_FAILED", "RECOVERY_REQUIRED"]:
+            self.assertIn(state, t, f"ADR-005 must define persistent state {state}")
+        self.assertIn("MIGRATION_ROUTING_ELIGIBILITY", t)
+        self.assertIn("schema_migration_state", t)
+        self.assertRegex(t, r"process (restart|exiting).{0,80}(MUST NOT|insufficient|never)")
+        self.assertIn("cold start", t)
+        # database identity evidence binding
+        self.assertIn("VERIFICATION_EVIDENCE_BINDING", t)
+        for ev in ["Cloudflare account", "environment", "database identifier", "binding",
+                   "migration filename", "SHA-256", "schema", "release", "timestamp",
+                   "verification"]:
+            self.assertIn(ev.lower(), t.lower(), f"evidence tuple must bind {ev}")
+        # routing eligibility: applied AND verified; process exit insufficient; subsequent migration re-runs verification
+        self.assertRegex(t, r"applied.{0,40}verified|verified.{0,40}applied")
+        self.assertIn("insufficient", t)
+        self.assertRegex(t, r"subsequent migration.{0,80}(re-?run|re-?execute).{0,20}verif")
+        # retry semantics: exact migration identity, no LIKE
+        self.assertIn("MIGRATION_EXACT_IDENTITY", t)
+        self.assertIn("LIKE '%0005%'", t)
+        self.assertRegex(t, r"prohibit", )
+        self.assertIn("VERIFICATION_INDEPENDENTLY_EXECUTABLE", t)
+        # schema semantic verification beyond sqlite_master names
+        self.assertIn("sqlite_master", t)
+        for asp in ["foreign key", "compound", "unique index", "partial-index", "trigger",
+                    "taxonomy", "service-account tenant ownership", "authorization subject",
+                    "explicit-deny", "human-principal", "service-principal", "invitation"]:
+            self.assertIn(asp, t.lower(), f"semantic verification must cover {asp}")
+        self.assertRegex(t, r"row ?/ ?tuple preservation")
+        self.assertRegex(t, r"isolated .*fixture")
+        self.assertRegex(t, r"[Nn]ever .* mutat.* production|[Pp]roduction data is never mutated")
+        # migration fence / TOCTOU
+        self.assertIn("MIGRATION_WRITE_FENCE", t)
+        self.assertRegex(t, r"TOCTOU|preflight.{0,20}(and|↔|->).{0,20}(migration|DDL)")
+        for fence in ["maintenance mode", "write quiescence", "deployment lock",
+                      "migration lease"]:
+            self.assertIn(fence.lower(), t.lower(), f"fence options must include {fence}")
+        # recovery
+        self.assertIn("RESTORE_DOES_NOT_REVERSE_EXTERNAL_EFFECTS", t)
+        self.assertIn("Time Travel", t)
+        for r in ["forward repair", "rollback eligibility", "event reconciliation",
+                  "routing quarantine", "incident escalation"]:
+            self.assertIn(r.lower(), t.lower(), f"recovery must cover {r}")
+        for h in ["### Decisions", "### Invariants", "### Open Questions"]:
+            self.assertIn(h, t)
+
+    def test_adr005_data_lifecycle_delta(self):
+        t = self._text("data-lifecycle.md")
+        self.assertIn("MIGRATION_ROUTING_ELIGIBILITY", t)
+        self.assertIn("RESTORE_DOES_NOT_REVERSE_EXTERNAL_EFFECTS", t)
+        self.assertIn("D1 Time Travel", t)  # carried-forward deletion pipeline fact preserved
+
+    # ---- ADR-006 ----
+
+    def test_adr006_event_sequencing_rules(self):
+        t = self._text("adr", "ADR-006-event-version-semantics.md")
+        # 1-6 required definitions
+        self.assertIn("EVENT_VERSION_MODEL", t)
+        self.assertIn("EVENT_VERSION_ALLOCATION", t)
+        self.assertIn("aggregate_event_sequences", t)
+        self.assertIn("ONE_EVENT_ONE_VERSION", t)
+        self.assertRegex(t, r"[Ss]table [Aa]ggregate [Ii]dentity|AGGREGATE_IDENTITY")
+        self.assertRegex(t, r"[Cc]oncurrency behavior|[Cc]oncurrency:")
+        self.assertRegex(t, r"[Dd]omain-state version.{0,60}emitted-event version|independent and .* not assumed equal")
+        # explicit A-vs-B choice, no mixing
+        self.assertRegex(t, r"Model B")
+        self.assertRegex(t, r"[Mm]ust not mix|never mixed|not mixed")
+        self.assertRegex(t, r"separate .*sequence")
+        # CAS allocation inside the mutation transaction, hard-coded prohibited
+        self.assertRegex(t, r"same .*(transaction|db\.batch).* as the domain mutation")
+        self.assertRegex(t, r"[Hh]ard-?coded.{0,40}prohibited")
+        self.assertIn("P1-09", t)
+        # filtered consumers & gaps
+        self.assertIn("CONSUMER_STREAM_SEQUENCE", t)
+        self.assertIn("consumer_stream_seq", t)
+        self.assertRegex(t, r"filtered consumer")
+        self.assertRegex(t, r"not .* transport loss|never .* loss|invisible to the gap check")
+        # idempotency: not random id + now
+        self.assertIn("EVENT_IDEMPOTENCY_KEY", t)
+        self.assertRegex(t, r"random_id \+ now|random.{0,20}now\(\)|freshly generated `event_id`")
+        self.assertRegex(t, r"deterministic function of the authoritative")
+        self.assertIn("command_idempotency", t)
+        for h in ["### Decisions", "### Invariants", "### Open Questions"]:
+            self.assertIn(h, t)
+
+    def test_adr006_audit_and_events_delta(self):
+        t = self._text("audit-and-events.md")
+        self.assertIn("EVENT_VERSION_MODEL", t)
+        self.assertIn("Model B", t)
+        self.assertIn("CONSUMER_STREAM_SEQUENCE", t)
+        self.assertIn("EVENT_IDEMPOTENCY_KEY", t)
+        self.assertIn("No regression", t)
+        # carried-forward audit immutability facts preserved
+        self.assertIn("trg_audit_no_update", t)
+        self.assertIn("trg_audit_no_delete", t)
+
+    # ---- implementation obligations ----
+
+    def test_v24_records_implementation_obligations_without_new_semantics(self):
+        t = self._text("IMPLEMENTATION-OBLIGATIONS.md")
+        for pid in ["P1-01", "P1-02", "P1-06", "P1-07", "P1-09"]:
+            self.assertIn(pid, t)
+        self.assertRegex(t, r"[Nn]o [Nn]ew [Ss]emantics")
+
+
 if __name__ == "__main__":
     unittest.main()
 
