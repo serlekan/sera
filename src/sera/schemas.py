@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 
 MAX_JSON_BYTES = 1024 * 1024
@@ -64,6 +66,9 @@ class ReasonCode:
     blocking: bool
     evidence_refs: tuple[str, ...]
     action: str
+
+
+EMPTY_LEDGER_FINGERPRINT = hashlib.sha256(b"sera:ledger:empty\x1f0").hexdigest()
 
 
 def _validate_json_value(value: Any) -> None:
@@ -261,3 +266,112 @@ def require_bounded_str(
     if any(ord(char) < 32 for char in value):
         raise SchemaError(f"{field_name} must not contain control characters")
     return value
+
+
+def _normalized_record(
+    record: dict[str, Any],
+    normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    normalized = normalizer(record) if normalizer is not None else record
+    if not isinstance(normalized, dict):
+        raise SchemaError("ledger normalizer must return an object")
+    canonical_json(normalized)
+    return normalized
+
+
+def _ledger_record_hash(schema_family: str, record: dict[str, Any]) -> str:
+    return sha256_domain(f"{schema_family}:record", canonical_json(record).encode("utf-8"))
+
+
+def ledger_fingerprint(schema_family: str, records: Iterable[dict[str, Any]]) -> str:
+    """Return an order- and duplicate-sensitive semantic ledger fingerprint."""
+    require_bounded_str(schema_family, "schema_family", max_length=128)
+    ordered = list(records)
+    if not ordered:
+        return EMPTY_LEDGER_FINGERPRINT
+    indexed_hashes = [
+        str(index).encode("ascii") + b"\0" + _ledger_record_hash(schema_family, record).encode("ascii")
+        for index, record in enumerate(ordered)
+    ]
+    return sha256_domain(
+        f"{schema_family}:ledger",
+        str(len(ordered)).encode("ascii"),
+        *indexed_hashes,
+    )
+
+
+class LedgerReader:
+    """Read one append-only JSONL ledger without skipping invalid history."""
+
+    def __init__(
+        self,
+        path: Path,
+        schema_family: str,
+        normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.schema_family = require_bounded_str(schema_family, "schema_family", max_length=128)
+        self.normalizer = normalizer
+        self.malformed: str | None = None
+
+    def _fail(self, reason: str, detail: Exception | None = None) -> None:
+        self.malformed = reason
+        message = f"ledger {self.path} is invalid: {reason}"
+        if detail is not None:
+            message += f" ({detail})"
+        raise SchemaError(message) from detail
+
+    def records(self) -> list[dict[str, Any]]:
+        self.malformed = None
+        if not self.path.exists():
+            return []
+        raw = self.path.read_bytes()
+        if not raw:
+            return []
+        if not raw.endswith(b"\n"):
+            self._fail("incomplete final line")
+        records: list[dict[str, Any]] = []
+        for line_number, segment in enumerate(raw.split(b"\n")[:-1], start=1):
+            if not segment.strip():
+                continue
+            try:
+                record = read_strict_json(segment, spec=None)
+                records.append(_normalized_record(record, self.normalizer))
+            except (SchemaError, KeyError, TypeError, ValueError) as exc:
+                self._fail(f"line {line_number} is invalid", exc)
+        return records
+
+    def indexed_hashes(self) -> list[tuple[int, str]]:
+        return [
+            (index, _ledger_record_hash(self.schema_family, record))
+            for index, record in enumerate(self.records())
+        ]
+
+    def fingerprint(self) -> str:
+        return ledger_fingerprint(self.schema_family, self.records())
+
+
+def _require_append_lock(lock: Any, path: Path) -> None:
+    if lock is None or getattr(lock, "held", False) is not True:
+        raise SchemaError("append_ledger_record requires a held lock")
+    protects = getattr(lock, "protects", None)
+    if not callable(protects) or protects(path) is not True:
+        raise SchemaError("held lock does not protect the ledger path")
+
+
+def append_ledger_record(path: Path, record: Mapping[str, Any], lock: Any) -> None:
+    """Append one canonical UTF-8 JSON object while the caller holds its lock."""
+    ledger_path = Path(path)
+    _require_append_lock(lock, ledger_path)
+    if not isinstance(record, Mapping):
+        raise SchemaError("ledger record must be an object")
+    line = (canonical_json(dict(record)) + "\n").encode("utf-8")
+    with ledger_path.open("ab", buffering=0) as handle:
+        written = handle.write(line)
+        if written != len(line):
+            raise SchemaError("ledger append was incomplete")
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
