@@ -169,6 +169,74 @@ class LockingTests(unittest.TestCase):
             append_ledger_record(ledger, {"sequence": 1}, guard)
         self.assertEqual(ledger.read_bytes(), b'{"sequence":1}\n')
 
+    def test_registry_guard_permits_only_repository_source_registry_append(self) -> None:
+        registry = self.root / ".sera" / "execution-evidence-sources.jsonl"
+        task_ledger = self.task_dir / "history.jsonl"
+        with registry_lock(self.root) as guard:
+            append_ledger_record(registry, {"sequence": 1}, guard)
+            with self.assertRaises(SchemaError):
+                append_ledger_record(task_ledger, {"sequence": 2}, guard)
+        self.assertEqual(registry.read_bytes(), b'{"sequence":1}\n')
+        self.assertFalse(task_ledger.exists())
+
+    def test_fabricated_task_lock_guard_is_rejected_while_real_guard_is_live(self) -> None:
+        ledger = self.task_dir / "history.jsonl"
+        with task_lock(self.task_dir) as real_guard:
+            fabricated = TaskLockGuard(
+                lock_dir=real_guard.lock_dir,
+                protected_root=real_guard.protected_root,
+                kind=real_guard.kind,
+                owner_thread_id=real_guard.owner_thread_id,
+                held=True,
+            )
+            with self.assertRaises(SchemaError):
+                append_ledger_record(ledger, {"sequence": 1}, fabricated)
+        self.assertFalse(ledger.exists())
+
+    def test_task_guard_for_another_task_is_rejected(self) -> None:
+        other_task_dir = self.root / ".sera" / "tasks" / "task-2"
+        other_task_dir.mkdir()
+        ledger = other_task_dir / "history.jsonl"
+        with task_lock(self.task_dir) as guard:
+            with self.assertRaises(SchemaError):
+                append_ledger_record(ledger, {"sequence": 1}, guard)
+        self.assertFalse(ledger.exists())
+
+    def test_task_guard_cannot_append_repository_source_registry(self) -> None:
+        registry = self.root / ".sera" / "execution-evidence-sources.jsonl"
+        with task_lock(self.task_dir) as guard:
+            with self.assertRaises(SchemaError):
+                append_ledger_record(registry, {"sequence": 1}, guard)
+        self.assertFalse(registry.exists())
+
+    def test_guard_is_rejected_after_context_exit(self) -> None:
+        ledger = self.task_dir / "history.jsonl"
+        with task_lock(self.task_dir) as guard:
+            pass
+        with self.assertRaises(SchemaError):
+            append_ledger_record(ledger, {"sequence": 1}, guard)
+        self.assertFalse(ledger.exists())
+
+    def test_guard_is_rejected_from_another_thread(self) -> None:
+        ledger = self.task_dir / "history.jsonl"
+        errors: list[BaseException] = []
+
+        def append_from_non_owner() -> None:
+            try:
+                append_ledger_record(ledger, {"sequence": 1}, guard)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with task_lock(self.task_dir) as guard:
+            worker = threading.Thread(target=append_from_non_owner)
+            worker.start()
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SchemaError)
+        self.assertFalse(ledger.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

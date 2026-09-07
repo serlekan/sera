@@ -8,22 +8,13 @@ import unittest
 from pathlib import Path
 
 from sera.schemas import (
-    EMPTY_LEDGER_FINGERPRINT,
     LedgerReader,
     SchemaError,
     append_ledger_record,
     canonical_json,
     ledger_fingerprint,
+    task_lock,
 )
-
-
-class _HeldLock:
-    def __init__(self, root: Path, *, held: bool = True) -> None:
-        self.root = root.resolve()
-        self.held = held
-
-    def protects(self, path: Path) -> bool:
-        return path.resolve().is_relative_to(self.root)
 
 
 class LedgerReaderTests(unittest.TestCase):
@@ -31,19 +22,20 @@ class LedgerReaderTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.path = self.root / "history.jsonl"
-        self.lock = _HeldLock(self.root)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def test_append_writes_one_canonical_utf8_record_and_newline(self) -> None:
-        append_ledger_record(self.path, {"z": 1, "name": "café"}, self.lock)
+        with task_lock(self.root) as guard:
+            append_ledger_record(self.path, {"z": 1, "name": "café"}, guard)
         self.assertEqual(self.path.read_bytes(), b'{"name":"caf\xc3\xa9","z":1}\n')
         self.assertEqual(LedgerReader(self.path, "test").records(), [{"name": "café", "z": 1}])
 
     def test_records_remain_in_physical_order(self) -> None:
-        for sequence in (1, 2, 3):
-            append_ledger_record(self.path, {"sequence": sequence}, self.lock)
+        with task_lock(self.root) as guard:
+            for sequence in (1, 2, 3):
+                append_ledger_record(self.path, {"sequence": sequence}, guard)
         self.assertEqual(
             LedgerReader(self.path, "test").records(),
             [{"sequence": 1}, {"sequence": 2}, {"sequence": 3}],
@@ -64,11 +56,43 @@ class LedgerReaderTests(unittest.TestCase):
         self.path.write_bytes((canonical_json(record) + "\n" + canonical_json(record) + "\n").encode())
         self.assertEqual(LedgerReader(self.path, "test").records(), [record, record])
 
-    def test_absent_and_empty_ledgers_have_the_canonical_empty_fingerprint(self) -> None:
-        self.assertEqual(LedgerReader(self.path, "test").fingerprint(), EMPTY_LEDGER_FINGERPRINT)
+    def test_same_family_empty_fingerprint_is_stable_for_absent_and_empty_ledgers(self) -> None:
+        absent = LedgerReader(self.path, "test").fingerprint()
         self.path.write_bytes(b"")
-        self.assertEqual(LedgerReader(self.path, "another-family").fingerprint(), EMPTY_LEDGER_FINGERPRINT)
-        self.assertEqual(ledger_fingerprint("test", []), EMPTY_LEDGER_FINGERPRINT)
+        empty = LedgerReader(self.path, "test").fingerprint()
+        self.assertEqual(absent, empty)
+        self.assertEqual(empty, ledger_fingerprint("test", []))
+
+    def test_different_families_have_different_empty_fingerprints(self) -> None:
+        self.assertNotEqual(
+            ledger_fingerprint("reviews", []),
+            ledger_fingerprint("seals", []),
+        )
+        fingerprints = {
+            ledger_fingerprint(family, [])
+            for family in (
+                "execution-bindings",
+                "execution-receipts",
+                "verification",
+                "reviews",
+                "seals",
+            )
+        }
+        self.assertEqual(len(fingerprints), 5)
+
+    def test_empty_and_non_empty_ledgers_have_different_fingerprints(self) -> None:
+        self.assertNotEqual(
+            ledger_fingerprint("reviews", []),
+            ledger_fingerprint("reviews", [{"sequence": 1}]),
+        )
+
+    def test_family_change_changes_empty_and_non_empty_fingerprints(self) -> None:
+        record = {"sequence": 1}
+        self.assertNotEqual(ledger_fingerprint("reviews", []), ledger_fingerprint("review", []))
+        self.assertNotEqual(
+            ledger_fingerprint("reviews", [record]),
+            ledger_fingerprint("review", [record]),
+        )
 
     def test_json_spacing_and_platform_newlines_are_non_semantic(self) -> None:
         records = [{"a": 1, "b": 2}, {"text": "é"}]
@@ -121,21 +145,24 @@ class LedgerReaderTests(unittest.TestCase):
 
 
 class LedgerAppendLockContractTests(unittest.TestCase):
-    def test_append_requires_a_held_lock(self) -> None:
+    def test_append_rejects_no_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "history.jsonl"
-            with self.assertRaisesRegex(SchemaError, "held lock"):
+            path = Path(directory) / "history.jsonl"
+            with self.assertRaises(SchemaError):
                 append_ledger_record(path, {"sequence": 1}, None)
-            with self.assertRaisesRegex(SchemaError, "held lock"):
-                append_ledger_record(path, {"sequence": 1}, _HeldLock(root, held=False))
             self.assertFalse(path.exists())
 
-    def test_append_rejects_a_lock_for_another_path(self) -> None:
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
-            path = Path(first) / "history.jsonl"
-            with self.assertRaisesRegex(SchemaError, "does not protect"):
-                append_ledger_record(path, {"sequence": 1}, _HeldLock(Path(second)))
+    def test_append_rejects_a_generic_fake_guard(self) -> None:
+        class Fake:
+            held = True
+
+            def protects(self, _path: Path) -> bool:
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.jsonl"
+            with self.assertRaises(SchemaError):
+                append_ledger_record(path, {"sequence": 1}, Fake())
             self.assertFalse(path.exists())
 
 

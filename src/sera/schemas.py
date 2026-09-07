@@ -99,9 +99,6 @@ class TaskLockGuard:
         return candidate == registry.resolve()
 
 
-EMPTY_LEDGER_FINGERPRINT = hashlib.sha256(b"sera:ledger:empty\x1f0").hexdigest()
-
-
 def _validate_json_value(value: Any) -> None:
     if value is None or isinstance(value, (str, bool, int)):
         return
@@ -456,8 +453,6 @@ def ledger_fingerprint(schema_family: str, records: Iterable[dict[str, Any]]) ->
     """Return an order- and duplicate-sensitive semantic ledger fingerprint."""
     require_bounded_str(schema_family, "schema_family", max_length=128)
     ordered = list(records)
-    if not ordered:
-        return EMPTY_LEDGER_FINGERPRINT
     indexed_hashes = [
         str(index).encode("ascii") + b"\0" + _ledger_record_hash(schema_family, record).encode("ascii")
         for index, record in enumerate(ordered)
@@ -521,10 +516,15 @@ class LedgerReader:
 
 
 def _require_append_lock(lock: Any, path: Path) -> None:
-    if lock is None or getattr(lock, "held", False) is not True:
-        raise SchemaError("append_ledger_record requires a held lock")
-    protects = getattr(lock, "protects", None)
-    if not callable(protects) or protects(path) is not True:
+    if not isinstance(lock, TaskLockGuard):
+        raise SchemaError("append_ledger_record requires a live TaskLockGuard")
+    if (
+        lock.held is not True
+        or lock.owner_thread_id != threading.get_ident()
+        or not any(guard is lock for guard in _held_guards())
+    ):
+        raise SchemaError("append_ledger_record requires a live TaskLockGuard")
+    if lock.protects(path) is not True:
         raise SchemaError("held lock does not protect the ledger path")
 
 
