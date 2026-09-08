@@ -41,6 +41,8 @@ from .core import (
     run_verification,
     update_repo_map,
 )
+from .provenance import adopt_policy_snapshot
+from .schemas import LockHeld, SchemaError
 
 
 def _json_flag(command: argparse.ArgumentParser) -> None:
@@ -96,6 +98,12 @@ def parser() -> argparse.ArgumentParser:
     confirm = task_commands.add_parser("confirm", help="Confirm or replace auto-selected exact file ownership.")
     confirm.add_argument("task", nargs="?")
     confirm.add_argument("--file", action="append", default=[], dest="files")
+
+    policy = task_commands.add_parser("policy", help="Capture a candidate policy without contract adoption.")
+    policy.add_argument("task", nargs="?")
+    policy.add_argument("--adopt", action="store_true", required=True)
+    policy.add_argument("--actor", required=True)
+    policy.add_argument("--reason", required=True)
 
     auto = task_commands.add_parser("auto", help="Draft a task capsule from a natural-language request.")
     auto.add_argument("request")
@@ -227,6 +235,12 @@ def main(argv: list[str] | None = None) -> int:
             task_dir = resolve_task_dir(root, args.task)
             task = confirm_task_ownership(root, task_dir, args.files or None)
             print(f"Confirmed ownership for {task['id']}: {len(task['allowed_files'])} files")
+            return 0
+        if args.command == "task" and args.task_command == "policy":
+            task_dir = resolve_task_dir(root, args.task)
+            snapshot = adopt_policy_snapshot(root, task_dir, actor=args.actor, reason=args.reason)
+            print(f"Captured candidate policy {snapshot['snapshot_hash']}")
+            print("TASK_CONTRACT_ADOPTION_REQUIRED: contract adoption must bind this candidate to activate it.")
             return 0
         if args.command == "task" and args.task_command == "auto":
             task_dir, report = auto_task(
@@ -495,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Next: {result['next_action']}")
             return 0 if result["ok"] and not seal_required_failure else 2
         raise SeraError("Unsupported command")
-    except (SeraError, OSError, json.JSONDecodeError) as exc:
+    except (SeraError, SchemaError, LockHeld, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

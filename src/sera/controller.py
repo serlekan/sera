@@ -35,6 +35,8 @@ from .core import (
     update_repo_map,
     write_task_capsule,
 )
+from .provenance import append_policy_snapshot, build_policy_snapshot, translate_config
+from .schemas import task_lock
 
 __all__ = [
     "HIGH_RISK_TERMS",
@@ -182,23 +184,26 @@ def confirm_task_ownership(root: Path, task_dir: Path, files: list[str] | None =
     would let a task confirmed onto a high-risk path keep a fast, review-free
     route.
     """
-    task = load_task(task_dir)
-    if files:
-        task["allowed_files"] = sorted({normalize_repo_path(path) for path in files})
-    if not task.get("allowed_files"):
-        raise SeraError("Cannot confirm empty ownership; provide --file at least once.")
-    config = load_config(root)
-    apply_task_policy(config, task)
-    controller = task.setdefault("controller", {})
-    controller["ownership_confirmed"] = True
-    controller["ownership_confirmed_at"] = utc_now()
-    controller["mode_source"] = task.get("mode_source")
-    controller["risk_reasons"] = task.get("risk_reasons", [])
-    (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
-    # Derived artifacts must not survive a contract mutation as authoritative:
-    # the capsule is rewritten now, and packets become stale by fingerprint.
-    write_task_capsule(task_dir, task)
-    return task
+    with task_lock(task_dir) as lock:
+        task = load_task(task_dir)
+        if files:
+            task["allowed_files"] = sorted({normalize_repo_path(path) for path in files})
+        if not task.get("allowed_files"):
+            raise SeraError("Cannot confirm empty ownership; provide --file at least once.")
+        config = load_config(root)
+        apply_task_policy(config, task)
+        snapshot = build_policy_snapshot(translate_config(config, root), task, "ownership_confirmed")
+        append_policy_snapshot(task_dir, snapshot, lock)
+        controller = task.setdefault("controller", {})
+        controller["ownership_confirmed"] = True
+        controller["ownership_confirmed_at"] = utc_now()
+        controller["mode_source"] = task.get("mode_source")
+        controller["risk_reasons"] = task.get("risk_reasons", [])
+        (task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+        # Derived artifacts must not survive a contract mutation as authoritative:
+        # the capsule is rewritten now, and packets become stale by fingerprint.
+        write_task_capsule(task_dir, task)
+        return task
 
 def next_action(root: Path, task_dir: Path) -> dict[str, Any]:
     task = load_task(task_dir)

@@ -22,15 +22,22 @@ from .core import (
     task_contract_fingerprint,
     task_fingerprint,
     task_review_coverage,
+    utc_now,
     validate_config,
 )
 from .schemas import (
+    LedgerReader,
     SchemaError,
+    TaskLockGuard,
+    append_ledger_record,
     canonical_json,
     read_strict_json,
+    record_hash,
     require_bounded_str,
     require_hash,
+    require_timestamp,
     sha256_domain,
+    task_lock,
 )
 
 
@@ -495,6 +502,216 @@ def translate_config(loaded: dict[str, object], root: Path) -> ConfigV2View:
     if schema_version == 1:
         return _translate_v1(loaded)
     return _translate_v2(loaded)
+
+
+_POLICY_TRIGGERS = {
+    "task_created", "ownership_confirmed", "explicit_policy_adoption", "task_contract_adoption",
+}
+_POLICY_SNAPSHOT_SPEC = {
+    "schema_version": None,
+    "source_schema": None,
+    "task_id": None,
+    "captured_at": None,
+    "trigger": None,
+    "mode": None,
+    "risk": None,
+    "required_stages": [None],
+    "implementation_origin_rules": {origin: [None] for origin in ("sera_builder", "external", "pre_existing")},
+    "provenance_requirements": _CONFIG_V2_SPEC["provenance_requirements"],
+    "execution_state_policy": {role: _EXECUTION_STATE_POLICY_SPEC for role in _CANONICAL_ROLES},
+    "legacy_override": {"allow_legacy_provenance": None},
+    "substitution_rules": _CONFIG_V2_SPEC["substitution_rules"],
+    "independence_requirements": {"distinct_execution_ids": None, "distinct_receipt_hashes": None},
+    "verification_requirements": [None],
+    "context_budgets": {"token_budget": None, "max_files": None, "max_packet_chars": None},
+    "knowledge_policy": _CONFIG_V2_SPEC["knowledge_policy"],
+    "repository_identity_requirement": _CONFIG_V2_SPEC["repository_identity_requirement"],
+    "snapshot_hash": None,
+}
+
+
+def _policy_value(value: object) -> object:
+    """Detach JSON values from one frozen view without consulting configuration."""
+    if isinstance(value, Mapping):
+        return {key: _policy_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_policy_value(item) for item in value]
+    return value
+
+
+def _validate_policy_snapshot(record: dict[str, object]) -> dict[str, object]:
+    """Validate persisted meaning as written; never normalize aliases or reload config."""
+    snapshot = read_strict_json(canonical_json(record).encode("utf-8"), spec=_POLICY_SNAPSHOT_SPEC)
+    try:
+        _require_exact_fields(snapshot, set(_POLICY_SNAPSHOT_SPEC) - {"legacy_override"}, "policy snapshot")
+        _reject_nulls(snapshot, "policy snapshot")
+        if type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != 1:
+            raise SchemaError("unsupported policy snapshot schema")
+        if type(snapshot["source_schema"]) is not int or snapshot["source_schema"] not in (1, 2):
+            raise SchemaError("unsupported policy source schema")
+        require_bounded_str(snapshot["task_id"], "task_id", max_length=256)
+        require_timestamp(snapshot["captured_at"], "captured_at")
+        if snapshot["trigger"] not in _POLICY_TRIGGERS:
+            raise SchemaError("unsupported policy snapshot trigger")
+        if snapshot["mode"] not in VALID_MODES or snapshot["risk"] not in RISK_LEVELS:
+            raise SchemaError("unsupported policy mode or risk")
+        _require_enum_list(snapshot["required_stages"], "required_stages", set(_CANONICAL_ROLES))
+        origins = snapshot["implementation_origin_rules"]
+        _require_exact_fields(origins, {"sera_builder", "external", "pre_existing"}, "implementation_origin_rules")
+        for origin, stages in origins.items():
+            allowed = {"implementation_builder"} if origin == "sera_builder" else {"implementation_validator"}
+            _require_enum_list(stages, f"implementation_origin_rules.{origin}", allowed)
+        if origins["sera_builder"] != ["implementation_builder"]:
+            raise SchemaError("sera_builder provenance requires an implementation_builder receipt")
+        provenance = snapshot["provenance_requirements"]
+        _require_exact_fields(provenance, set(_CONFIG_V2_SPEC["provenance_requirements"]), "provenance_requirements")
+        if provenance["minimum_repository_identity_strength"] not in _REPOSITORY_STRENGTHS:
+            raise SchemaError("unsupported provenance repository identity strength")
+        for key in ("require_execution_receipts", "allow_legacy_provenance"):
+            _require_bool_value(provenance[key], f"provenance_requirements.{key}")
+        execution = snapshot["execution_state_policy"]
+        _require_exact_fields(execution, set(_CANONICAL_ROLES), "execution_state_policy")
+        for role, policy in execution.items():
+            _validate_execution_state_policy(policy, f"execution_state_policy.{role}")
+        if "legacy_override" in snapshot:
+            if snapshot["legacy_override"].get("allow_legacy_provenance") is not True:
+                raise SchemaError("legacy_override must explicitly permit legacy provenance")
+            if provenance["allow_legacy_provenance"] is not True:
+                raise SchemaError("legacy_override disagrees with provenance requirements")
+        elif provenance["allow_legacy_provenance"]:
+            raise SchemaError("legacy provenance requires an explicit captured override")
+        for key in ("substitution_rules", "independence_requirements"):
+            block = snapshot[key]
+            _require_exact_fields(block, set(_POLICY_SNAPSHOT_SPEC[key]), key)
+            for field, value in block.items():
+                _require_bool_value(value, f"{key}.{field}")
+        if not all(snapshot["independence_requirements"].values()):
+            raise SchemaError("independent stages require distinct execution IDs and receipt hashes")
+        _require_string_list(snapshot["verification_requirements"], "verification_requirements", maximum_items=128, maximum_chars=4096)
+        budgets = snapshot["context_budgets"]
+        _require_exact_fields(budgets, set(_POLICY_SNAPSHOT_SPEC["context_budgets"]), "context_budgets")
+        for key, value in budgets.items():
+            _require_bounded_int(value, f"context_budgets.{key}", maximum=10_000 if key == "max_files" else 10_000_000)
+        knowledge = snapshot["knowledge_policy"]
+        _require_exact_fields(knowledge, set(_POLICY_SNAPSHOT_SPEC["knowledge_policy"]), "knowledge_policy")
+        paths = _require_string_list(knowledge["source_paths"], "knowledge_policy.source_paths", maximum_items=64, maximum_chars=512)
+        for path in paths:
+            normalized = path.replace("\\", "/")
+            if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized) or ".." in normalized.split("/"):
+                raise SchemaError("knowledge source paths must be repository-relative")
+        _require_bounded_int(knowledge["max_source_bytes"], "knowledge_policy.max_source_bytes", maximum=10_000_000)
+        _require_bool_value(knowledge["assessment_required"], "knowledge_policy.assessment_required")
+        identity = snapshot["repository_identity_requirement"]
+        _require_exact_fields(identity, {"minimum_strength"}, "repository_identity_requirement")
+        if identity["minimum_strength"] not in _REPOSITORY_STRENGTHS:
+            raise SchemaError("unsupported repository identity requirement")
+        require_hash(snapshot["snapshot_hash"], "snapshot_hash")
+        if record_hash("policy_snapshot", snapshot, "snapshot_hash") != snapshot["snapshot_hash"]:
+            raise SchemaError("policy snapshot hash mismatch")
+    except (SeraError, TypeError, KeyError) as exc:
+        raise SchemaError(f"invalid policy snapshot: {exc}") from exc
+    return snapshot
+
+
+def build_policy_snapshot(config_view: ConfigV2View, task: Mapping[str, object], trigger: str) -> dict:
+    """Capture one normalized candidate; configured source hashes confer no registry trust.
+
+    Origin receipt rules and structural independence capture Sections 9 and 13.
+    Verification comes from the task contract, where task creation resolved it.
+    Neither origin selection nor modern contract adoption is performed here.
+    """
+    if not isinstance(config_view, ConfigV2View):
+        raise SchemaError("policy capture requires one normalized ConfigV2View")
+    if set(config_view.stage_policies) != set(_CANONICAL_ROLES):
+        raise SchemaError("policy capture requires canonical stage roles")
+    mode, risk = task.get("mode"), task.get("risk")
+    if mode not in VALID_MODES or risk not in RISK_LEVELS:
+        raise SchemaError("policy capture requires resolved task mode and risk")
+    required = []
+    for role in _CANONICAL_ROLES:
+        policy = config_view.stage_policies[role]
+        if policy["enabled"] and (mode in policy["required_modes"] or risk in policy["required_risks"]):
+            required.append(role)
+    validator = ["implementation_validator"] if "implementation_validator" in required else []
+    snapshot = {
+        "schema_version": 1,
+        "source_schema": config_view.source_schema,
+        "task_id": task.get("task_id", task.get("id")),
+        "captured_at": utc_now(),
+        "trigger": trigger,
+        "mode": mode,
+        "risk": risk,
+        "required_stages": required,
+        "implementation_origin_rules": {
+            "sera_builder": ["implementation_builder"], "external": list(validator), "pre_existing": list(validator),
+        },
+        "provenance_requirements": _policy_value(config_view.provenance_requirements),
+        "execution_state_policy": _policy_value(config_view.execution_state_policy),
+        "substitution_rules": _policy_value(config_view.substitution_rules),
+        "independence_requirements": {"distinct_execution_ids": True, "distinct_receipt_hashes": True},
+        "verification_requirements": _policy_value(task.get("verification_requirements", task.get("verification", []))),
+        "context_budgets": {
+            "token_budget": config_view.context_budgets["token_budgets"][mode],
+            "max_files": config_view.context_budgets["max_files"],
+            "max_packet_chars": config_view.context_budgets["max_packet_chars"],
+        },
+        "knowledge_policy": _policy_value(config_view.knowledge_policy),
+        "repository_identity_requirement": _policy_value(config_view.repository_identity_requirement),
+    }
+    if config_view.provenance_requirements["allow_legacy_provenance"]:
+        snapshot["legacy_override"] = {"allow_legacy_provenance": True}
+    snapshot["snapshot_hash"] = record_hash("policy_snapshot", snapshot, "snapshot_hash")
+    return _validate_policy_snapshot(snapshot)
+
+
+def read_policy_snapshots(task_dir: Path) -> LedgerReader:
+    return LedgerReader(Path(task_dir) / "policy-snapshots.jsonl", "policy_snapshot", _validate_policy_snapshot)
+
+
+def append_policy_snapshot(task_dir: Path, snapshot: dict, lock: TaskLockGuard) -> None:
+    """Append under a genuine live task guard, refusing any invalid existing history."""
+    validated = _validate_policy_snapshot(snapshot)
+    read_policy_snapshots(task_dir).records()
+    append_ledger_record(Path(task_dir) / "policy-snapshots.jsonl", validated, lock)
+
+
+def active_policy_snapshot(task_dir: Path, contract: Mapping[str, object] | None) -> dict | None:
+    """Resolve the exact hash from a caller-supplied active modern contract.
+
+    T11/T12 own contract validation and active-contract authority. This function
+    never derives either from task.json, candidates, or current configuration.
+    """
+    records = read_policy_snapshots(task_dir).records()
+    if contract is None or contract.get("schema_version") == 1:
+        return None
+    if contract.get("schema_version") != 2 or contract.get("record_type") != "task_contract":
+        raise SchemaError("active policy selection requires a modern task contract")
+    bound_hash = require_hash(contract.get("active_policy_hash"), "active_policy_hash")
+    task_id = require_bounded_str(contract.get("task_id"), "task_id", max_length=256)
+    for snapshot in records:
+        if snapshot["snapshot_hash"] == bound_hash:
+            if snapshot["task_id"] != task_id:
+                raise SchemaError("bound policy snapshot belongs to another task")
+            return snapshot
+    return None
+
+
+def adopt_policy_snapshot(root: Path, task_dir: Path, *, actor: str, reason: str) -> dict:
+    """Capture a candidate only; actor/reason are explicit command preconditions.
+
+    Section 8.2 defines no normative actor/reason fields or adoption audit record.
+    They are required here but are deliberately not added to PolicySnapshotV1.
+    """
+    require_bounded_str(actor, "actor", max_length=256)
+    require_bounded_str(reason, "reason", max_length=4096)
+    if not actor.strip() or not reason.strip():
+        raise SchemaError("policy adoption requires nonblank actor and reason")
+    with task_lock(task_dir) as lock:
+        task = load_task(task_dir)
+        view = translate_config(load_config(root), root)
+        snapshot = build_policy_snapshot(view, task, "explicit_policy_adoption")
+        append_policy_snapshot(task_dir, snapshot, lock)
+    return snapshot
 
 
 def canonicalize_remote(url: str) -> str:
