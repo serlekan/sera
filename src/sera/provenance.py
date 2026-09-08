@@ -11,7 +11,19 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
-from .core import RISK_LEVELS, VALID_MODES, SeraError, validate_config
+from .core import (
+    RISK_LEVELS,
+    UNBORN_HEAD,
+    VALID_MODES,
+    SeraError,
+    git_head_identity,
+    load_config,
+    load_task,
+    task_contract_fingerprint,
+    task_fingerprint,
+    task_review_coverage,
+    validate_config,
+)
 from .schemas import (
     SchemaError,
     canonical_json,
@@ -643,6 +655,291 @@ def repository_identity(root: Path, config: dict[str, object]) -> dict[str, obje
             "root_commit": root_commit,
         },
     }
+
+
+EXECUTION_HEAD_MISMATCH = "EXECUTION_HEAD_MISMATCH"
+EXECUTION_TREE_MISMATCH = "EXECUTION_TREE_MISMATCH"
+EXECUTION_INPUT_STATE_MISMATCH = "EXECUTION_INPUT_STATE_MISMATCH"
+EXECUTION_OUTPUT_STATE_MISSING = "EXECUTION_OUTPUT_STATE_MISSING"
+EXECUTION_REPOSITORY_MISMATCH = "EXECUTION_REPOSITORY_MISMATCH"
+
+_REPOSITORY_IDENTITY_SPEC = {
+    "schema_version": None,
+    "strategy": None,
+    "logical_id": None,
+    "strength": None,
+    "components": None,
+}
+_REPOSITORY_STATE_SPEC = {
+    "schema_version": None,
+    "repository_identity": _REPOSITORY_IDENTITY_SPEC,
+    "head_sha": None,
+    "tree_sha": None,
+    "task_contract_fingerprint": None,
+    "task_fingerprint": None,
+    "state_kind": None,
+    "review_change_fingerprint": None,
+}
+
+
+class RepositoryStateError(SeraError):
+    """Fail-closed repository-state error with a stable reason-code leaf."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(f"{code}: {detail}")
+
+
+def _state_error(detail: str, code: str = EXECUTION_INPUT_STATE_MISMATCH) -> RepositoryStateError:
+    return RepositoryStateError(code, detail)
+
+
+def _validated_hash(value: object, field: str) -> str:
+    try:
+        return require_hash(value, field)
+    except SchemaError as exc:
+        raise _state_error(str(exc)) from None
+
+
+def _validated_git_id(value: object, field: str, *, allow_unborn: bool = True) -> str:
+    if value == UNBORN_HEAD and allow_unborn:
+        return UNBORN_HEAD
+    if not isinstance(value, str) or not _GIT_OBJECT_RE.fullmatch(value):
+        raise _state_error(f"{field} must be a lowercase immutable Git object ID.")
+    return value
+
+
+def _validate_repository_identity(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != set(_REPOSITORY_IDENTITY_SPEC):
+        raise _state_error("repository_identity has an invalid field set.")
+    if value.get("schema_version") != 1 or isinstance(value.get("schema_version"), bool):
+        raise _state_error("repository_identity uses an unsupported schema.")
+    strategy = value.get("strategy")
+    strength = value.get("strength")
+    if not isinstance(strategy, str):
+        raise _state_error("repository_identity.strategy is invalid.")
+    expected_strength = {
+        "configured": "configured",
+        "git_remote_root": "derived",
+        "local_git_dir": "local_only",
+    }.get(strategy)
+    if expected_strength is None or strength != expected_strength:
+        raise _state_error("repository_identity strategy and strength are inconsistent.")
+    logical_id = _validated_hash(value.get("logical_id"), "repository_identity.logical_id")
+    components = value.get("components")
+    if not isinstance(components, dict):
+        raise _state_error("repository_identity.components must be an object.")
+
+    if strategy == "configured":
+        if set(components) != {"configured_id_hash"}:
+            raise _state_error("configured repository identity components are invalid.")
+        normalized_components: dict[str, object] = {
+            "configured_id_hash": _validated_hash(
+                components["configured_id_hash"], "repository_identity.components.configured_id_hash"
+            )
+        }
+    elif strategy == "git_remote_root":
+        if set(components) != {"remote_count", "remote_identity_hashes", "root_commit"}:
+            raise _state_error("remote repository identity components are invalid.")
+        count = components["remote_count"]
+        hashes = components["remote_identity_hashes"]
+        if isinstance(count, bool) or not isinstance(count, int) or not (1 <= count <= _MAX_REMOTE_IDENTITIES):
+            raise _state_error("repository_identity.components.remote_count is invalid.")
+        if not isinstance(hashes, list) or len(hashes) != count:
+            raise _state_error("repository_identity.components.remote_identity_hashes are invalid.")
+        validated_hashes = [
+            _validated_hash(item, "repository_identity.components.remote_identity_hashes")
+            for item in hashes
+        ]
+        if len(set(validated_hashes)) != len(validated_hashes):
+            raise _state_error("repository_identity.components.remote_identity_hashes are invalid.")
+        normalized_components = {
+            "remote_count": count,
+            "remote_identity_hashes": validated_hashes,
+            "root_commit": _validated_git_id(
+                components["root_commit"],
+                "repository_identity.components.root_commit",
+                allow_unborn=False,
+            ),
+        }
+    else:
+        if set(components) != {"git_common_dir_hash", "root_commit"}:
+            raise _state_error("local repository identity components are invalid.")
+        normalized_components = {
+            "git_common_dir_hash": _validated_hash(
+                components["git_common_dir_hash"],
+                "repository_identity.components.git_common_dir_hash",
+            ),
+            "root_commit": _validated_git_id(
+                components["root_commit"],
+                "repository_identity.components.root_commit",
+                allow_unborn=False,
+            ),
+        }
+    return {
+        "schema_version": 1,
+        "strategy": strategy,
+        "logical_id": logical_id,
+        "strength": strength,
+        "components": normalized_components,
+    }
+
+
+def validate_repository_state(
+    obj: object,
+    *,
+    root: Path | None = None,
+    task_dir: Path | None = None,
+    contract_fp: str | None = None,
+    dynamic_fp: str | None = None,
+    require_committed: bool = False,
+    output_required: bool = False,
+) -> dict[str, object]:
+    """Validate intrinsic state and, when supplied, its current context."""
+    if obj is None:
+        code = EXECUTION_OUTPUT_STATE_MISSING if output_required else EXECUTION_INPUT_STATE_MISMATCH
+        raise _state_error("repository state is missing.", code)
+    if not isinstance(obj, dict):
+        raise _state_error("repository state must be an object.")
+    try:
+        strict = read_strict_json(canonical_json(obj).encode("utf-8"), spec=_REPOSITORY_STATE_SPEC)
+    except SchemaError as exc:
+        raise _state_error(str(exc)) from None
+    required = set(_REPOSITORY_STATE_SPEC) - {"review_change_fingerprint"}
+    if not required.issubset(strict):
+        missing = sorted(required - set(strict))[0]
+        raise _state_error(f"repository state is missing required field {missing}.")
+    schema_version = strict["schema_version"]
+    if schema_version != 1 or isinstance(schema_version, bool):
+        raise _state_error("repository state uses an unsupported schema.")
+    state_kind = strict["state_kind"]
+    if not isinstance(state_kind, str) or state_kind not in {"committed", "working_tree"}:
+        raise _state_error("state_kind must be committed or working_tree.")
+    head_sha = _validated_git_id(strict["head_sha"], "head_sha")
+    tree_sha = _validated_git_id(strict["tree_sha"], "tree_sha")
+    if (head_sha == UNBORN_HEAD) != (tree_sha == UNBORN_HEAD):
+        raise _state_error("head_sha and tree_sha must agree on unborn state.")
+    if state_kind == "committed" and head_sha == UNBORN_HEAD:
+        raise _state_error("an unborn repository cannot satisfy committed state.")
+    if require_committed and state_kind != "committed":
+        raise _state_error("the validation context requires committed state.")
+
+    review_fingerprint = strict.get("review_change_fingerprint")
+    if state_kind == "working_tree" and review_fingerprint is None:
+        raise _state_error("working_tree state requires review_change_fingerprint.")
+    if review_fingerprint is not None:
+        review_fingerprint = _validated_hash(review_fingerprint, "review_change_fingerprint")
+
+    normalized: dict[str, object] = {
+        "schema_version": 1,
+        "repository_identity": _validate_repository_identity(strict["repository_identity"]),
+        "head_sha": head_sha,
+        "tree_sha": tree_sha,
+        "task_contract_fingerprint": _validated_hash(
+            strict["task_contract_fingerprint"], "task_contract_fingerprint"
+        ),
+        "task_fingerprint": _validated_hash(strict["task_fingerprint"], "task_fingerprint"),
+        "state_kind": state_kind,
+    }
+    if review_fingerprint is not None:
+        normalized["review_change_fingerprint"] = review_fingerprint
+
+    root = Path(root).resolve() if root is not None else None
+    if root is not None:
+        try:
+            current_identity = repository_identity(root, load_config(root))
+            current_head = git_head_identity(root)
+        except (OSError, ValueError, SeraError):
+            raise _state_error("current repository context could not be resolved.") from None
+        if normalized["repository_identity"] != current_identity:
+            raise _state_error(
+                "repository identity does not match current context.", EXECUTION_REPOSITORY_MISMATCH
+            )
+        if head_sha != current_head["head_sha"]:
+            raise _state_error("HEAD does not match current context.", EXECUTION_HEAD_MISMATCH)
+        if tree_sha != current_head["head_tree_sha"]:
+            raise _state_error("tree does not match current context.", EXECUTION_TREE_MISMATCH)
+
+    if task_dir is not None:
+        if root is None:
+            raise _state_error("task_dir context requires root.")
+        try:
+            task = load_task(Path(task_dir))
+            current_contract_fp = task_contract_fingerprint(task)
+            current_dynamic_fp = task_fingerprint(root, Path(task_dir))
+        except (OSError, ValueError, SeraError):
+            raise _state_error("current task context could not be resolved.") from None
+        if contract_fp is None:
+            contract_fp = current_contract_fp
+        if dynamic_fp is None:
+            dynamic_fp = current_dynamic_fp
+    if contract_fp is not None:
+        expected_contract_fp = _validated_hash(contract_fp, "expected task_contract_fingerprint")
+        if normalized["task_contract_fingerprint"] != expected_contract_fp:
+            raise _state_error("task contract fingerprint does not match validation context.")
+    if dynamic_fp is not None:
+        expected_dynamic_fp = _validated_hash(dynamic_fp, "expected task_fingerprint")
+        if normalized["task_fingerprint"] != expected_dynamic_fp:
+            raise _state_error("dynamic task fingerprint does not match validation context.")
+    return normalized
+
+
+def repository_state(
+    root: Path,
+    task_dir: Path,
+    *,
+    state_kind: str,
+    contract_fp: str,
+    dynamic_fp: str,
+) -> dict[str, object]:
+    """Capture one coherent ExecutionRepositoryStateV1 from current state."""
+    if not isinstance(state_kind, str) or state_kind not in {"committed", "working_tree"}:
+        raise _state_error("state_kind must be committed or working_tree.")
+    contract_fp = _validated_hash(contract_fp, "task_contract_fingerprint")
+    dynamic_fp = _validated_hash(dynamic_fp, "task_fingerprint")
+    root = Path(root).resolve()
+    task_dir = Path(task_dir).resolve()
+    try:
+        config = load_config(root)
+        identity_before = repository_identity(root, config)
+        head_before = git_head_identity(root)
+        if state_kind == "committed" and head_before["head_sha"] == UNBORN_HEAD:
+            raise _state_error("an unborn repository cannot satisfy committed state.")
+        task = load_task(task_dir)
+        coverage = task_review_coverage(root, task, int(config["max_packet_chars"]))
+        identity_after = repository_identity(root, config)
+        head_after = git_head_identity(root)
+    except RepositoryStateError:
+        raise
+    except (OSError, ValueError, KeyError, SeraError):
+        raise _state_error("current repository state could not be captured.") from None
+
+    if identity_before != identity_after:
+        raise _state_error(
+            "repository identity moved during capture.", EXECUTION_REPOSITORY_MISMATCH
+        )
+    if head_before["head_sha"] != head_after["head_sha"]:
+        raise _state_error("HEAD moved during capture.", EXECUTION_HEAD_MISMATCH)
+    if head_before["head_tree_sha"] != head_after["head_tree_sha"]:
+        raise _state_error("tree moved during capture.", EXECUTION_TREE_MISMATCH)
+
+    if state_kind == "committed" and any(
+        entry.get("staged") or entry.get("unstaged") for entry in coverage["entries"]
+    ):
+        raise _state_error("task-relevant working-tree changes cannot be captured as committed state.")
+
+    state: dict[str, object] = {
+        "schema_version": 1,
+        "repository_identity": identity_before,
+        "head_sha": head_before["head_sha"],
+        "tree_sha": head_before["head_tree_sha"],
+        "task_contract_fingerprint": contract_fp,
+        "task_fingerprint": dynamic_fp,
+        "state_kind": state_kind,
+    }
+    if state_kind == "working_tree":
+        state["review_change_fingerprint"] = coverage["change_fingerprint"]
+    return validate_repository_state(state)
 
 
 @dataclass(frozen=True)
