@@ -65,7 +65,39 @@ _EVIDENCE_CLASSES = {
     "EXECUTION_STATE_ENFORCED",
     "EXECUTION_STATE_ATTESTED",
 }
+# Identity-evidence mechanisms, NOT a total ordering. T06-R only validates and
+# normalizes the candidate policy; class comparison/satisfaction belongs to T20.
+_IDENTITY_EVIDENCE_CLASSES = {
+    "unknown",
+    "manual_assertion",
+    "controller_observed",
+    "adapter_observed",
+    "provider_attested",
+}
+_V1_IDENTITY_EVIDENCE_CLASS = "manual_assertion"
 _REPOSITORY_STRENGTHS = {"local_only", "derived", "configured"}
+
+# The modern Config v2 route-relevant stage lanes. `planner` and `optional_fable`
+# remain accepted for existing 0.4.2 purposes but are never canonical-stage
+# routes and never carry approved-fallback authority.
+_MODERN_ROUTE_LANES = (
+    "fast_builder",
+    "deep_builder",
+    "implementation_validator",
+    "independent_reviewer",
+    "release_gate",
+)
+# The physically present route lanes in a Config v1 file. A v1 file has no
+# validator lane; its absence is compatibility, not an error.
+_V1_ROUTE_LANES = ("fast_builder", "deep_builder", "independent_reviewer", "release_gate")
+_MAX_ROUTE_STR = 128
+_MAX_APPROVED_FALLBACKS = 8
+# A captured configuration is the repository's own reviewed policy merged over
+# ``DEFAULT_CONFIG`` (already parsed and validated by ``core.load_config``), not
+# an untrusted external payload. Its object-key count comfortably exceeds the
+# external-evidence default, so the strict descriptor pass over a config uses a
+# wider bound; ``read_strict_json`` defaults for evidence paths are untouched.
+_CONFIG_STRICT_MAX_KEYS = 1024
 
 _STAGE_POLICY_SPEC = {
     "enabled": None,
@@ -88,6 +120,15 @@ _LANE_SPEC = {
     "allowed_uses": [None],
     "may_be_sole_release_gate": None,
 }
+# Exact modern route lane shape. Unknown lane-entry or fallback-entry fields are
+# rejected; order of `approved_fallbacks` is normative.
+_ROUTE_LANE_SPEC = {
+    "provider": None,
+    "model": None,
+    "enabled": None,
+    "approved_fallbacks": [{"provider": None, "model": None}],
+}
+_IDENTITY_STAGE_SPEC = {"required_identity_evidence_class": None}
 _CONFIG_V2_SPEC = {
     "schema_version": None,
     "repository_id": None,
@@ -98,6 +139,7 @@ _CONFIG_V2_SPEC = {
         "allow_legacy_provenance": None,
     },
     "execution_state_policy": _EXECUTION_ROLE_SPEC_KEYS,
+    "identity_evidence_policy": {role: _IDENTITY_STAGE_SPEC for role in _CANONICAL_ROLES},
     "substitution_rules": {
         "allow_approved_fallbacks": None,
         "allow_manual_substitution": None,
@@ -123,15 +165,9 @@ _CONFIG_V2_SPEC = {
     "exclude_dirs": [None],
     "token_budgets": {mode: None for mode in VALID_MODES},
     "lanes": {
-        name: _LANE_SPEC
-        for name in (
-            "planner",
-            "fast_builder",
-            "deep_builder",
-            "independent_reviewer",
-            "release_gate",
-            "optional_fable",
-        )
+        "planner": _LANE_SPEC,
+        "optional_fable": _LANE_SPEC,
+        **{name: _ROUTE_LANE_SPEC for name in _MODERN_ROUTE_LANES},
     },
     "verification": [None],
     "controller": {
@@ -158,10 +194,26 @@ class ConfigV2View:
     stage_policies: Mapping[str, object]
     provenance_requirements: Mapping[str, object]
     execution_state_policy: Mapping[str, object]
+    identity_evidence_policy: Mapping[str, object]
     substitution_rules: Mapping[str, object]
     knowledge_policy: Mapping[str, object]
     repository_identity_requirement: Mapping[str, object]
     context_budgets: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class RouteConfigView:
+    """Immutable in-memory normalization of mutable provider/model route mechanics.
+
+    Never persisted, never policy authority, never assurance evidence, and never
+    nested in ``ConfigV2View``. It carries only normalized lane identity,
+    provider, model, enabled state, and each lane's own ordered explicit
+    ``approved_fallbacks``. Whether a fallback is policy-permitted is decided
+    later (T09) against the active ``PolicySnapshotV1``; T06-R never gates it.
+    """
+
+    source_schema: int
+    lanes: Mapping[str, Mapping[str, object]]
 
 
 def _freeze(value: object) -> object:
@@ -277,6 +329,95 @@ def _validate_stage_policy(value: object, path: str) -> dict[str, object]:
     }
 
 
+def _normalize_identity_evidence_policy(value: object, path: str = "identity_evidence_policy") -> dict[str, object]:
+    """Normalize the explicit four-stage identity-evidence candidate policy.
+
+    This is the only configuration candidate for the required provider/model
+    identity class. It is never inferred from execution-state policy, a
+    provider/model string, a source display name, or a receipt claim, and T06-R
+    performs no class comparison or ranking.
+    """
+    if not isinstance(value, dict):
+        raise SeraError(f"{path} must be an object.")
+    _require_exact_fields(value, set(_CANONICAL_ROLES), path)
+    unsupported = sorted(set(value) - set(_CANONICAL_ROLES))
+    if unsupported:
+        raise SeraError(f"{path} contains an unsupported stage: {unsupported[0]}")
+    normalized: dict[str, object] = {}
+    for role in _CANONICAL_ROLES:
+        entry = value[role]
+        entry_path = f"{path}.{role}"
+        if not isinstance(entry, dict):
+            raise SeraError(f"{entry_path} must be an object.")
+        _require_exact_fields(entry, {"required_identity_evidence_class"}, entry_path)
+        extra = sorted(set(entry) - {"required_identity_evidence_class"})
+        if extra:
+            raise SeraError(f"{entry_path} has an unknown field: {extra[0]}")
+        identity_class = entry["required_identity_evidence_class"]
+        if not isinstance(identity_class, str) or identity_class not in _IDENTITY_EVIDENCE_CLASSES:
+            raise SeraError(f"{entry_path}.required_identity_evidence_class is unsupported.")
+        normalized[role] = {"required_identity_evidence_class": identity_class}
+    return {role: normalized[role] for role in _CANONICAL_ROLES}
+
+
+def _require_route_str(value: object, path: str) -> str:
+    try:
+        return require_bounded_str(value, path, max_length=_MAX_ROUTE_STR)
+    except SchemaError as exc:
+        raise SeraError(str(exc)) from None
+
+
+def _normalize_approved_fallbacks(
+    value: object, path: str, primary: tuple[str, str]
+) -> tuple[dict[str, str], ...]:
+    """Validate and normalize one lane's explicit ordered fallback candidates.
+
+    Order is normative: entries are never sorted, never deduplicated, and never
+    silently discarded. Whether these candidates are policy-permitted is a
+    later (T09) decision against the active ``PolicySnapshotV1``.
+    """
+    if not isinstance(value, list):
+        raise SeraError(f"{path} must be a list.")
+    if len(value) > _MAX_APPROVED_FALLBACKS:
+        raise SeraError(f"{path} accepts at most {_MAX_APPROVED_FALLBACKS} entries.")
+    seen: list[tuple[str, str]] = []
+    normalized: list[dict[str, str]] = []
+    for index, entry in enumerate(value):
+        entry_path = f"{path}[{index}]"
+        if not isinstance(entry, dict):
+            raise SeraError(f"{entry_path} must be an object.")
+        _require_exact_fields(entry, {"provider", "model"}, entry_path)
+        extra = sorted(set(entry) - {"provider", "model"})
+        if extra:
+            raise SeraError(f"{entry_path} has an unknown field: {extra[0]}")
+        provider = _require_route_str(entry.get("provider"), f"{entry_path}.provider")
+        model = _require_route_str(entry.get("model"), f"{entry_path}.model")
+        target = (provider, model)
+        if target == primary:
+            raise SeraError(f"{entry_path} must not repeat the lane primary provider/model.")
+        if target in seen:
+            raise SeraError(f"{entry_path} is a duplicate approved fallback target.")
+        seen.append(target)
+        normalized.append({"provider": provider, "model": model})
+    return tuple(normalized)
+
+
+def _normalize_route_lane(value: object, path: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise SeraError(f"{path} must be an object.")
+    _require_exact_fields(value, set(_ROUTE_LANE_SPEC), path)
+    extra = sorted(set(value) - set(_ROUTE_LANE_SPEC))
+    if extra:
+        raise SeraError(f"{path} has an unknown field: {extra[0]}")
+    provider = _require_route_str(value.get("provider"), f"{path}.provider")
+    model = _require_route_str(value.get("model"), f"{path}.model")
+    enabled = _require_bool_value(value.get("enabled"), f"{path}.enabled")
+    fallbacks = _normalize_approved_fallbacks(
+        value.get("approved_fallbacks"), f"{path}.approved_fallbacks", (provider, model)
+    )
+    return {"provider": provider, "model": model, "enabled": enabled, "approved_fallbacks": fallbacks}
+
+
 def _validate_execution_state_policy(value: object, path: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise SeraError(f"{path} must be an object.")
@@ -354,6 +495,13 @@ def _translate_v1(loaded: dict[str, object]) -> ConfigV2View:
             "allow_legacy_provenance": True,
         },
         "execution_state_policy": {role: dict(legacy_state) for role in _CANONICAL_ROLES},
+        # Compatibility only: an explicitly limited legacy default. It does not
+        # make a v1 task modern, strong, strict-assured, or release-grade, and it
+        # is never persisted into the v1 config file.
+        "identity_evidence_policy": {
+            role: {"required_identity_evidence_class": _V1_IDENTITY_EVIDENCE_CLASS}
+            for role in _CANONICAL_ROLES
+        },
         "substitution_rules": {
             "allow_approved_fallbacks": False,
             "allow_manual_substitution": False,
@@ -375,6 +523,7 @@ def _translate_v1(loaded: dict[str, object]) -> ConfigV2View:
         stage_policies=_freeze_mapping(values["stage_policies"]),
         provenance_requirements=_freeze_mapping(values["provenance_requirements"]),
         execution_state_policy=_freeze_mapping(values["execution_state_policy"]),
+        identity_evidence_policy=_freeze_mapping(values["identity_evidence_policy"]),
         substitution_rules=_freeze_mapping(values["substitution_rules"]),
         knowledge_policy=_freeze_mapping(values["knowledge_policy"]),
         repository_identity_requirement=_freeze_mapping(values["repository_identity_requirement"]),
@@ -384,7 +533,11 @@ def _translate_v1(loaded: dict[str, object]) -> ConfigV2View:
 
 def _translate_v2(loaded: dict[str, object]) -> ConfigV2View:
     try:
-        strict = read_strict_json(canonical_json(loaded).encode("utf-8"), spec=_CONFIG_V2_SPEC)
+        strict = read_strict_json(
+            canonical_json(loaded).encode("utf-8"),
+            spec=_CONFIG_V2_SPEC,
+            max_keys=_CONFIG_STRICT_MAX_KEYS,
+        )
     except SchemaError as exc:
         raise SeraError(str(exc)) from None
     _reject_nulls(strict)
@@ -393,6 +546,7 @@ def _translate_v2(loaded: dict[str, object]) -> ConfigV2View:
         "stage_policies",
         "provenance_requirements",
         "execution_state_policy",
+        "identity_evidence_policy",
         "substitution_rules",
         "knowledge_policy",
         "repository_identity_requirement",
@@ -427,6 +581,9 @@ def _translate_v2(loaded: dict[str, object]) -> ConfigV2View:
         _required_object(strict, "execution_state_policy"),
         "execution_state_policy",
         _validate_execution_state_policy,
+    )
+    identity_evidence_policy = _normalize_identity_evidence_policy(
+        _required_object(strict, "identity_evidence_policy")
     )
 
     substitution = _required_object(strict, "substitution_rules")
@@ -484,6 +641,7 @@ def _translate_v2(loaded: dict[str, object]) -> ConfigV2View:
         stage_policies=_freeze_mapping(stage_policies),
         provenance_requirements=_freeze_mapping(provenance_requirements),
         execution_state_policy=_freeze_mapping(execution_state_policy),
+        identity_evidence_policy=_freeze_mapping(identity_evidence_policy),
         substitution_rules=_freeze_mapping(substitution_rules),
         knowledge_policy=_freeze_mapping(knowledge_policy),
         repository_identity_requirement=_freeze_mapping(repository_identity_requirement),
@@ -502,6 +660,78 @@ def translate_config(loaded: dict[str, object], root: Path) -> ConfigV2View:
     if schema_version == 1:
         return _translate_v1(loaded)
     return _translate_v2(loaded)
+
+
+def _route_v1(loaded: dict[str, object]) -> RouteConfigView:
+    validate_config(loaded)
+    lanes = loaded.get("lanes")
+    if not isinstance(lanes, dict):
+        raise SeraError("lanes must be an object.")
+    normalized: dict[str, object] = {}
+    for lane_name in _V1_ROUTE_LANES:
+        lane = lanes.get(lane_name)
+        if not isinstance(lane, dict):
+            raise SeraError(f"lanes.{lane_name} must be an object for route normalization.")
+        normalized[lane_name] = {
+            "provider": _require_route_str(lane.get("provider"), f"lanes.{lane_name}.provider"),
+            "model": _require_route_str(lane.get("model"), f"lanes.{lane_name}.model"),
+            "enabled": _require_bool_value(lane.get("enabled"), f"lanes.{lane_name}.enabled"),
+            # No v1 field grants fallback authority; `optional_fable` never does.
+            "approved_fallbacks": (),
+        }
+    # A v1 file has no validator lane. Its absence is compatibility, not an error:
+    # the translated validator route is disabled and carries no fallbacks.
+    normalized["implementation_validator"] = {
+        "provider": None,
+        "model": None,
+        "enabled": False,
+        "approved_fallbacks": (),
+    }
+    return RouteConfigView(
+        source_schema=1,
+        lanes=_freeze_mapping({name: normalized[name] for name in _MODERN_ROUTE_LANES}),
+    )
+
+
+def _route_v2(loaded: dict[str, object]) -> RouteConfigView:
+    try:
+        strict = read_strict_json(
+            canonical_json(loaded).encode("utf-8"),
+            spec=_CONFIG_V2_SPEC,
+            max_keys=_CONFIG_STRICT_MAX_KEYS,
+        )
+    except SchemaError as exc:
+        raise SeraError(str(exc)) from None
+    _reject_nulls(strict)
+    lanes = strict.get("lanes")
+    if not isinstance(lanes, dict):
+        raise SeraError("lanes must be an object for a modern route configuration.")
+    normalized: dict[str, object] = {}
+    for lane_name in _MODERN_ROUTE_LANES:
+        if lane_name not in lanes:
+            raise SeraError(f"lanes is missing the modern route lane {lane_name!r}.")
+        normalized[lane_name] = _normalize_route_lane(lanes[lane_name], f"lanes.{lane_name}")
+    return RouteConfigView(
+        source_schema=2,
+        lanes=_freeze_mapping({name: normalized[name] for name in _MODERN_ROUTE_LANES}),
+    )
+
+
+def normalize_route_config(loaded: dict[str, object]) -> RouteConfigView:
+    """Normalize mutable route mechanics from one captured config, in memory only.
+
+    Operates on the supplied configuration object: it never rereads
+    ``.sera/config.json``, never calls ``load_config``, and never writes. The
+    result is not persisted, not policy authority, and not assurance evidence.
+    """
+    if not isinstance(loaded, dict):
+        raise SeraError("configuration must be an object.")
+    schema_version = loaded.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version not in {1, 2}:
+        raise SeraError(f"unsupported config schema: {schema_version!r}")
+    if schema_version == 1:
+        return _route_v1(loaded)
+    return _route_v2(loaded)
 
 
 _POLICY_TRIGGERS = {
