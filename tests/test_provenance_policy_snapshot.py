@@ -18,7 +18,21 @@ from sera.controller import confirm_task_ownership
 from sera.core import DEFAULT_CONFIG, load_task, new_task
 from sera.schemas import LedgerReader, SchemaError, TaskLockGuard, canonical_json, task_lock
 from tests.test_controller import git
-from tests.test_provenance_config_v2 import CANONICAL_ROLES, modern_config
+from tests.test_provenance_config_v2 import (
+    CANONICAL_ROLES,
+    CANONICAL_STAGE_ORDER,
+    IDENTITY_EVIDENCE_CLASSES,
+    identity_policy,
+    modern_config,
+)
+
+
+MODERN_IDENTITY_POLICY = {
+    "implementation_builder": {"required_identity_evidence_class": "provider_attested"},
+    "implementation_validator": {"required_identity_evidence_class": "adapter_observed"},
+    "independent_reviewer": {"required_identity_evidence_class": "controller_observed"},
+    "release_gate": {"required_identity_evidence_class": "manual_assertion"},
+}
 
 
 def signed(record):
@@ -56,15 +70,19 @@ class PolicySnapshotTests(unittest.TestCase):
         self.assertEqual(set(snapshot), {
             "schema_version", "source_schema", "task_id", "captured_at", "trigger", "mode", "risk",
             "required_stages", "implementation_origin_rules", "provenance_requirements",
-            "execution_state_policy", "substitution_rules", "independence_requirements",
-            "verification_requirements", "context_budgets", "knowledge_policy",
-            "repository_identity_requirement", "snapshot_hash",
+            "identity_evidence_policy", "execution_state_policy", "substitution_rules",
+            "independence_requirements", "verification_requirements", "context_budgets",
+            "knowledge_policy", "repository_identity_requirement", "snapshot_hash",
         })
         self.assertEqual(snapshot["schema_version"], 1)
         self.assertEqual(snapshot["source_schema"], 2)
         self.assertEqual(snapshot["task_id"], "task-1")
         self.assertEqual(set(snapshot["required_stages"]), CANONICAL_ROLES)
         self.assertEqual(set(snapshot["execution_state_policy"]), CANONICAL_ROLES)
+        self.assertEqual(set(snapshot["identity_evidence_policy"]), CANONICAL_ROLES)
+        self.assertEqual(snapshot["identity_evidence_policy"], MODERN_IDENTITY_POLICY)
+        for entry in snapshot["identity_evidence_policy"].values():
+            self.assertEqual(set(entry), {"required_identity_evidence_class"})
         for policy in snapshot["execution_state_policy"].values():
             self.assertEqual(policy, {
                 "minimum_evidence_class": "CHECKPOINT_OBSERVED",
@@ -111,6 +129,12 @@ class PolicySnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["legacy_override"], {"allow_legacy_provenance": True})
         self.assertEqual(snapshot, signed(snapshot))
         self.assertNotIn("implementation_validator", snapshot["required_stages"])
+        self.assertEqual(set(snapshot["identity_evidence_policy"]), CANONICAL_ROLES)
+        for stage in CANONICAL_STAGE_ORDER:
+            self.assertEqual(
+                snapshot["identity_evidence_policy"][stage],
+                {"required_identity_evidence_class": "manual_assertion"},
+            )
 
     def test_required_stage_uses_mode_or_risk_and_enabled(self):
         self.task.update(mode="fast", risk="low")
@@ -278,6 +302,174 @@ class PolicySnapshotTests(unittest.TestCase):
             provenance.active_policy_snapshot(self.task_dir, contract)
 
 
+class PolicySnapshotIdentityPolicyTests(unittest.TestCase):
+    """T08-R: the four-stage identity-evidence policy is persisted and hash-bound."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.task_dir = self.root / ".sera" / "tasks" / "task-1"
+        self.task_dir.mkdir(parents=True)
+        self.path = self.task_dir / "policy-snapshots.jsonl"
+        self.config = modern_config()
+        self.task = {"id": "task-1", "mode": "assured", "risk": "high", "verification": ["python -m unittest"]}
+
+    def build(self, view=None, trigger="explicit_policy_adoption"):
+        return provenance.build_policy_snapshot(
+            view or provenance.translate_config(self.config, self.root), self.task, trigger
+        )
+
+    def append(self, snapshot):
+        with task_lock(self.task_dir) as guard:
+            provenance.append_policy_snapshot(self.task_dir, snapshot, guard)
+
+    def test_identity_policy_shape_and_values_match_the_captured_view(self):
+        snapshot = self.build()
+        self.assertEqual(set(snapshot["identity_evidence_policy"]), CANONICAL_ROLES)
+        self.assertEqual(snapshot["identity_evidence_policy"], MODERN_IDENTITY_POLICY)
+        for entry in snapshot["identity_evidence_policy"].values():
+            self.assertEqual(set(entry), {"required_identity_evidence_class"})
+
+    def test_disabled_stage_identity_requirement_is_still_persisted(self):
+        self.task.update(mode="fast", risk="low")
+        snapshot = self.build()
+        self.assertEqual(snapshot["required_stages"], [])
+        self.assertEqual(set(snapshot["identity_evidence_policy"]), CANONICAL_ROLES)
+
+    def test_every_identity_class_round_trips_through_the_ledger(self):
+        for identity_class in IDENTITY_EVIDENCE_CLASSES:
+            with self.subTest(identity_class=identity_class):
+                self.config = modern_config()
+                self.config["identity_evidence_policy"] = identity_policy(
+                    {stage: identity_class for stage in CANONICAL_STAGE_ORDER}
+                )
+                snapshot = self.build()
+                self.assertEqual(
+                    {entry["required_identity_evidence_class"] for entry in snapshot["identity_evidence_policy"].values()},
+                    {identity_class},
+                )
+                if self.path.exists():
+                    self.path.unlink()
+                self.append(snapshot)
+                self.assertEqual(provenance.read_policy_snapshots(self.task_dir).records(), [snapshot])
+
+    def test_each_stage_identity_change_changes_the_snapshot_hash(self):
+        snapshot = self.build()
+        for stage in CANONICAL_STAGE_ORDER:
+            with self.subTest(stage=stage):
+                altered = copy.deepcopy(snapshot)
+                altered["identity_evidence_policy"][stage]["required_identity_evidence_class"] = "unknown"
+                self.assertNotEqual(signed(altered)["snapshot_hash"], snapshot["snapshot_hash"])
+
+    def test_identity_policy_cannot_be_excluded_from_the_hash(self):
+        snapshot = self.build()
+        altered = copy.deepcopy(snapshot)
+        altered["identity_evidence_policy"]["release_gate"]["required_identity_evidence_class"] = "unknown"
+        # record_hash omits exactly {"snapshot_hash"}; the identity block is covered.
+        self.assertNotEqual(
+            provenance.record_hash("policy_snapshot", altered, "snapshot_hash"),
+            snapshot["snapshot_hash"],
+        )
+        other = provenance.build_policy_snapshot(
+            provenance.translate_config(
+                {**modern_config(), "identity_evidence_policy": identity_policy(
+                    {stage: "unknown" for stage in CANONICAL_STAGE_ORDER}
+                )},
+                self.root,
+            ),
+            self.task,
+            "explicit_policy_adoption",
+        )
+        self.assertNotEqual(other["snapshot_hash"], snapshot["snapshot_hash"])
+
+    def test_rehashed_identity_mutations_are_rejected_by_the_reader(self):
+        snapshot = self.build()
+
+        def variant(mutate):
+            altered = copy.deepcopy(snapshot)
+            mutate(altered["identity_evidence_policy"])
+            return altered
+
+        def drop_block(altered):
+            del altered["identity_evidence_policy"]
+
+        mutations = {
+            "missing_whole_block": drop_block,
+            "missing_stage": lambda block: block.pop("release_gate"),
+            "unknown_stage": lambda block: block.__setitem__("planner", {"required_identity_evidence_class": "unknown"}),
+            "alias_stage": lambda block: block.__setitem__("builder", {"required_identity_evidence_class": "manual_assertion"}),
+            "missing_class": lambda block: block.__setitem__("implementation_builder", {}),
+            "unknown_nested_field": lambda block: block["implementation_builder"].__setitem__("note", "x"),
+            "null_class": lambda block: block["implementation_builder"].__setitem__("required_identity_evidence_class", None),
+            "unsupported_class": lambda block: block["implementation_builder"].__setitem__("required_identity_evidence_class", "provider_trusted"),
+            "non_string_class": lambda block: block["implementation_builder"].__setitem__("required_identity_evidence_class", 5),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                if name == "missing_whole_block":
+                    altered = copy.deepcopy(snapshot)
+                    drop_block(altered)
+                else:
+                    altered = variant(mutate)
+                self.path.write_text(canonical_json(signed(altered)) + "\n", encoding="utf-8")
+                with self.assertRaises(SchemaError):
+                    provenance.read_policy_snapshots(self.task_dir).records()
+
+    def test_persisted_alias_stage_is_never_normalized_away(self):
+        snapshot = self.build()
+        altered = copy.deepcopy(snapshot)
+        altered["identity_evidence_policy"]["gate"] = altered["identity_evidence_policy"].pop("release_gate")
+        self.path.write_text(canonical_json(signed(altered)) + "\n", encoding="utf-8")
+        with self.assertRaises(SchemaError):
+            provenance.read_policy_snapshots(self.task_dir).records()
+
+    def test_captured_identity_policy_survives_later_config_movement(self):
+        view = provenance.translate_config(self.config, self.root)
+        config_path = self.root / ".sera" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.config["identity_evidence_policy"] = identity_policy(
+            {stage: "unknown" for stage in CANONICAL_STAGE_ORDER}
+        )
+        config_path.write_text(json.dumps(self.config))
+        snapshot = self.build(view=view)
+        config_path.write_text("config moved between capture and append")
+        self.append(snapshot)
+        config_path.write_text("not even valid JSON anymore")
+
+        records = provenance.read_policy_snapshots(self.task_dir).records()
+        self.assertEqual(records, [snapshot])
+        self.assertEqual(records[0]["identity_evidence_policy"], MODERN_IDENTITY_POLICY)
+
+    def test_snapshot_identity_is_a_json_detached_copy_of_the_frozen_view(self):
+        view = provenance.translate_config(self.config, self.root)
+        snapshot = self.build(view=view)
+
+        self.assertEqual(
+            snapshot["identity_evidence_policy"],
+            {stage: dict(entry) for stage, entry in view.identity_evidence_policy.items()},
+        )
+        snapshot["identity_evidence_policy"]["release_gate"]["required_identity_evidence_class"] = "unknown"
+        self.assertEqual(
+            view.identity_evidence_policy["release_gate"]["required_identity_evidence_class"],
+            "manual_assertion",
+        )
+        with self.assertRaises(TypeError):
+            view.identity_evidence_policy["release_gate"] = {}  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            view.identity_evidence_policy["release_gate"]["required_identity_evidence_class"] = "x"  # type: ignore[index]
+
+    def test_mutating_source_config_after_capture_cannot_change_the_snapshot(self):
+        view = provenance.translate_config(self.config, self.root)
+        self.config["identity_evidence_policy"]["implementation_builder"]["required_identity_evidence_class"] = "unknown"
+        snapshot = self.build(view=view)
+        self.assertEqual(
+            snapshot["identity_evidence_policy"]["implementation_builder"],
+            {"required_identity_evidence_class": "provider_attested"},
+        )
+
+
 class PolicyAdoptionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -321,6 +513,9 @@ class PolicyAdoptionTests(unittest.TestCase):
         self.assertEqual(records[0]["trigger"], "explicit_policy_adoption")
         self.assertNotIn("actor", records[0])
         self.assertNotIn("reason", records[0])
+        self.assertEqual(set(records[0]["identity_evidence_policy"]), CANONICAL_ROLES)
+        for entry in records[0]["identity_evidence_policy"].values():
+            self.assertEqual(entry, {"required_identity_evidence_class": "manual_assertion"})
         self.assertIsNone(provenance.active_policy_snapshot(self.task_dir, load_task(self.task_dir)))
         history = b'{"sentinel":"future contract history"}\n'
         (self.task_dir / "task-contracts.jsonl").write_bytes(history)
@@ -354,6 +549,10 @@ class PolicyAdoptionTests(unittest.TestCase):
         self.assertEqual(records[1]["risk"], confirmed["risk"])
         self.assertEqual(records[1]["risk"], "high")
         self.assertIn("release_gate", records[1]["required_stages"])
+        for record in records:
+            self.assertEqual(set(record["identity_evidence_policy"]), CANONICAL_ROLES)
+            for entry in record["identity_evidence_policy"].values():
+                self.assertEqual(entry, {"required_identity_evidence_class": "manual_assertion"})
 
     def test_malformed_history_blocks_confirmation_before_task_mutation(self):
         self.assertTrue(callable(getattr(provenance, "build_policy_snapshot", None)))

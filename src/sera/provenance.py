@@ -748,6 +748,7 @@ _POLICY_SNAPSHOT_SPEC = {
     "required_stages": [None],
     "implementation_origin_rules": {origin: [None] for origin in ("sera_builder", "external", "pre_existing")},
     "provenance_requirements": _CONFIG_V2_SPEC["provenance_requirements"],
+    "identity_evidence_policy": _CONFIG_V2_SPEC["identity_evidence_policy"],
     "execution_state_policy": {role: _EXECUTION_STATE_POLICY_SPEC for role in _CANONICAL_ROLES},
     "legacy_override": {"allow_legacy_provenance": None},
     "substitution_rules": _CONFIG_V2_SPEC["substitution_rules"],
@@ -803,6 +804,12 @@ def _validate_policy_snapshot(record: dict[str, object]) -> dict[str, object]:
         _require_exact_fields(execution, set(_CANONICAL_ROLES), "execution_state_policy")
         for role, policy in execution.items():
             _validate_execution_state_policy(policy, f"execution_state_policy.{role}")
+        # Persisted identity-evidence policy is read exactly as written: the
+        # complete four-stage block is required, aliases are rejected rather than
+        # normalized, and the class must be one of the five accepted mechanisms.
+        # This is an independent policy dimension; nothing here compares it to
+        # execution-state evidence, provider/model, or receipt claims.
+        _normalize_identity_evidence_policy(snapshot["identity_evidence_policy"])
         if "legacy_override" in snapshot:
             if snapshot["legacy_override"].get("allow_legacy_provenance") is not True:
                 raise SchemaError("legacy_override must explicitly permit legacy provenance")
@@ -876,6 +883,11 @@ def build_policy_snapshot(config_view: ConfigV2View, task: Mapping[str, object],
             "sera_builder": ["implementation_builder"], "external": list(validator), "pre_existing": list(validator),
         },
         "provenance_requirements": _policy_value(config_view.provenance_requirements),
+        # Required policy copied from the already-captured frozen view (Section
+        # 8.2): the four-stage identity requirement, hash-bound below. Not an
+        # observed effective class; never inferred from provider/model or
+        # execution-state policy, and never a config reread.
+        "identity_evidence_policy": _policy_value(config_view.identity_evidence_policy),
         "execution_state_policy": _policy_value(config_view.execution_state_policy),
         "substitution_rules": _policy_value(config_view.substitution_rules),
         "independence_requirements": {"distinct_execution_ids": True, "distinct_receipt_hashes": True},
