@@ -664,13 +664,26 @@ def build_policy_snapshot(config_view: ConfigV2View, task: Mapping[str, object],
     return _validate_policy_snapshot(snapshot)
 
 
+def _validate_task_policy_snapshot(record: dict, task_id: str) -> dict:
+    snapshot = _validate_policy_snapshot(record)
+    if snapshot["task_id"] != task_id:
+        raise SchemaError("policy snapshot belongs to another task")
+    return snapshot
+
+
 def read_policy_snapshots(task_dir: Path) -> LedgerReader:
-    return LedgerReader(Path(task_dir) / "policy-snapshots.jsonl", "policy_snapshot", _validate_policy_snapshot)
+    task_dir = Path(task_dir).resolve()
+
+    def validate(record: dict) -> dict:
+        return _validate_task_policy_snapshot(record, task_dir.name)
+
+    return LedgerReader(task_dir / "policy-snapshots.jsonl", "policy_snapshot", validate)
 
 
 def append_policy_snapshot(task_dir: Path, snapshot: dict, lock: TaskLockGuard) -> None:
     """Append under a genuine live task guard, refusing any invalid existing history."""
-    validated = _validate_policy_snapshot(snapshot)
+    task_dir = Path(task_dir).resolve()
+    validated = _validate_task_policy_snapshot(snapshot, task_dir.name)
     read_policy_snapshots(task_dir).records()
     append_ledger_record(Path(task_dir) / "policy-snapshots.jsonl", validated, lock)
 

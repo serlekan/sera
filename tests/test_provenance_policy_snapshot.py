@@ -229,6 +229,54 @@ class PolicySnapshotTests(unittest.TestCase):
         with self.assertRaises(SchemaError):
             provenance.active_policy_snapshot(self.task_dir, contract)
 
+    def test_foreign_snapshot_with_real_destination_lock_is_rejected(self):
+        foreign = self.build()
+        destination = self.task_dir.parent / "task-B"
+        destination.mkdir()
+        with task_lock(destination) as guard:
+            with self.assertRaises(SchemaError):
+                provenance.append_policy_snapshot(destination, foreign, guard)
+        self.assertFalse((destination / "policy-snapshots.jsonl").exists())
+
+    def test_foreign_history_is_rejected_without_changing_bytes(self):
+        foreign = signed({**self.build(), "task_id": "task-A"})
+        self.path.write_text(canonical_json(foreign) + "\n")
+        before = self.path.read_bytes()
+        with self.assertRaises(SchemaError):
+            provenance.read_policy_snapshots(self.task_dir).records()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_same_task_snapshot_with_real_lock_appends_and_reads(self):
+        snapshot = self.build()
+        self.append(snapshot)
+        self.assertEqual(provenance.read_policy_snapshots(self.task_dir).records(), [snapshot])
+
+    def test_mixed_history_blocks_reader_fingerprint_and_new_append(self):
+        local = self.build()
+        foreign = signed({**local, "task_id": "task-A"})
+        for records in ([local, foreign], [foreign, local], [local, foreign, local]):
+            with self.subTest(task_ids=[record["task_id"] for record in records]):
+                self.path.write_text("".join(canonical_json(record) + "\n" for record in records))
+                before = self.path.read_bytes()
+                reader = provenance.read_policy_snapshots(self.task_dir)
+                with self.assertRaises(SchemaError):
+                    reader.records()
+                with self.assertRaises(SchemaError):
+                    reader.fingerprint()
+                with self.assertRaises(SchemaError):
+                    self.append(local)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_foreign_history_cannot_activate_even_with_matching_hash_and_task(self):
+        foreign = signed({**self.build(), "task_id": "task-A"})
+        self.path.write_text(canonical_json(foreign) + "\n")
+        contract = {
+            "schema_version": 2, "record_type": "task_contract",
+            "task_id": "task-A", "active_policy_hash": foreign["snapshot_hash"],
+        }
+        with self.assertRaises(SchemaError):
+            provenance.active_policy_snapshot(self.task_dir, contract)
+
 
 class PolicyAdoptionTests(unittest.TestCase):
     def setUp(self):
