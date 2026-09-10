@@ -228,6 +228,55 @@ class PolicySnapshotTests(unittest.TestCase):
                 with self.assertRaises(SchemaError):
                     provenance.read_policy_snapshots(self.task_dir).records()
 
+    def test_rehashed_validator_policy_inconsistency_still_blocks(self):
+        # T10-001: external and pre_existing must require the validator stage
+        # exactly when required_stages does. A matching snapshot_hash does not
+        # rescue a semantically contradictory record.
+        with_validator = self.build()
+        self.assertIn("implementation_validator", with_validator["required_stages"])
+
+        no_validator_cfg = copy.deepcopy(modern_config())
+        no_validator_cfg["stage_policies"]["validator"]["enabled"] = False
+        without_validator = self.build(
+            view=provenance.translate_config(no_validator_cfg, self.root)
+        )
+        self.assertNotIn("implementation_validator", without_validator["required_stages"])
+
+        def rules(base, *, external, pre_existing):
+            altered = copy.deepcopy(base)
+            altered["implementation_origin_rules"]["external"] = external
+            altered["implementation_origin_rules"]["pre_existing"] = pre_existing
+            return altered
+
+        mutations = {
+            "A_required_external_omits": rules(
+                with_validator, external=[], pre_existing=["implementation_validator"]
+            ),
+            "B_required_pre_existing_omits": rules(
+                with_validator, external=["implementation_validator"], pre_existing=[]
+            ),
+            "C_required_both_omit": rules(with_validator, external=[], pre_existing=[]),
+            "D_not_required_external_has": rules(
+                without_validator, external=["implementation_validator"], pre_existing=[]
+            ),
+            "E_not_required_pre_existing_has": rules(
+                without_validator, external=[], pre_existing=["implementation_validator"]
+            ),
+        }
+        for name, altered in mutations.items():
+            with self.subTest(case=name):
+                rehashed = signed(altered)
+                self.path.write_text(canonical_json(rehashed) + "\n")
+                with self.assertRaises(SchemaError):
+                    provenance.read_policy_snapshots(self.task_dir).records()
+
+        # The untampered builds remain valid through the same reader.
+        for good in (with_validator, without_validator):
+            self.path.write_text(canonical_json(good) + "\n")
+            self.assertEqual(
+                provenance.read_policy_snapshots(self.task_dir).records(), [good]
+            )
+
     def test_active_selection_validates_entire_history_after_bound_record(self):
         snapshot = self.build()
         self.append(snapshot)

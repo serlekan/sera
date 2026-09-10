@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -339,6 +339,36 @@ def _required_stage_set(policy: Mapping[str, object]) -> frozenset[str]:
     return frozenset(raw)
 
 
+def _assert_validator_policy_consistency(
+    required_stages: Collection[str],
+    origin_rules: Mapping[str, Collection[str]],
+) -> None:
+    """Fail closed unless both ``external`` and ``pre_existing`` require the
+    validator stage exactly when ``required_stages`` does.
+
+    This is the single authority for the captured-fact consistency invariant
+    (spec Section 9): for each of those two origins,
+
+        "implementation_validator" in implementation_origin_rules[origin]
+        IFF
+        "implementation_validator" in required_stages
+
+    Every origin is checked regardless of which one a caller asked about, so one
+    contradictory bound policy never yields a partial trusted answer. It reads
+    only these two captured policy facts and never consults configuration.
+    ``sera_builder`` is intentionally excluded: its rule is always
+    ``["implementation_builder"]`` and is not derived from ``required_stages``.
+    """
+    stage_has_validator = "implementation_validator" in set(required_stages)
+    for origin in ("external", "pre_existing"):
+        rule_has_validator = "implementation_validator" in set(origin_rules[origin])
+        if rule_has_validator != stage_has_validator:
+            raise SchemaError(
+                f"implementation_origin_rules.{origin} validator requirement disagrees "
+                "with required_stages"
+            )
+
+
 def origin_requirements(origin: object, policy: Mapping[str, object]) -> dict[str, object]:
     """Return the implementation-provenance role requirements for an origin.
 
@@ -369,14 +399,12 @@ def origin_requirements(origin: object, policy: Mapping[str, object]) -> dict[st
         )
     rules = _origin_rules(policy)
     required_stages = _required_stage_set(policy)
+    # Validate the complete captured relationship before returning anything: a
+    # policy whose external or pre_existing rule disagrees with required_stages
+    # is rejected even when the caller asked about a different, consistent origin.
+    _assert_validator_policy_consistency(required_stages, rules)
     origin_rule = rules[origin]
     required_roles = tuple(role for role in CANONICAL_ROLES if role in origin_rule)
-    if origin != "sera_builder" and "implementation_validator" in origin_rule:
-        # external / pre_existing carry no builder-authorship claim; a required
-        # validator stage must also appear in the bound policy's captured stages
-        # so this function never disagrees with those facts.
-        if "implementation_validator" not in required_stages:
-            raise SchemaError(f"{origin} requires a validator stage the bound policy did not capture")
     return {
         "origin": origin,
         "required_roles": required_roles,
@@ -993,6 +1021,11 @@ def _validate_policy_snapshot(record: dict[str, object]) -> dict[str, object]:
             _require_enum_list(stages, f"implementation_origin_rules.{origin}", allowed)
         if origins["sera_builder"] != ["implementation_builder"]:
             raise SchemaError("sera_builder provenance requires an implementation_builder receipt")
+        # Stricter semantic validation of the existing captured facts (no new
+        # field, no schema change): external and pre_existing must require the
+        # validator stage exactly when required_stages does. Same single
+        # authority used by origin_requirements.
+        _assert_validator_policy_consistency(snapshot["required_stages"], origins)
         provenance = snapshot["provenance_requirements"]
         _require_exact_fields(provenance, set(_CONFIG_V2_SPEC["provenance_requirements"]), "provenance_requirements")
         if provenance["minimum_repository_identity_strength"] not in _REPOSITORY_STRENGTHS:

@@ -259,6 +259,103 @@ class OriginRequirementsTests(unittest.TestCase):
                 provenance.origin_requirements("external", bad)  # type: ignore[arg-type]
 
 
+class ValidatorPolicyConsistencyTests(unittest.TestCase):
+    """T10-001: the validator relation is an exact IFF against required_stages
+    for both external and pre_existing, and the complete policy is validated
+    regardless of which origin is queried."""
+
+    @staticmethod
+    def _policy(*, required_validator: bool, external: list[str], pre_existing: list[str]) -> dict:
+        stages = ["implementation_builder"]
+        if required_validator:
+            stages.append("implementation_validator")
+        return {
+            "required_stages": stages,
+            "implementation_origin_rules": {
+                "sera_builder": ["implementation_builder"],
+                "external": external,
+                "pre_existing": pre_existing,
+            },
+        }
+
+    def test_valid_combinations_are_accepted(self) -> None:
+        both_required = self._policy(
+            required_validator=True,
+            external=["implementation_validator"],
+            pre_existing=["implementation_validator"],
+        )
+        neither = self._policy(required_validator=False, external=[], pre_existing=[])
+        self.assertEqual(
+            provenance.origin_requirements("external", both_required)["required_roles"],
+            ("implementation_validator",),
+        )
+        self.assertEqual(
+            provenance.origin_requirements("pre_existing", both_required)["required_roles"],
+            ("implementation_validator",),
+        )
+        self.assertEqual(provenance.origin_requirements("external", neither)["required_roles"], ())
+        self.assertEqual(provenance.origin_requirements("pre_existing", neither)["required_roles"], ())
+        # sera_builder is unaffected by the ordinary stage fact.
+        self.assertEqual(
+            provenance.origin_requirements("sera_builder", neither)["required_roles"],
+            ("implementation_builder",),
+        )
+
+    def test_required_stage_but_origin_omits_validator_is_rejected(self) -> None:
+        # This is the inverse contradiction T10-001 previously accepted.
+        external_omits = self._policy(
+            required_validator=True, external=[], pre_existing=["implementation_validator"]
+        )
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("external", external_omits)
+
+        pre_existing_omits = self._policy(
+            required_validator=True, external=["implementation_validator"], pre_existing=[]
+        )
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("pre_existing", pre_existing_omits)
+
+        both_omit = self._policy(required_validator=True, external=[], pre_existing=[])
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("external", both_omit)
+
+    def test_origin_requires_validator_but_stage_omits_it_is_rejected(self) -> None:
+        external_extra = self._policy(
+            required_validator=False, external=["implementation_validator"], pre_existing=[]
+        )
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("external", external_extra)
+
+        pre_existing_extra = self._policy(
+            required_validator=False, external=[], pre_existing=["implementation_validator"]
+        )
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("pre_existing", pre_existing_extra)
+
+    def test_complete_policy_is_validated_regardless_of_queried_origin(self) -> None:
+        external_contradictory = self._policy(
+            required_validator=True, external=[], pre_existing=["implementation_validator"]
+        )
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("pre_existing", external_contradictory)
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("sera_builder", external_contradictory)
+
+        pre_existing_contradictory = self._policy(
+            required_validator=True, external=["implementation_validator"], pre_existing=[]
+        )
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("external", pre_existing_contradictory)
+        with self.assertRaises(SchemaError):
+            provenance.origin_requirements("sera_builder", pre_existing_contradictory)
+
+    def test_real_snapshots_stay_consistent(self) -> None:
+        for validator_required in (True, False):
+            policy = policy_snapshot(validator_required=validator_required)
+            for origin in ("sera_builder", "external", "pre_existing"):
+                provenance.origin_requirements(origin, policy)
+
+
 class ValidatorVersusBuilderTests(unittest.TestCase):
     def test_validator_never_satisfies_builder(self) -> None:
         self.assertIs(provenance.validator_satisfies_builder(), False)
