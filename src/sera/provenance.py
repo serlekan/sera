@@ -1432,6 +1432,17 @@ def build_route_snapshot(
     provider = _require_route_target(resolved_primary["provider"], "requested_provider")
     model = _require_route_target(resolved_primary["model"], "requested_model")
     fallbacks = _normalize_effective_fallbacks(effective_fallbacks, (provider, model))
+    # Defense in depth at the authoritative construction boundary (T09-001): the
+    # constructor holds the validated active policy, so it independently refuses
+    # to mint route authority the bound policy forbids. `resolve_route_snapshot_inputs`
+    # rejects a contradictory *captured lane*; this rejects a contradictory
+    # *effective list* reaching the builder by any path. Both read the one bound
+    # rule — this is not a second substitution-rule interpretation.
+    if fallbacks and not policy["substitution_rules"]["allow_approved_fallbacks"]:
+        raise SchemaError(
+            f"{EXECUTION_ROUTE_MISMATCH}: active policy disallows approved fallbacks but "
+            f"{len(fallbacks)} effective fallback(s) were supplied to build_route_snapshot"
+        )
     snapshot = {
         "schema_version": _ROUTE_SNAPSHOT_SCHEMA_VERSION,
         "task_id": task_id,

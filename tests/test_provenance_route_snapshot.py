@@ -885,5 +885,77 @@ class ModernConfigV2Tests(unittest.TestCase):
             )
 
 
+# --------------------------------------------------------------------------- #
+# Group 10 — T09-001: fallback policy enforced at the constructor boundary     #
+# --------------------------------------------------------------------------- #
+class BuildRouteSnapshotFallbackAuthorityTests(unittest.TestCase):
+    """`build_route_snapshot` independently refuses authority the bound policy forbids.
+
+    Every case here bypasses `resolve_route_snapshot_inputs` and calls the
+    authoritative constructor directly with a caller-supplied effective list.
+    """
+
+    def _policy(self, *, allow: bool) -> dict:
+        config = modern_merged(
+            lambda c: c["substitution_rules"].__setitem__("allow_approved_fallbacks", allow)
+        )
+        return policy_for(config, task(id="task-1", mode="assured", risk="high"))
+
+    def _build(self, policy, fallbacks):
+        return provenance.build_route_snapshot(
+            "task-1",
+            "implementation_builder",
+            policy,
+            {"provider": "primary", "model": "model"},
+            fallbacks,
+        )
+
+    def test_disallowed_policy_with_non_empty_fallbacks_fails_at_construction(self) -> None:
+        policy = self._policy(allow=False)
+        self.assertIs(policy["substitution_rules"]["allow_approved_fallbacks"], False)
+        with self.assertRaises(SchemaError):
+            self._build(policy, [{"provider": "fallback", "model": "other"}])
+
+    def test_disallowed_policy_produces_no_snapshot_hash_authority(self) -> None:
+        policy = self._policy(allow=False)
+        result = None
+        try:
+            result = self._build(policy, [{"provider": "fallback", "model": "other"}])
+        except SchemaError:
+            pass
+        self.assertIsNone(result)  # nothing hashed, nothing returned
+
+    def test_disallowed_policy_with_empty_fallbacks_builds_a_valid_snapshot(self) -> None:
+        snapshot = self._build(self._policy(allow=False), [])
+        self.assertEqual(snapshot["approved_fallbacks"], [])
+        self.assertEqual(provenance._validate_route_snapshot(dict(snapshot)), snapshot)
+
+    def test_allowed_policy_with_ordered_fallbacks_builds_and_preserves_order(self) -> None:
+        ordered = [
+            {"provider": "zeta", "model": "z"},
+            {"provider": "alpha", "model": "a"},
+        ]
+        snapshot = self._build(self._policy(allow=True), copy.deepcopy(ordered))
+        self.assertEqual(snapshot["approved_fallbacks"], ordered)
+        self.assertEqual(provenance._validate_route_snapshot(dict(snapshot)), snapshot)
+
+    def test_resolver_fail_closed_check_is_still_present(self) -> None:
+        config = modern_merged(
+            lambda c: (
+                c["substitution_rules"].__setitem__("allow_approved_fallbacks", False),
+                c["lanes"]["fast_builder"].__setitem__(
+                    "approved_fallbacks", [{"provider": "x", "model": "y"}]
+                ),
+            )
+        )
+        the_task = task(mode="fast", risk="low", uncertainty=0)
+        decision = decide_route_from_config(config, the_task, REPO_MAP)
+        view = provenance.normalize_route_config(config)
+        identity = resolved_route_identity(config, decision)
+        policy = policy_for(config, the_task)
+        with self.assertRaises(SchemaError):
+            provenance.resolve_route_snapshot_inputs(view, identity, "implementation_builder", policy)
+
+
 if __name__ == "__main__":
     unittest.main()
