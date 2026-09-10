@@ -192,6 +192,11 @@ class RouteDecision:
     fable_eligible: bool
     ownership_file_count: int = 0
     ownership_tokens: int = 0
+    # A semantically distinct fifth result: the explicit `implementation_validator`
+    # lane, selected only when the captured modern task policy requires that
+    # stage. Never an alias of `builder`, `reviewer`, or `gate`, and always
+    # `None` for a Config v1 route (the compatibility policy disables the stage).
+    validator: str | None = None
 
 
 def utc_now() -> str:
@@ -1257,12 +1262,21 @@ def resolved_route_identity(config: dict[str, Any], decision: RouteDecision) -> 
 
     Only stages this task genuinely requires are bound, so changing an unrelated
     or unused lane never invalidates a packet.
+
+    The `validator` key appears only when a modern route selected the explicit
+    `implementation_validator` lane. A Config v1 route always resolves
+    `decision.validator` to `None`, so its identity — and therefore
+    `route_fingerprint` — is byte-identical to the pre-T09 representation and no
+    existing v1 packet is invalidated by T09.
     """
-    return {
+    identity = {
         "builder": _lane_identity(config, decision.builder),
         "reviewer": _lane_identity(config, decision.reviewer),
         "gate": _lane_identity(config, decision.gate),
     }
+    if decision.validator is not None:
+        identity["validator"] = _lane_identity(config, decision.validator)
+    return identity
 
 
 def route_fingerprint(config: dict[str, Any], decision: RouteDecision) -> str:
@@ -1494,9 +1508,69 @@ def ownership_summary(task: dict[str, Any], repo_map: dict[str, Any]) -> dict[st
     }
 
 
-def decide_route(root: Path, task: dict[str, Any], repo_map: dict[str, Any] | None = None) -> RouteDecision:
-    config = load_config(root)
-    repo_map = repo_map or load_repo_map(root)
+def _modern_validator_stage_required(config: dict[str, Any], task: dict[str, Any]) -> bool:
+    """Whether the captured modern task policy requires the validator stage.
+
+    Route selection stays here in `core`; this helper only *reads* the modern
+    validator stage policy from the already-captured configuration. It delegates
+    normalization to the reviewed T06 config translator rather than duplicating
+    it, and applies the identical stage-policy rule T08 uses in
+    `build_policy_snapshot`:
+
+        stage enabled AND (task.mode in required_modes OR task.risk in required_risks)
+
+    A Config v1 (or schema-less) configuration always returns `False`: the
+    compatibility translation keeps `implementation_validator` disabled. The
+    validator requirement is never derived from provider/model, receipts,
+    execution evidence, reviewer/gate requirements, or fallback presence.
+    """
+    if config.get("schema_version") != 2:
+        return False
+    from . import provenance  # deferred: `provenance` imports `core` at module load
+
+    view = provenance.translate_config(config, Path())
+    policy = view.stage_policies["implementation_validator"]
+    if not policy["enabled"]:
+        return False
+    return task["mode"] in policy["required_modes"] or task["risk"] in policy["required_risks"]
+
+
+def _resolve_validator_lane(config: dict[str, Any]) -> str:
+    """Resolve the one explicit validator lane or fail closed.
+
+    A required validator resolves *only* `lanes.implementation_validator`. A
+    missing, disabled, or otherwise unresolvable lane (blank provider or model)
+    fails closed with no fallback and no substitution by another stage's lane.
+    """
+    lane = config.get("lanes", {}).get("implementation_validator", {})
+    provider = lane.get("provider")
+    model = lane.get("model")
+    if (
+        not lane.get("enabled", False)
+        or not isinstance(provider, str)
+        or not provider.strip()
+        or not isinstance(model, str)
+        or not model.strip()
+    ):
+        raise SeraError(
+            "Required lane 'implementation_validator' is disabled or unresolvable. "
+            "The validator stage has no fallback lane and no other lane may substitute it."
+        )
+    return "implementation_validator"
+
+
+def decide_route_from_config(
+    config: dict[str, Any], task: dict[str, Any], repo_map: dict[str, Any]
+) -> RouteDecision:
+    """Resolve one route from one already-captured configuration.
+
+    This is the single 0.5.0 task-dependent route selector. It never reads
+    configuration (`load_config` is the facade's job) and never rereads the
+    repository map. The fast/deep, reviewer, gate, complexity, budget, and
+    `optional_fable` rules are exactly those that previously lived in
+    `decide_route`; T09 only extracts them and adds the explicit validator
+    result.
+    """
     if task["mode"] not in VALID_MODES:
         raise SeraError(f"Task mode {task['mode']!r} is invalid. Valid modes: {', '.join(VALID_MODES)}.")
     if task["risk"] not in RISK_LEVELS:
@@ -1523,20 +1597,29 @@ def decide_route(root: Path, task: dict[str, Any], repo_map: dict[str, Any] | No
                 f"Required lane {required_lane!r} is disabled or unconfigured. "
                 "Choose a different mode or configure the lane explicitly; no silent fallback is allowed."
             )
+    validator = _resolve_validator_lane(config) if _modern_validator_stage_required(config, task) else None
     fable = config["lanes"].get("optional_fable", {})
     fable_eligible = bool(fable.get("enabled")) and task.get("use_case") in set(fable.get("allowed_uses", []))
     budget = int(config["token_budgets"][task["mode"]])
     return RouteDecision(
-        builder,
-        reviewer,
-        gate,
-        reason,
-        context_tokens,
-        budget,
-        fable_eligible,
+        builder=builder,
+        reviewer=reviewer,
+        gate=gate,
+        reason=reason,
+        estimated_context_tokens=context_tokens,
+        budget_tokens=budget,
+        fable_eligible=fable_eligible,
         ownership_file_count=file_count,
         ownership_tokens=context_tokens,
+        validator=validator,
     )
+
+
+def decide_route(root: Path, task: dict[str, Any], repo_map: dict[str, Any] | None = None) -> RouteDecision:
+    """Compatibility facade: capture configuration once, then delegate."""
+    config = load_config(root)
+    repo_map = repo_map or load_repo_map(root)
+    return decide_route_from_config(config, task, repo_map)
 
 
 def lane_label(config: dict[str, Any], lane: str | None) -> str | None:

@@ -1201,6 +1201,293 @@ def adopt_policy_snapshot(root: Path, task_dir: Path, *, actor: str, reason: str
     return snapshot
 
 
+# --- RouteSnapshotV1 + route-snapshots.jsonl (spec Section 8.3) ----------------
+#
+# Every packet binds one immutable route snapshot resolved from one captured
+# configuration under the validated active policy. `core.decide_route_from_config`
+# remains the sole route selector; this module only maps its already-resolved
+# result to the four canonical stages, applies the active policy's fallback gate,
+# copies the two independent evidence requirements from the bound policy, and
+# hashes the record. It never reads configuration, never selects fast/deep,
+# reviewer, gate, or the validator requirement, never evaluates evidence, never
+# dispatches a provider, and never carries source authorization.
+
+EXECUTION_ROUTE_MISMATCH = "EXECUTION_ROUTE_MISMATCH"
+
+_ROUTE_SNAPSHOT_SCHEMA_VERSION = 1
+_MAX_ROUTE_TARGET_STR = _MAX_ROUTE_STR  # 128
+_MAX_EFFECTIVE_FALLBACKS = _MAX_APPROVED_FALLBACKS  # 8
+
+# Deterministic receipt semantics for a successful counted stage (spec Section
+# 8.3), not configurable route policy. Order is normative.
+_ROUTE_OUTPUT_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "implementation_builder": ("raw_output_hash", "output_state"),
+        "implementation_validator": ("raw_output_hash",),
+        "independent_reviewer": ("raw_output_hash", "parsed_verdict"),
+        "release_gate": ("raw_output_hash", "parsed_verdict"),
+    }
+)
+
+# Canonical stage -> the `RouteDecision` / `resolved_route_identity` key carrying
+# the lane the selector already chose. `implementation_validator` maps to the
+# distinct `validator` result and never to `builder`, `reviewer`, or `gate`.
+_STAGE_IDENTITY_KEY: Mapping[str, str] = MappingProxyType(
+    {
+        "implementation_builder": "builder",
+        "implementation_validator": "validator",
+        "independent_reviewer": "reviewer",
+        "release_gate": "gate",
+    }
+)
+
+_ROUTE_SNAPSHOT_SPEC = {
+    "schema_version": None,
+    "task_id": None,
+    "stage": None,
+    "policy_hash": None,
+    "requested_provider": None,
+    "requested_model": None,
+    "approved_fallbacks": [{"provider": None, "model": None}],
+    "required_identity_evidence_class": None,
+    "required_execution_state_evidence_class": None,
+    "required_output_fields": [None],
+    "snapshot_hash": None,
+}
+
+
+def _require_route_target(value: object, path: str) -> str:
+    return require_bounded_str(value, path, max_length=_MAX_ROUTE_TARGET_STR)
+
+
+def _normalize_effective_fallbacks(
+    value: object, primary: tuple[str, str]
+) -> list[dict[str, str]]:
+    """Validate the effective ordered fallback list against one selected primary.
+
+    Order is normative: never sorted, grouped, or deduplicated. A fallback may
+    not repeat the selected primary and no `(provider, model)` pair may recur.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise SchemaError("approved_fallbacks must be a list")
+    if len(value) > _MAX_EFFECTIVE_FALLBACKS:
+        raise SchemaError(f"approved_fallbacks accepts at most {_MAX_EFFECTIVE_FALLBACKS} entries")
+    seen: list[tuple[str, str]] = []
+    normalized: list[dict[str, str]] = []
+    for index, entry in enumerate(value):
+        entry_path = f"approved_fallbacks[{index}]"
+        if not isinstance(entry, Mapping) or set(entry) != {"provider", "model"}:
+            raise SchemaError(f"{entry_path} must be an object with exactly provider and model")
+        provider = _require_route_target(entry["provider"], f"{entry_path}.provider")
+        model = _require_route_target(entry["model"], f"{entry_path}.model")
+        target = (provider, model)
+        if target == primary:
+            raise SchemaError(f"{entry_path} must not repeat the selected primary provider/model")
+        if target in seen:
+            raise SchemaError(f"{entry_path} is a duplicate fallback target")
+        seen.append(target)
+        normalized.append({"provider": provider, "model": model})
+    return normalized
+
+
+def _validate_route_snapshot(record: dict[str, object]) -> dict[str, object]:
+    """Validate one persisted RouteSnapshotV1 exactly as written.
+
+    Persisted history is read strictly: canonical stage names only (no alias
+    normalization), the exact deterministic output-field table for that stage,
+    supported evidence classes on both independent dimensions, and a recomputed
+    `snapshot_hash`. A rehashed but semantically invalid record is still
+    rejected.
+    """
+    snapshot = read_strict_json(canonical_json(record).encode("utf-8"), spec=_ROUTE_SNAPSHOT_SPEC)
+    try:
+        _require_exact_fields(snapshot, set(_ROUTE_SNAPSHOT_SPEC), "route snapshot")
+        _reject_nulls(snapshot, "route snapshot")
+        if type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != _ROUTE_SNAPSHOT_SCHEMA_VERSION:
+            raise SchemaError("unsupported route snapshot schema")
+        require_bounded_str(snapshot["task_id"], "task_id", max_length=256)
+        stage = snapshot["stage"]
+        if stage not in _CANONICAL_ROLES:
+            raise SchemaError("route snapshot stage must be a canonical role")
+        require_hash(snapshot["policy_hash"], "policy_hash")
+        primary = (
+            _require_route_target(snapshot["requested_provider"], "requested_provider"),
+            _require_route_target(snapshot["requested_model"], "requested_model"),
+        )
+        _normalize_effective_fallbacks(snapshot["approved_fallbacks"], primary)
+        if snapshot["required_identity_evidence_class"] not in _IDENTITY_EVIDENCE_CLASSES:
+            raise SchemaError("unsupported required identity-evidence class")
+        if snapshot["required_execution_state_evidence_class"] not in _EVIDENCE_CLASSES:
+            raise SchemaError("unsupported required execution-state evidence class")
+        if snapshot["required_output_fields"] != list(_ROUTE_OUTPUT_FIELDS[stage]):
+            raise SchemaError("route snapshot output fields do not match the deterministic stage table")
+        require_hash(snapshot["snapshot_hash"], "snapshot_hash")
+        if record_hash("route_snapshot", snapshot, "snapshot_hash") != snapshot["snapshot_hash"]:
+            raise SchemaError("route snapshot hash mismatch")
+    except (SeraError, TypeError, KeyError) as exc:
+        raise SchemaError(f"invalid route snapshot: {exc}") from exc
+    return snapshot
+
+
+def _policy_allows_approved_fallbacks(active_policy_snapshot: Mapping[str, object]) -> bool:
+    policy = _validate_policy_snapshot(dict(active_policy_snapshot))
+    return bool(policy["substitution_rules"]["allow_approved_fallbacks"])
+
+
+def resolve_route_snapshot_inputs(
+    route_view: RouteConfigView,
+    route_identity: Mapping[str, object],
+    canonical_stage: str,
+    active_policy_snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    """Map one already-selected stage to its captured route mechanics.
+
+    Pure and selection-free: it maps the canonical stage to the lane the
+    `RouteDecision` already chose (via `core.resolved_route_identity`), reads
+    that exact lane's normalized provider/model and explicit ordered
+    `approved_fallbacks` from the captured `RouteConfigView`, and applies the
+    active policy's fallback gate. It never chooses fast vs deep, decides the
+    reviewer/gate/validator requirement, reads configuration, inspects receipts,
+    interprets evidence, or dispatches a provider.
+
+    When `substitution_rules.allow_approved_fallbacks` is false the effective
+    list is empty; a non-empty selected-lane list under that policy is a
+    contradictory capture and fails closed (spec Section 8.3) rather than being
+    silently dropped.
+    """
+    if canonical_stage not in _CANONICAL_ROLES:
+        raise SchemaError("route snapshot stage must be a canonical role")
+    if not isinstance(route_view, RouteConfigView):
+        raise SchemaError("route snapshot inputs require a normalized RouteConfigView")
+    identity = (
+        route_identity.get(_STAGE_IDENTITY_KEY[canonical_stage])
+        if isinstance(route_identity, Mapping)
+        else None
+    )
+    if not isinstance(identity, Mapping) or not identity.get("lane"):
+        raise SchemaError(
+            f"{EXECUTION_ROUTE_MISMATCH}: {canonical_stage} is not a selected route stage"
+        )
+    lane_name = identity["lane"]
+    lane = route_view.lanes.get(lane_name)
+    if lane is None:
+        raise SchemaError(
+            f"{EXECUTION_ROUTE_MISMATCH}: selected lane {lane_name!r} is absent from the captured route view"
+        )
+    provider = _require_route_target(lane["provider"], "requested_provider")
+    model = _require_route_target(lane["model"], "requested_model")
+    # The RouteConfigView and the RouteDecision identity were both normalized
+    # from the SAME captured configuration; disagreement means two configs were
+    # mixed between capture and route construction.
+    if identity.get("provider") != provider or identity.get("model") != model:
+        raise SchemaError(
+            f"{EXECUTION_ROUTE_MISMATCH}: route identity disagrees with the captured route view"
+        )
+    lane_fallbacks = [dict(entry) for entry in lane["approved_fallbacks"]]
+    if not _policy_allows_approved_fallbacks(active_policy_snapshot):
+        if lane_fallbacks:
+            raise SchemaError(
+                f"{EXECUTION_ROUTE_MISMATCH}: active policy disallows approved fallbacks but the "
+                f"selected lane {lane_name!r} configures {len(lane_fallbacks)}"
+            )
+        effective: list[dict[str, str]] = []
+    else:
+        effective = lane_fallbacks
+    return {
+        "stage": canonical_stage,
+        "requested_provider": provider,
+        "requested_model": model,
+        "approved_fallbacks": effective,
+    }
+
+
+def build_route_snapshot(
+    task_id: object,
+    stage: object,
+    active_policy_snapshot: Mapping[str, object],
+    resolved_primary: Mapping[str, object],
+    effective_fallbacks: object,
+) -> dict[str, object]:
+    """Construct and hash one immutable RouteSnapshotV1 without reading config.
+
+    Each argument has exactly one authority. `policy_hash`, the required
+    identity-evidence class, the required execution-state evidence class, and the
+    deterministic output fields are all derived here from their authoritative
+    inputs — the validated active `PolicySnapshotV1` and the locked stage table —
+    so a caller cannot supply a second, disagreeing copy. A receipt, provider, or
+    model can influence none of them. `snapshot_hash` excludes only itself.
+    """
+    policy = _validate_policy_snapshot(dict(active_policy_snapshot))
+    task_id = require_bounded_str(task_id, "task_id", max_length=256)
+    if policy["task_id"] != task_id:
+        raise SchemaError(
+            f"{EXECUTION_ROUTE_MISMATCH}: route task_id does not match the bound policy snapshot"
+        )
+    try:
+        canonical_stage = canonical_role(stage)
+    except SeraError as exc:
+        raise SchemaError(f"route snapshot stage is not a canonical stage: {exc}") from None
+    if not isinstance(resolved_primary, Mapping) or set(resolved_primary) != {"provider", "model"}:
+        raise SchemaError("resolved primary route must carry exactly provider and model")
+    provider = _require_route_target(resolved_primary["provider"], "requested_provider")
+    model = _require_route_target(resolved_primary["model"], "requested_model")
+    fallbacks = _normalize_effective_fallbacks(effective_fallbacks, (provider, model))
+    snapshot = {
+        "schema_version": _ROUTE_SNAPSHOT_SCHEMA_VERSION,
+        "task_id": task_id,
+        "stage": canonical_stage,
+        "policy_hash": policy["snapshot_hash"],
+        "requested_provider": provider,
+        "requested_model": model,
+        "approved_fallbacks": fallbacks,
+        "required_identity_evidence_class": policy["identity_evidence_policy"][canonical_stage][
+            "required_identity_evidence_class"
+        ],
+        "required_execution_state_evidence_class": policy["execution_state_policy"][canonical_stage][
+            "minimum_evidence_class"
+        ],
+        "required_output_fields": list(_ROUTE_OUTPUT_FIELDS[canonical_stage]),
+    }
+    snapshot["snapshot_hash"] = record_hash("route_snapshot", snapshot, "snapshot_hash")
+    return _validate_route_snapshot(snapshot)
+
+
+def _validate_task_route_snapshot(record: dict, task_id: str) -> dict:
+    snapshot = _validate_route_snapshot(record)
+    if snapshot["task_id"] != task_id:
+        raise SchemaError(f"{EXECUTION_ROUTE_MISMATCH}: route snapshot belongs to another task")
+    return snapshot
+
+
+def read_route_snapshots(task_dir: Path) -> LedgerReader:
+    """Strictly read one task's append-only route-snapshot ledger.
+
+    Every physical non-empty record is validated, including that its `task_id`
+    equals the owning task directory name (the T08 contextual-binding lesson).
+    Nothing is skipped, repaired, or filtered.
+    """
+    task_dir = Path(task_dir).resolve()
+
+    def validate(record: dict) -> dict:
+        return _validate_task_route_snapshot(record, task_dir.name)
+
+    return LedgerReader(task_dir / "route-snapshots.jsonl", "route_snapshot", validate)
+
+
+def append_route_snapshot(task_dir: Path, snapshot: dict, lock: TaskLockGuard) -> None:
+    """Append one route snapshot under a genuine live task guard.
+
+    The incoming record is fully validated and bound to this task, the entire
+    existing ledger is reread and validated, and only then is one canonical line
+    appended. Any malformed or foreign existing history blocks the append with
+    the ledger bytes unchanged.
+    """
+    task_dir = Path(task_dir).resolve()
+    validated = _validate_task_route_snapshot(snapshot, task_dir.name)
+    read_route_snapshots(task_dir).records()
+    append_ledger_record(Path(task_dir) / "route-snapshots.jsonl", validated, lock)
+
+
 def canonicalize_remote(url: str) -> str:
     """Return a credential-free logical identity for a supported Git remote."""
     if (
