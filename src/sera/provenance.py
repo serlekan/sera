@@ -46,19 +46,44 @@ _MAX_REMOTE_IDENTITIES = 32
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _CONFIGURED_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SCP_REMOTE_RE = re.compile(r"^(?:[^@/:\\\s]+@)?([^/:\\\s]+):(.+)$")
-_CANONICAL_ROLES = (
+# --- Canonical roles and implementation origin (spec Section 9) ----------------
+# One authoritative public vocabulary. T06/T08 and every downstream consumer
+# resolve roles and origins through these names; the private spellings below only
+# delegate to this authority and never form a second normative list.
+CANONICAL_ROLES: tuple[str, ...] = (
     "implementation_builder",
     "implementation_validator",
     "independent_reviewer",
     "release_gate",
 )
-_ROLE_ALIASES = {
-    "builder": "implementation_builder",
-    "validator": "implementation_validator",
-    "independent": "independent_reviewer",
-    "gate": "release_gate",
-    **{role: role for role in _CANONICAL_ROLES},
-}
+# Section 9 domain input aliases. `builder`, `independent`, and `gate` are the
+# only permitted aliases; every canonical role resolves to itself. `validator`
+# is deliberately NOT a domain alias (see `_CONFIG_ROLE_ALIASES`).
+ROLE_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "builder": "implementation_builder",
+        "independent": "independent_reviewer",
+        "gate": "release_gate",
+        **{role: role for role in CANONICAL_ROLES},
+    }
+)
+# The Config v2 compatibility translator (T06) accepts one extra historical,
+# config-oriented alias, `validator`, inside its own normalization boundary. That
+# is not a Section 9 domain alias; it is derived from `ROLE_ALIASES` so the two
+# vocabularies cannot drift.
+_CONFIG_ROLE_ALIASES: Mapping[str, str] = MappingProxyType(
+    {**ROLE_ALIASES, "validator": "implementation_validator"}
+)
+# Backwards-compatible private spelling used by this module's config/policy code;
+# the same object as the public authority, not a copy.
+_CANONICAL_ROLES = CANONICAL_ROLES
+# Implementation origins (spec Sections 7.1 and 9). Exactly three; an unknown
+# origin fails closed with `IMPLEMENTATION_ORIGIN_UNSUPPORTED`.
+IMPLEMENTATION_ORIGINS: tuple[str, ...] = ("sera_builder", "external", "pre_existing")
+# T10 reason codes, following the reason-code string-constant pattern from T02.
+VALIDATOR_CANNOT_SATISFY_BUILDER = "VALIDATOR_CANNOT_SATISFY_BUILDER"
+IMPLEMENTATION_ORIGIN_UNSUPPORTED = "IMPLEMENTATION_ORIGIN_UNSUPPORTED"
+BUILDER_PROVENANCE_REQUIRED = "BUILDER_PROVENANCE_REQUIRED"
 _EVIDENCE_CLASSES = {
     "LEGACY_PROVENANCE",
     "CHECKPOINT_OBSERVED",
@@ -111,8 +136,8 @@ _EXECUTION_STATE_POLICY_SPEC = {
     "required_capabilities": [None],
     "accepted_verification_methods": [None],
 }
-_ROLE_SPEC_KEYS = {key: _STAGE_POLICY_SPEC for key in _ROLE_ALIASES}
-_EXECUTION_ROLE_SPEC_KEYS = {key: _EXECUTION_STATE_POLICY_SPEC for key in _ROLE_ALIASES}
+_ROLE_SPEC_KEYS = {key: _STAGE_POLICY_SPEC for key in _CONFIG_ROLE_ALIASES}
+_EXECUTION_ROLE_SPEC_KEYS = {key: _EXECUTION_STATE_POLICY_SPEC for key in _CONFIG_ROLE_ALIASES}
 _LANE_SPEC = {
     "provider": None,
     "model": None,
@@ -184,6 +209,180 @@ _CONFIG_V2_SPEC = {
         "draft_pull_requests": None,
     },
 }
+
+
+# --- T10 role/origin domain semantics (spec Section 9) -------------------------
+#
+# T10 fixes the internal vocabulary only. It does not route executions, select
+# or validate receipts, interpret identity evidence, or create any persisted
+# artifact. `provenance.py` owns these semantics; `core`/`controller`/`cli`
+# remain facades and never decide role/origin questions.
+
+_STRICT_EVIDENCE_CLASSES: tuple[str, ...] = (
+    "EXECUTION_STATE_ENFORCED",
+    "EXECUTION_STATE_ATTESTED",
+)
+
+# Strict modern execution-state defaults (spec Section 9). This is a default
+# *requirement* table, never evidence: nothing here marks any execution as
+# ENFORCED or ATTESTED, chooses an evidence source, or derives assurance.
+# Actual policy acceptance of ATTESTED still comes from a bound PolicySnapshotV1.
+STRICT_MODERN_EXECUTION_STATE_DEFAULTS: Mapping[str, Mapping[str, object]] = MappingProxyType(
+    {
+        "implementation_builder": MappingProxyType(
+            {
+                "required_when": "implementation_origin=sera_builder",
+                "evidence_scope": "governed_input",
+                "accepted_evidence_classes": _STRICT_EVIDENCE_CLASSES,
+                "attested_requires_policy_acceptance": True,
+            }
+        ),
+        "implementation_validator": MappingProxyType(
+            {
+                "required_when": "always",
+                "evidence_scope": "stage_execution",
+                "accepted_evidence_classes": _STRICT_EVIDENCE_CLASSES,
+                "attested_requires_policy_acceptance": True,
+            }
+        ),
+        "independent_reviewer": MappingProxyType(
+            {
+                "required_when": "always",
+                "evidence_scope": "stage_execution",
+                "accepted_evidence_classes": _STRICT_EVIDENCE_CLASSES,
+                "attested_requires_policy_acceptance": True,
+            }
+        ),
+        "release_gate": MappingProxyType(
+            {
+                "required_when": "always",
+                "evidence_scope": "stage_execution",
+                "accepted_evidence_classes": _STRICT_EVIDENCE_CLASSES,
+                "attested_requires_policy_acceptance": True,
+            }
+        ),
+    }
+)
+
+
+class ProvenanceRoleError(SeraError):
+    """Fail-closed role/origin domain error carrying a stable reason-code leaf."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {detail}")
+
+
+def canonical_role(value: object) -> str:
+    """Resolve a Section 9 role or domain alias to its canonical role name.
+
+    Canonical roles resolve to themselves. ``builder``, ``independent``, and
+    ``gate`` are the only accepted input aliases. Every other value fails closed:
+    blank, ``None``, a non-string, an unknown string, a routing lane name, a
+    legacy presentation label such as ``supplementary``, or a config-only alias
+    such as ``validator``. No case-folding or whitespace trimming is performed
+    and malformed persisted values are never coerced into validity.
+    """
+    if not isinstance(value, str):
+        raise SeraError(f"canonical_role requires a string role, got {type(value).__name__}")
+    resolved = ROLE_ALIASES.get(value)
+    if resolved is None:
+        raise SeraError(f"unsupported provenance role {value!r}")
+    return resolved
+
+
+def validator_satisfies_builder() -> bool:
+    """Return ``False`` unconditionally.
+
+    An ``implementation_validator`` receipt never satisfies an
+    ``implementation_builder`` requirement (spec Section 9). No same provider,
+    same model, same execution, same content, same output hash, manual override,
+    or legacy-compatibility path changes this; the stable reason is
+    ``VALIDATOR_CANNOT_SATISFY_BUILDER``. T10 does not implement receipt
+    selection.
+    """
+    return False
+
+
+def _origin_rules(policy: Mapping[str, object]) -> dict[str, frozenset[str]]:
+    if not isinstance(policy, Mapping):
+        raise SchemaError("origin_requirements requires a policy mapping")
+    raw = policy.get("implementation_origin_rules")
+    if not isinstance(raw, Mapping) or set(raw) != set(IMPLEMENTATION_ORIGINS):
+        raise SchemaError("policy implementation_origin_rules must key exactly the canonical origins")
+    rules: dict[str, frozenset[str]] = {}
+    for name in IMPLEMENTATION_ORIGINS:
+        entry = raw[name]
+        if not isinstance(entry, (list, tuple)):
+            raise SchemaError(f"implementation_origin_rules.{name} must be a list of role strings")
+        entry_list = list(entry)
+        if any(role not in CANONICAL_ROLES for role in entry_list):
+            raise SchemaError(f"implementation_origin_rules.{name} contains a non-canonical role")
+        if len(set(entry_list)) != len(entry_list):
+            raise SchemaError(f"implementation_origin_rules.{name} repeats a role")
+        rules[name] = frozenset(entry_list)
+    # Section 9 invariants, checked for every query so a malformed block fails
+    # closed regardless of which origin is asked about. These mirror the T08
+    # persisted-policy reader and are never broadened here.
+    if rules["sera_builder"] != frozenset({"implementation_builder"}):
+        raise SchemaError("implementation_origin_rules.sera_builder must require exactly implementation_builder")
+    for name in ("external", "pre_existing"):
+        if not rules[name] <= frozenset({"implementation_validator"}):
+            raise SchemaError(f"implementation_origin_rules.{name} may only require implementation_validator")
+    return rules
+
+
+def _required_stage_set(policy: Mapping[str, object]) -> frozenset[str]:
+    raw = policy.get("required_stages")
+    if not isinstance(raw, (list, tuple)) or any(role not in CANONICAL_ROLES for role in raw):
+        raise SchemaError("policy required_stages must be a list of canonical roles")
+    return frozenset(raw)
+
+
+def origin_requirements(origin: object, policy: Mapping[str, object]) -> dict[str, object]:
+    """Return the implementation-provenance role requirements for an origin.
+
+    Pure in-memory semantic mapping over one already-bound policy. It never
+    reads or translates current configuration, never inspects provider/model,
+    receipts, or route snapshots, and never mutates ``policy``. The bound policy
+    is authoritative for whether the validator stage is required; this function
+    consumes the captured PolicySnapshotV1 facts ``implementation_origin_rules``
+    and ``required_stages`` (spec Section 8.2) rather than recomputing a second,
+    possibly disagreeing answer.
+
+    Returned keys (minimal and deterministic):
+
+    - ``origin``: the canonical origin (one of ``IMPLEMENTATION_ORIGINS``)
+    - ``required_roles``: canonical roles required for this origin, ordered by
+      ``CANONICAL_ROLES``
+    - ``builder_authorship_claim``: ``True`` only for ``sera_builder``
+    - ``reason``: ``BUILDER_PROVENANCE_REQUIRED`` for ``sera_builder`` else
+      ``None``
+
+    Fails closed with ``ProvenanceRoleError`` (code
+    ``IMPLEMENTATION_ORIGIN_UNSUPPORTED``) on an unknown origin and with
+    ``SchemaError`` on malformed or internally contradictory policy input.
+    """
+    if not isinstance(origin, str) or origin not in IMPLEMENTATION_ORIGINS:
+        raise ProvenanceRoleError(
+            IMPLEMENTATION_ORIGIN_UNSUPPORTED, f"unknown implementation origin {origin!r}"
+        )
+    rules = _origin_rules(policy)
+    required_stages = _required_stage_set(policy)
+    origin_rule = rules[origin]
+    required_roles = tuple(role for role in CANONICAL_ROLES if role in origin_rule)
+    if origin != "sera_builder" and "implementation_validator" in origin_rule:
+        # external / pre_existing carry no builder-authorship claim; a required
+        # validator stage must also appear in the bound policy's captured stages
+        # so this function never disagrees with those facts.
+        if "implementation_validator" not in required_stages:
+            raise SchemaError(f"{origin} requires a validator stage the bound policy did not capture")
+    return {
+        "origin": origin,
+        "required_roles": required_roles,
+        "builder_authorship_claim": origin == "sera_builder",
+        "reason": BUILDER_PROVENANCE_REQUIRED if origin == "sera_builder" else None,
+    }
 
 
 @dataclass(frozen=True)
@@ -302,7 +501,7 @@ def _normalize_role_map(
 ) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for role, policy in value.items():
-        canonical = _ROLE_ALIASES.get(role)
+        canonical = _CONFIG_ROLE_ALIASES.get(role)
         if canonical is None:
             raise SeraError(f"{path} contains unsupported role {role!r}.")
         if canonical in normalized:
@@ -746,7 +945,7 @@ _POLICY_SNAPSHOT_SPEC = {
     "mode": None,
     "risk": None,
     "required_stages": [None],
-    "implementation_origin_rules": {origin: [None] for origin in ("sera_builder", "external", "pre_existing")},
+    "implementation_origin_rules": {origin: [None] for origin in IMPLEMENTATION_ORIGINS},
     "provenance_requirements": _CONFIG_V2_SPEC["provenance_requirements"],
     "identity_evidence_policy": _CONFIG_V2_SPEC["identity_evidence_policy"],
     "execution_state_policy": {role: _EXECUTION_STATE_POLICY_SPEC for role in _CANONICAL_ROLES},
@@ -788,7 +987,7 @@ def _validate_policy_snapshot(record: dict[str, object]) -> dict[str, object]:
             raise SchemaError("unsupported policy mode or risk")
         _require_enum_list(snapshot["required_stages"], "required_stages", set(_CANONICAL_ROLES))
         origins = snapshot["implementation_origin_rules"]
-        _require_exact_fields(origins, {"sera_builder", "external", "pre_existing"}, "implementation_origin_rules")
+        _require_exact_fields(origins, set(IMPLEMENTATION_ORIGINS), "implementation_origin_rules")
         for origin, stages in origins.items():
             allowed = {"implementation_builder"} if origin == "sera_builder" else {"implementation_validator"}
             _require_enum_list(stages, f"implementation_origin_rules.{origin}", allowed)
