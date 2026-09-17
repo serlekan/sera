@@ -1245,7 +1245,16 @@ def task_contract_fingerprint(task: dict[str, Any]) -> str:
     and derived policy, confirmed ownership, constraints, verification. It
     deliberately excludes generated artifacts, timestamps, evidence, and
     worktree state, so binding an artifact to it can never be circular.
+
+    A modern `TaskContractV2` (validated by `provenance`) already carries its
+    own stable `contract_hash` identity; this returns that value unchanged
+    rather than reducing it to `TASK_CONTRACT_FIELDS`, which would silently
+    collapse fields the legacy subset never covered (repository identity,
+    origin, policy, knowledge). A legacy Task v1 record keeps the original
+    subset hash exactly, byte-for-byte, so historical evidence is unaffected.
     """
+    if task.get("schema_version") == 2 and task.get("record_type") == "task_contract":
+        return task["contract_hash"]
     payload = {field: task.get(field) for field in TASK_CONTRACT_FIELDS}
     return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
