@@ -35,6 +35,7 @@ from sera.core import (
     packet_provenance_path,
     packet_state,
     read_reviews,
+    record_evidence,
     record_review,
     new_task,
     task_fingerprint,
@@ -192,6 +193,17 @@ class ReviewRecordIdentityTests(ReviewIdentityRepository, unittest.TestCase):
         self.assertEqual(result["stale_reviews"], [])
         self.assertEqual(result["review_states"]["independent"]["status"], "current")
         self.assertTrue(result["ok"])
+
+    def test_recording_verification_evidence_no_longer_stales_an_accepted_review(self) -> None:
+        """Former (<0.5.0): a ledger append changed the fingerprint the review was
+        bound to. New invariant (Section 7.4): assurance evidence alone does not."""
+        task_dir = self.reviewable_task()
+        accept_review(self.root, task_dir, "ship", "peer", "correct")
+        self.assertEqual(check_task(self.root, task_dir)["review_states"]["independent"]["status"], "current")
+        record_evidence(task_dir, "python -m unittest", 0, "passed")
+        result = check_task(self.root, task_dir)
+        self.assertEqual(result["stale_reviews"], [])
+        self.assertEqual(result["review_states"]["independent"]["status"], "current")
 
     # --- A6: a 0.4.1 review record cannot satisfy 0.4.2 acceptance ----------
     def test_legacy_unbound_review_record_fails_closed(self) -> None:

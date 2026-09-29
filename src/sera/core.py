@@ -2547,22 +2547,20 @@ def generate_packet(
 
 
 def task_fingerprint(root: Path, task_dir: Path) -> str:
-    task_bytes = (task_dir / "task.json").read_bytes()
-    ledger_bytes = (task_dir / "ledger.jsonl").read_bytes()
-    diff = run_git(root, "diff", "--binary", "--no-ext-diff", check=False).encode("utf-8", errors="replace")
-    staged = run_git(root, "diff", "--cached", "--binary", "--no-ext-diff", check=False).encode("utf-8", errors="replace")
-    untracked_parts: list[bytes] = []
-    for relative in sorted(run_git(root, "ls-files", "--others", "--exclude-standard").splitlines()):
-        normalized = relative.replace("\\", "/")
-        if is_sera_runtime_path(normalized):
-            continue
-        path = root / relative
-        if path.is_file():
-            untracked_parts.extend([normalized.encode("utf-8"), b"\0", path.read_bytes(), b"\0"])
-    return sha256_bytes(
-        task_bytes + b"\0" + ledger_bytes + b"\0" + diff + b"\0" + staged + b"\0" + b"".join(untracked_parts)
-    )
+    """State-sensitive task identity used to bind and age handoff artifacts.
 
+    Since 0.5.0 this is a facade over `provenance.dynamic_task_fingerprint`
+    (spec Section 7.4). It covers the active task-contract identity plus the
+    governed task and repository state, and deliberately excludes append-only
+    assurance-ledger bytes: appending verification, review, policy, or other
+    evidence never stales a binding by itself. Before 0.5.0 it hashed
+    `ledger.jsonl`, so every recorded verification invalidated packets, reviews,
+    and seals.
+    """
+    # Imported here: `provenance` is the contract authority and imports `core`.
+    from .provenance import current_task_contract_fingerprint, dynamic_task_fingerprint
+
+    return dynamic_task_fingerprint(root, task_dir, current_task_contract_fingerprint(task_dir))
 
 
 def run_verification(root: Path, task_dir: Path) -> list[dict[str, Any]]:

@@ -1877,8 +1877,7 @@ def validate_repository_state(
         if root is None:
             raise _state_error("task_dir context requires root.")
         try:
-            task = load_task(Path(task_dir))
-            current_contract_fp = task_contract_fingerprint(task)
+            current_contract_fp = current_task_contract_fingerprint(Path(task_dir))
             current_dynamic_fp = task_fingerprint(root, Path(task_dir))
         except (OSError, ValueError, SeraError):
             raise _state_error("current task context could not be resolved.") from None
@@ -3166,6 +3165,22 @@ def _untracked_manifest(root: Path) -> bytes:
         kind, digest = described
         entries.append(raw_path + b"\0" + kind + b"\0" + digest.encode("ascii") + b"\n")
     return b"".join(entries)
+
+
+def current_task_contract_fingerprint(task_dir: Path) -> str:
+    """The task-contract fingerprint the dynamic task fingerprint must incorporate.
+
+    A task with a validated active modern contract is identified by that
+    contract's `contract_hash` (full-ledger chain validation; malformed history
+    raises). A legacy task with no adoption keeps its historical compatibility
+    identity — the unchanged legacy subset fingerprint — so it stays stable and
+    explicit; a legacy task is never given a manufactured modern contract here.
+    """
+    task_dir = Path(task_dir)
+    active = active_contract(task_dir)
+    if active is not None:
+        return active["contract_hash"]
+    return task_contract_fingerprint(load_task(task_dir))
 
 
 def dynamic_task_fingerprint(root: Path, task_dir: Path, contract_fp: str) -> str:

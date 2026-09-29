@@ -24,6 +24,7 @@ from sera.core import (
     git_head_identity,
     initialize,
     new_task,
+    record_evidence,
     record_review,
     review_ledger_fingerprint,
     task_fingerprint,
@@ -97,6 +98,16 @@ class SealHeadBindingTests(SealRepository, unittest.TestCase):
         self.assertFalse(result["seal_stale"])
         self.assertEqual(result["seal_status"], "current")
         self.assertEqual(result["seal_stale_reasons"], [])
+
+    def test_recording_verification_evidence_no_longer_stales_the_seal(self) -> None:
+        """Former (<0.5.0): the seal bound a fingerprint that hashed ledger.jsonl,
+        so any appended evidence invalidated it. New invariant (Section 7.4): an
+        assurance-ledger append alone does not; real HEAD/tree/task moves still do."""
+        task_dir, _ = self.seal_task()
+        record_evidence(task_dir, "python -m unittest", 0, "passed")
+        result = check_task(self.root, task_dir)
+        self.assertFalse(result["seal_stale"], result["seal_stale_reasons"])
+        self.assertEqual(result["seal_status"], "current")
 
     def test_new_commit_invalidates_the_seal(self) -> None:
         task_dir, _ = self.seal_task()

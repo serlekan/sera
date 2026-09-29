@@ -1,22 +1,24 @@
 """`provenance.dynamic_task_fingerprint` — state-sensitive, ledger-byte-free.
 
 T11 defines the 0.5.0 dynamic task fingerprint: it covers the active contract
-identity plus the same repository/task-state inputs as the legacy
-`core.task_fingerprint`, but never reads any append-only `*.jsonl` assurance
-ledger. `core.task_fingerprint` itself is not cut over to this primitive in
-T11 (that is T13's job); this file also characterizes that the legacy
-function's old, ledger-sensitive behavior is untouched.
+identity plus the repository/task-state inputs, but never reads any
+append-only `*.jsonl` assurance ledger. T13 activates it: `core.task_fingerprint`
+delegates to this primitive (see `CoreTaskFingerprintCutoverTests`).
 """
 
 from __future__ import annotations
 
+import inspect
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sera import provenance
-from sera.core import task_fingerprint
+from sera.core import load_task, new_task, record_evidence, task_contract_fingerprint, task_fingerprint
+from sera.schemas import SchemaError
 
 
 CONTRACT_FP = "ab" * 32
@@ -275,8 +277,15 @@ class SubdirectoryRootTests(unittest.TestCase):
         self.assertEqual(before, self.fp())
 
 
-class CoreTaskFingerprintNotYetCutOverTests(unittest.TestCase):
-    """Characterization test: T11 must not change `core.task_fingerprint`."""
+class CoreTaskFingerprintCutoverTests(unittest.TestCase):
+    """T13: `core.task_fingerprint` delegates to `provenance.dynamic_task_fingerprint`.
+
+    Former behavior (0.4.2): the facade hashed `ledger.jsonl` bytes, so every
+    appended verification record made a packet/review/seal stale. New invariant
+    (spec Section 7.4): append-only assurance-ledger bytes never enter the
+    dynamic fingerprint; only the active contract and real task/repository
+    state do.
+    """
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -285,30 +294,117 @@ class CoreTaskFingerprintNotYetCutOverTests(unittest.TestCase):
         git(self.root, "init", "-b", "main")
         git(self.root, "config", "user.name", "Test")
         git(self.root, "config", "user.email", "test@example.com")
-        (self.root / ".sera").mkdir()
         (self.root / "src.py").write_text("value = 1\n", encoding="utf-8")
         git(self.root, "add", ".")
         git(self.root, "commit", "-m", "baseline")
+        self.task_dir = new_task(
+            self.root, "cutover", "Change src", "standard", "low", ["src.py"], [], ["python -m unittest"]
+        )
 
-        self.task_dir = self.root / ".sera" / "tasks" / "task-1"
-        self.task_dir.mkdir(parents=True)
-        (self.task_dir / "task.json").write_text('{"id": "task-1"}\n', encoding="utf-8")
-        (self.task_dir / "ledger.jsonl").write_text("", encoding="utf-8")
+    def fp(self) -> str:
+        return task_fingerprint(self.root, self.task_dir)
 
-    def test_legacy_fingerprint_still_hashes_ledger_bytes(self) -> None:
-        """Unlike the new primitive, the legacy facade still binds ledger.jsonl."""
-        before = task_fingerprint(self.root, self.task_dir)
-        with (self.task_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write('{"exit_code": 0}\n')
-        after = task_fingerprint(self.root, self.task_dir)
-        self.assertNotEqual(before, after, "core.task_fingerprint must not yet exclude ledger.jsonl (T13's job)")
+    def legacy_contract_fp(self) -> str:
+        return task_contract_fingerprint(load_task(self.task_dir))
 
-    def test_legacy_fingerprint_ignores_the_new_contract_fp_argument_entirely(self) -> None:
-        """`core.task_fingerprint` takes no `contract_fp` — it is not delegated yet."""
-        import inspect
+    def test_signature_is_preserved(self) -> None:
+        self.assertEqual(list(inspect.signature(task_fingerprint).parameters), ["root", "task_dir"])
 
-        params = inspect.signature(task_fingerprint).parameters
-        self.assertEqual(list(params), ["root", "task_dir"])
+    def test_facade_delegates_to_exactly_one_primitive(self) -> None:
+        with patch.object(provenance, "dynamic_task_fingerprint", return_value="c" * 64) as primitive:
+            self.assertEqual(self.fp(), "c" * 64)
+        primitive.assert_called_once_with(self.root, self.task_dir, self.legacy_contract_fp())
+
+    def test_legacy_task_gets_a_stable_fingerprint_over_its_legacy_contract(self) -> None:
+        self.assertEqual(self.fp(), self.fp())
+        self.assertEqual(
+            self.fp(), provenance.dynamic_task_fingerprint(self.root, self.task_dir, self.legacy_contract_fp())
+        )
+
+    def test_verification_ledger_append_no_longer_changes_the_fingerprint(self) -> None:
+        """Former behavior: changed. New invariant (Section 7.4): unchanged."""
+        before = self.fp()
+        record_evidence(self.task_dir, "python -m unittest", 0, "passed")
+        self.assertEqual(before, self.fp())
+
+    def test_every_assurance_ledger_append_leaves_the_fingerprint_unchanged(self) -> None:
+        before = self.fp()
+        # `task-contracts.jsonl` is the contract authority, not free-form
+        # evidence: its bytes are excluded, but its validated content selects
+        # the contract (covered by the adoption test below).
+        for name in set(provenance.ASSURANCE_LEDGER_NAMES) - {"task-contracts.jsonl"}:
+            with (self.task_dir / name).open("a", encoding="utf-8") as handle:
+                handle.write('{"appended": true}\n')
+        self.assertEqual(before, self.fp())
+
+    def test_task_json_change_still_changes_the_fingerprint(self) -> None:
+        before = self.fp()
+        task = load_task(self.task_dir)
+        task["status"] = "in-progress"
+        (self.task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+        self.assertNotEqual(before, self.fp())
+
+    def test_unstaged_change_still_changes_the_fingerprint(self) -> None:
+        before = self.fp()
+        (self.root / "src.py").write_text("value = 2\n", encoding="utf-8")
+        self.assertNotEqual(before, self.fp())
+
+    def test_staged_change_still_changes_the_fingerprint(self) -> None:
+        (self.root / "src.py").write_text("value = 3\n", encoding="utf-8")
+        before = self.fp()
+        git(self.root, "add", "src.py")
+        (self.root / "src.py").write_text("value = 4\n", encoding="utf-8")
+        git(self.root, "add", "src.py")
+        self.assertNotEqual(before, self.fp())
+
+    def test_untracked_project_file_change_still_changes_the_fingerprint(self) -> None:
+        before = self.fp()
+        (self.root / "extra.py").write_text("x = 1\n", encoding="utf-8")
+        created = self.fp()
+        self.assertNotEqual(before, created)
+        (self.root / "extra.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertNotEqual(created, self.fp())
+
+    def test_contract_change_still_changes_the_fingerprint(self) -> None:
+        before = self.fp()
+        task = load_task(self.task_dir)
+        task["objective"] = "A different objective"
+        (self.task_dir / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+        self.assertNotEqual(before, self.fp())
+
+    def test_adopted_task_binds_its_validated_active_contract_and_changes_across_adoption(self) -> None:
+        legacy = self.fp()
+        result = provenance.adopt_task_contract(
+            self.root, self.task_dir, origin="pre_existing", actor="Op", reason="adopt",
+            bootstrap_limitations={},
+        )
+        modern = self.fp()
+        self.assertNotEqual(legacy, modern)
+        self.assertEqual(
+            modern,
+            provenance.dynamic_task_fingerprint(self.root, self.task_dir, result["task_contract_fingerprint"]),
+        )
+        record_evidence(self.task_dir, "python -m unittest", 0, "passed")
+        self.assertEqual(modern, self.fp(), "assurance evidence alone must not stale an adopted task")
+
+    def test_task_is_never_silently_promoted_by_fingerprinting(self) -> None:
+        for _ in range(3):
+            self.fp()
+        self.assertFalse((self.task_dir / "task-contracts.jsonl").exists())
+
+    def test_malformed_contract_history_fails_closed(self) -> None:
+        (self.task_dir / "task-contracts.jsonl").write_text("not json\n", encoding="utf-8")
+        with self.assertRaises(SchemaError):
+            self.fp()
+
+    def test_no_consumer_reimplements_the_fingerprint(self) -> None:
+        """The legacy ledger-hashing implementation must be unreachable."""
+        source = Path(provenance.__file__).with_name("core.py").read_text(encoding="utf-8")
+        function = source[source.index("def task_fingerprint(") :].split("\ndef ", 1)[0]
+        body = function.split('"""')[2]  # executable code after the docstring
+        self.assertNotIn("ledger.jsonl", body)
+        self.assertNotIn("run_git", body)
+        self.assertNotIn("sha256_bytes", body)
 
 
 if __name__ == "__main__":

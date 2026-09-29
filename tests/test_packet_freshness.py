@@ -236,6 +236,23 @@ class PacketFreshnessTests(unittest.TestCase):
             )["current"]
         )
 
+    def test_recording_verification_evidence_no_longer_stales_a_review_packet(self) -> None:
+        """Former (<0.5.0): the fingerprint hashed ledger.jsonl, so recording a
+        verification staled the packet it was meant to support. New invariant
+        (spec Section 7.4): appended assurance evidence alone never stales it."""
+        task_dir = new_task(
+            self.root, "evidence append", "low-risk task",
+            mode="standard", risk="medium", allowed_files=["docs/note.py"],
+        )
+        (self.root / "docs" / "note.py").write_text("NOTE = 2\n", encoding="utf-8")
+        build_packet(self.root, task_dir, "build")
+        build_packet(self.root, task_dir, "review")
+        task = load_task(task_dir)
+        record_evidence(task_dir, "python -m unittest", 0, "passed")
+        state = packet_state(self.root, task_dir, "review", task, task_fingerprint(self.root, task_dir))
+        self.assertTrue(state["current"], state)
+        self.assertEqual(next_action(self.root, task_dir)["state"], "dispatch_review")
+
     def test_route_is_recorded_in_packet_provenance(self) -> None:
         task_dir = self.low_risk_task()
         build_packet(self.root, task_dir, "build")
