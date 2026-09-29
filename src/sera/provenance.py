@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,6 @@ from .core import (
     load_config,
     load_task,
     normalize_repo_path,
-    run_git,
     sha256_text,
     task_contract_fingerprint,
     task_fingerprint,
@@ -36,6 +36,7 @@ from .core import (
     validate_config,
 )
 from .schemas import (
+    MAX_JSON_BYTES,
     LedgerReader,
     SchemaError,
     TaskLockGuard,
@@ -2002,6 +2003,23 @@ TASK_CONTRACT_LEGACY = "TASK_CONTRACT_LEGACY"
 TASK_CONTRACT_ADOPTION_REQUIRED = "TASK_CONTRACT_ADOPTION_REQUIRED"
 TASK_CONTRACT_FINGERPRINT_MISMATCH = "TASK_CONTRACT_FINGERPRINT_MISMATCH"
 TASK_CONTRACT_REPOSITORY_MISMATCH = "TASK_CONTRACT_REPOSITORY_MISMATCH"
+TASK_CONTRACT_ADOPTION_INVALID = "TASK_CONTRACT_ADOPTION_INVALID"
+TASK_CONTRACT_ADOPTION_STALE = "TASK_CONTRACT_ADOPTION_STALE"
+TASK_CONTRACT_ADOPTION_DUPLICATE = "TASK_CONTRACT_ADOPTION_DUPLICATE"
+TASK_CONTRACT_ADOPTION_CONFLICT = "TASK_CONTRACT_ADOPTION_CONFLICT"
+
+
+class TaskContractError(SchemaError):
+    """Fail-closed task-contract history error carrying a stable reason-code leaf.
+
+    A `SchemaError` subclass so every strict-reader caller still fails closed;
+    `code` lets the adoption operation and CLI report the specific Section 7.5
+    reason instead of a generic schema failure.
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {detail}")
 
 _MAX_TASK_ID_CHARS = 256
 _MAX_ALLOWED_FILES = 256
@@ -2237,7 +2255,7 @@ def _validate_task_contract(record: dict[str, object], task_id: str) -> dict[str
     return contract
 
 
-def _validate_task_contract_adoption_shape(record: dict[str, object]) -> dict[str, object]:
+def _check_task_contract_adoption_shape(record: dict[str, object]) -> dict[str, object]:
     """Validate one `TaskContractAdoptionV1` exactly as written.
 
     This proves internal coherence only: the embedded contract validates, the
@@ -2276,13 +2294,20 @@ def _validate_task_contract_adoption_shape(record: dict[str, object]) -> dict[st
             raise SchemaError("embedded task contract belongs to another task")
         require_hash(adoption["new_contract_hash"], "new_contract_hash")
         if adoption["new_contract_hash"] != embedded["contract_hash"]:
-            raise SchemaError("new_contract_hash must equal the embedded contract_hash")
+            raise TaskContractError(
+                TASK_CONTRACT_FINGERPRINT_MISMATCH, "new_contract_hash must equal the embedded contract_hash"
+            )
         require_hash(adoption["new_task_contract_fingerprint"], "new_task_contract_fingerprint")
         if adoption["new_task_contract_fingerprint"] != embedded["contract_hash"]:
-            raise SchemaError("new_task_contract_fingerprint must equal the embedded contract_hash")
+            raise TaskContractError(
+                TASK_CONTRACT_FINGERPRINT_MISMATCH,
+                "new_task_contract_fingerprint must equal the embedded contract_hash",
+            )
         identity = _validate_repository_identity(adoption["repository_identity"])
         if identity != embedded["repository_identity"]:
-            raise SchemaError("adoption repository_identity disagrees with the embedded contract")
+            raise TaskContractError(
+                TASK_CONTRACT_REPOSITORY_MISMATCH, "adoption repository_identity disagrees with the embedded contract"
+            )
         _validated_git_id(adoption["head_sha"], "head_sha")
         _validated_git_id(adoption["tree_sha"], "tree_sha", allow_unborn=False)
         if adoption["implementation_origin"] not in IMPLEMENTATION_ORIGINS:
@@ -2321,10 +2346,20 @@ def _validate_task_contract_adoption_shape(record: dict[str, object]) -> dict[st
     return adoption
 
 
+def _validate_task_contract_adoption_shape(record: dict[str, object]) -> dict[str, object]:
+    """Shape-validate one adoption; anything not more specifically coded is INVALID."""
+    try:
+        return _check_task_contract_adoption_shape(record)
+    except TaskContractError:
+        raise
+    except SchemaError as exc:
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, str(exc)) from exc
+
+
 def _validate_task_contract_adoption(record: dict[str, object], task_id: str) -> dict[str, object]:
     adoption = _validate_task_contract_adoption_shape(record)
     if adoption["task_id"] != task_id:
-        raise SchemaError("task contract adoption belongs to another task")
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, "task contract adoption belongs to another task")
     return adoption
 
 
@@ -2529,30 +2564,83 @@ def _load_declared_task(task_dir: Path) -> dict[str, object] | None:
 
 def _validate_first_adoption_link(record: Mapping[str, object], declared_task: Mapping[str, object] | None) -> None:
     if record["previous_contract_schema"] != 1:
-        raise SchemaError("the first task contract adoption must transition from schema 1")
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_INVALID, "the first task contract adoption must transition from schema 1"
+        )
     if not _is_task_v1(declared_task):
-        raise SchemaError("the first task contract adoption requires a legacy Task v1 record")
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_INVALID, "the first task contract adoption requires a legacy Task v1 record"
+        )
     if declared_task.get("id") != record["task_id"]:
-        raise SchemaError("the legacy Task v1 record belongs to another task")
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, "the legacy Task v1 record belongs to another task")
+    if record["implementation_origin"] == "sera_builder":
+        # Section 7.5: a Task v1 adoption is pre_existing/external unless
+        # independently valid historical builder evidence exists, which this
+        # runtime cannot validate. The reader enforces it too, so a hand-written
+        # line cannot smuggle a builder claim into the active contract.
+        raise TaskContractError(
+            BUILDER_PROVENANCE_REQUIRED,
+            "a Task v1 adoption cannot claim sera_builder origin without independently valid builder evidence",
+        )
     if record["previous_contract_hash"] != legacy_previous_contract_hash(declared_task):
-        raise SchemaError("task contract adoption previous_contract_hash does not match the legacy task record")
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_STALE,
+            "task contract adoption previous_contract_hash does not match the legacy task record",
+        )
     if record["previous_task_contract_fingerprint"] != task_contract_fingerprint(dict(declared_task)):
-        raise SchemaError(
-            "task contract adoption previous_task_contract_fingerprint does not match the legacy task record"
+        raise TaskContractError(
+            TASK_CONTRACT_FINGERPRINT_MISMATCH,
+            "task contract adoption previous_task_contract_fingerprint does not match the legacy task record",
         )
 
 
 def _validate_later_adoption_link(record: Mapping[str, object], active: Mapping[str, object] | None) -> None:
-    if record["previous_contract_schema"] != 2:
-        raise SchemaError("a later task contract adoption must transition from schema 2")
-    if active is None:
-        raise SchemaError("no active contract precedes this task contract adoption")
-    if record["previous_contract_hash"] != active["contract_hash"]:
-        raise SchemaError("task contract adoption previous_contract_hash does not match the active contract")
-    if record["previous_task_contract_fingerprint"] != active["contract_hash"]:
-        raise SchemaError(
-            "task contract adoption previous_task_contract_fingerprint does not match the active contract"
+    if active is not None and record["previous_contract_schema"] != 2:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_STALE,
+            "the adoption is based on a superseded schema 1 record; a modern contract is already active",
         )
+    if record["previous_contract_schema"] != 2:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_INVALID, "a later task contract adoption must transition from schema 2"
+        )
+    if active is None:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_INVALID, "no active contract precedes this task contract adoption"
+        )
+    if record["previous_contract_hash"] != active["contract_hash"]:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_STALE,
+            "task contract adoption previous_contract_hash does not match the active contract",
+        )
+    if record["previous_task_contract_fingerprint"] != active["contract_hash"]:
+        raise TaskContractError(
+            TASK_CONTRACT_FINGERPRINT_MISMATCH,
+            "task contract adoption previous_task_contract_fingerprint does not match the active contract",
+        )
+    if record["new_contract_hash"] == active["contract_hash"]:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_DUPLICATE, "the adoption re-states the currently active contract unchanged"
+        )
+
+
+def _note_adoption_identity(seen: dict[str, str], adoption: Mapping[str, object]) -> None:
+    """Section 7.5: a reused `adoption_id` is a duplicate or a conflict, never history.
+
+    The same id with the same hash is an exact duplicate; the same id with
+    different content is a conflict. Both fail closed wherever they appear.
+    """
+    adoption_id, adoption_hash = adoption["adoption_id"], adoption["adoption_hash"]
+    prior = seen.get(adoption_id)
+    if prior is not None:
+        if prior == adoption_hash:
+            raise TaskContractError(
+                TASK_CONTRACT_ADOPTION_DUPLICATE, f"adoption {adoption_id} is recorded more than once"
+            )
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_CONFLICT, f"adoption_id {adoption_id} is reused with different content"
+        )
+    seen[adoption_id] = adoption_hash
 
 
 def active_contract(task_dir: Path) -> dict[str, object] | None:
@@ -2574,16 +2662,21 @@ def active_contract(task_dir: Path) -> dict[str, object] | None:
     is_legacy = _is_task_v1(declared_task)
 
     active: dict[str, object] | None = None
+    seen_adoptions: dict[str, str] = {}
     for index, record in enumerate(records):
         if record["record_type"] == TASK_CONTRACT_RECORD_TYPE:
             if index != 0:
-                raise SchemaError("a raw task contract may only be the first ledger record")
+                raise TaskContractError(
+                    TASK_CONTRACT_ADOPTION_INVALID, "a raw task contract may only be the first ledger record"
+                )
             if is_legacy:
-                raise SchemaError(
-                    "a historical Task v1 must adopt a modern contract rather than start one natively"
+                raise TaskContractError(
+                    TASK_CONTRACT_ADOPTION_INVALID,
+                    "a historical Task v1 must adopt a modern contract rather than start one natively",
                 )
             active = record
             continue
+        _note_adoption_identity(seen_adoptions, record)
         if index == 0:
             _validate_first_adoption_link(record, declared_task)
         else:
@@ -2614,20 +2707,369 @@ def append_task_contract(task_dir: Path, contract: Mapping[str, object], lock: T
 def append_task_contract_adoption(task_dir: Path, adoption: Mapping[str, object], lock: TaskLockGuard) -> None:
     """Append one caller-supplied, intrinsically valid `TaskContractAdoptionV1`.
 
-    This is the structural primitive only (Section 14): it validates the
-    record and the complete existing chain, then appends exactly one line
-    under a genuine live task lock. It is not the trusted `sera task contract
-    --adopt` operation (T12), which additionally captures and re-reads live
-    repository/policy state under the same lock before calling this.
+    This is the structural primitive only: it validates the record and the
+    complete existing chain, then appends exactly one line under a genuine
+    live task lock. It is not the trusted transition; `adopt_task_contract`
+    is, and it alone additionally captures and re-reads live repository and
+    policy state under the same lock before calling this.
     """
     task_dir = Path(task_dir).resolve()
     validated = _validate_task_contract_adoption(dict(adoption), task_dir.name)
     current_active = active_contract(task_dir)
+    seen_adoptions: dict[str, str] = {}
+    for prior in read_task_contracts(task_dir).records():
+        if prior["record_type"] == TASK_CONTRACT_ADOPTION_RECORD_TYPE:
+            _note_adoption_identity(seen_adoptions, prior)
+    _note_adoption_identity(seen_adoptions, validated)
     if current_active is None:
         _validate_first_adoption_link(validated, _load_declared_task(task_dir))
     else:
         _validate_later_adoption_link(validated, current_active)
     append_ledger_record(task_dir / "task-contracts.jsonl", validated, lock)
+
+
+# --- T12 explicit task-contract adoption (spec Sections 7.5 and 19, boundary 1) -
+#
+# `adopt_task_contract` is the only trusted transition from a compatibility-read
+# Task v1 (or the currently active Task v2) to a new modern contract. One task
+# lock is held across the complete capture -> construct -> re-read -> single
+# append -> projection sequence and is never released in between. SERA makes
+# no trust decision beyond validating these bindings: the operator supplies
+# origin, actor, reason, and bootstrap limitations explicitly.
+
+_ADOPTION_POLICY_TRIGGER = "task_contract_adoption"
+# Snapshot fields recording when/why a candidate was captured rather than what
+# policy it states; two candidates differing only here state the same policy.
+_POLICY_CAPTURE_FIELDS = frozenset({"captured_at", "trigger", "snapshot_hash"})
+_MAX_ADOPTION_ACTOR_CHARS = 256
+_MAX_ADOPTION_REASON_CHARS = 2048
+# The contract-defining task fields an adoption carries forward unchanged.
+_CARRIED_CONTRACT_FIELDS = (
+    "objective",
+    "requested_mode",
+    "requested_risk",
+    "mode",
+    "risk",
+    "risk_reasons",
+    "allowed_files",
+    "constraints",
+    "verification",
+    "uncertainty",
+    "use_case",
+)
+
+
+@dataclass(frozen=True)
+class _AdoptionState:
+    """One reading of every binding Section 7.5 step 6 must find unchanged."""
+
+    ledger_fingerprint: str
+    previous: Mapping[str, object]
+    previous_schema: int
+    previous_hash: str
+    previous_fingerprint: str
+    repository_identity: Mapping[str, object]
+    head_sha: str
+    tree_sha: str
+
+
+def _require_adoption_inputs(
+    origin: object, actor: object, reason: object, bootstrap_limitations: object
+) -> tuple[str, str, str, dict[str, object]]:
+    """Step 4's explicit operator inputs, validated before anything is written.
+
+    Only cheap, context-free checks live here; the complete record-level
+    validation runs as a dry construction in `adopt_task_contract` before any
+    policy snapshot is appended.
+
+    `sera_builder` is refused: a Task v1 adoption may claim it only with
+    independently valid historical builder evidence, and a re-contract may
+    not reclassify earlier work (Section 7.5). This runtime has no validator
+    for such evidence, so the claim can never be established here — and
+    neither compatibility normalization nor the adoption command itself is
+    evidence of builder provenance.
+    """
+    if not isinstance(origin, str) or origin not in IMPLEMENTATION_ORIGINS:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_INVALID, f"implementation origin must be one of {list(IMPLEMENTATION_ORIGINS)}"
+        )
+    if origin == "sera_builder":
+        raise TaskContractError(
+            BUILDER_PROVENANCE_REQUIRED,
+            "an adopted contract cannot claim sera_builder origin without independently valid builder "
+            "evidence, which this runtime cannot establish; use pre_existing or external",
+        )
+    for value, field, maximum in (
+        (actor, "actor", _MAX_ADOPTION_ACTOR_CHARS),
+        (reason, "reason", _MAX_ADOPTION_REASON_CHARS),
+    ):
+        if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+            raise TaskContractError(
+                TASK_CONTRACT_ADOPTION_INVALID,
+                f"{field} must be an explicit nonblank string of at most {maximum} characters",
+            )
+    if not isinstance(bootstrap_limitations, Mapping):
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, "bootstrap limitations must be a structured object")
+    try:
+        limitations = read_strict_json(canonical_json(dict(bootstrap_limitations)).encode("utf-8"), spec=None)
+    except (SchemaError, ValueError) as exc:
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, f"bootstrap limitations are invalid: {exc}") from exc
+    return origin, actor, reason, limitations
+
+
+def load_bootstrap_limitations(path: Path) -> dict[str, object]:
+    """Strictly read an operator-supplied structured limitations file.
+
+    Bounded, duplicate-key-free UTF-8 JSON whose top level is an object; the
+    operation itself re-validates whatever this returns.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            raw = handle.read(MAX_JSON_BYTES + 1)
+    except OSError as exc:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_INVALID, f"bootstrap limitations file is unreadable: {exc}"
+        ) from exc
+    try:
+        return read_strict_json(raw, spec=None)
+    except SchemaError as exc:
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, f"bootstrap limitations are invalid: {exc}") from exc
+
+
+def _read_adoption_state(root: Path, task_dir: Path) -> _AdoptionState:
+    """Steps 1-2: the active (or legacy) contract, repository identity, HEAD/tree."""
+    ledger_fingerprint = read_task_contracts(task_dir).fingerprint()
+    active = active_contract(task_dir)
+    if active is None:
+        declared = _load_declared_task(task_dir)
+        if not _is_task_v1(declared):
+            raise TaskContractError(
+                TASK_CONTRACT_ADOPTION_INVALID, "the task has neither an active modern contract nor a Task v1 record"
+            )
+        if declared.get("id") != task_dir.name:
+            raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, "the Task v1 record belongs to another task")
+        controller = declared.get("controller")
+        if isinstance(controller, dict) and controller.get("auto_drafted") and not controller.get("ownership_confirmed"):
+            raise TaskContractError(
+                TASK_CONTRACT_ADOPTION_INVALID,
+                "the task's auto-drafted file ownership is unconfirmed and would be frozen into the contract; "
+                "run `sera task confirm` first",
+            )
+        previous: Mapping[str, object] = declared
+        previous_schema = 1
+        previous_hash = legacy_previous_contract_hash(declared)
+        previous_fingerprint = task_contract_fingerprint(dict(declared))
+    else:
+        previous, previous_schema = active, TASK_CONTRACT_SCHEMA_VERSION
+        previous_hash = previous_fingerprint = active["contract_hash"]
+    identity = repository_identity(root, load_config(root))
+    head = git_head_identity(root)
+    return _AdoptionState(
+        ledger_fingerprint=ledger_fingerprint,
+        previous=previous,
+        previous_schema=previous_schema,
+        previous_hash=previous_hash,
+        previous_fingerprint=previous_fingerprint,
+        repository_identity=identity,
+        head_sha=head["head_sha"],
+        tree_sha=head["head_tree_sha"],
+    )
+
+
+def _policy_semantics(snapshot: Mapping[str, object]) -> dict[str, object]:
+    return {key: value for key, value in snapshot.items() if key not in _POLICY_CAPTURE_FIELDS}
+
+
+def _adoption_policy_candidate(root: Path, previous: Mapping[str, object]) -> dict:
+    return build_policy_snapshot(translate_config(load_config(root), root), previous, _ADOPTION_POLICY_TRIGGER)
+
+
+def _resolve_adoption_policy(
+    root: Path, task_dir: Path, previous: Mapping[str, object], lock: TaskLockGuard
+) -> tuple[dict, bool]:
+    """Step 3: reuse an equal-policy candidate, or append one immutable snapshot.
+
+    An appended candidate is not active until a contract binds it, so a later
+    fail-closed step leaves no authoritative change behind.
+    """
+    candidate = _adoption_policy_candidate(root, previous)
+    for snapshot in reversed(read_policy_snapshots(task_dir).records()):
+        if _policy_semantics(snapshot) == _policy_semantics(candidate):
+            return snapshot, False
+    append_policy_snapshot(task_dir, candidate, lock)
+    return candidate, True
+
+
+def _construct_adoption(
+    task_dir: Path,
+    captured: _AdoptionState,
+    snapshot: Mapping[str, object],
+    *,
+    origin: str,
+    actor: str,
+    reason: str,
+    limitations: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Step 5: the complete new `TaskContractV2` and its single adoption record."""
+    previous = captured.previous
+    contract = build_task_contract_v2(
+        task_dir.name,
+        **{field: previous.get(field) for field in _CARRIED_CONTRACT_FIELDS},
+        repository_identity=captured.repository_identity,
+        implementation_origin=origin,
+        active_policy_hash=snapshot["snapshot_hash"],
+        bootstrap_boundary=limitations or None,
+    )
+    if contract["contract_hash"] == captured.previous_hash:
+        raise TaskContractError(
+            TASK_CONTRACT_ADOPTION_DUPLICATE, "the new contract is identical to the currently active contract"
+        )
+    if contract["contract_hash"] == captured.previous_fingerprint:
+        raise TaskContractError(
+            TASK_CONTRACT_FINGERPRINT_MISMATCH, "the new contract fingerprint must differ from the previous one"
+        )
+    adoption = build_adoption_record(
+        previous,
+        contract,
+        adoption_id=str(uuid.uuid4()),
+        head_sha=captured.head_sha,
+        tree_sha=captured.tree_sha,
+        actor=actor,
+        reason=reason,
+        adopted_at=utc_now(),
+        bootstrap_limitations=limitations,
+    )
+    if (
+        adoption["previous_contract_hash"] != captured.previous_hash
+        or adoption["previous_task_contract_fingerprint"] != captured.previous_fingerprint
+    ):
+        raise TaskContractError(
+            TASK_CONTRACT_FINGERPRINT_MISMATCH, "the adoption does not bind the captured previous contract"
+        )
+    return contract, adoption
+
+
+def _require_unchanged(
+    root: Path, task_dir: Path, captured: _AdoptionState, snapshot: Mapping[str, object]
+) -> None:
+    """Steps 6-7: re-read every captured binding; any movement fails closed."""
+    try:
+        current = _read_adoption_state(root, task_dir)
+        fresh_policy = _adoption_policy_candidate(root, current.previous)
+        persisted_policies = {record["snapshot_hash"] for record in read_policy_snapshots(task_dir).records()}
+    except TaskContractError:
+        raise
+    except (SchemaError, SeraError, OSError, ValueError) as exc:
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_STALE, f"adoption state could not be re-read: {exc}") from exc
+    if current.repository_identity != captured.repository_identity:
+        raise TaskContractError(TASK_CONTRACT_REPOSITORY_MISMATCH, "repository identity moved during adoption")
+    if (
+        current.ledger_fingerprint != captured.ledger_fingerprint
+        or current.previous_schema != captured.previous_schema
+        or current.previous_hash != captured.previous_hash
+        or current.previous_fingerprint != captured.previous_fingerprint
+    ):
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_STALE, "the previous contract is no longer the active one")
+    if current.head_sha != captured.head_sha or current.tree_sha != captured.tree_sha:
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_STALE, "HEAD/tree moved during adoption")
+    if (
+        _policy_semantics(fresh_policy) != _policy_semantics(snapshot)
+        or snapshot["snapshot_hash"] not in persisted_policies
+    ):
+        raise TaskContractError(TASK_CONTRACT_ADOPTION_STALE, "policy moved during adoption")
+
+
+def _write_contract_projection(task_dir: Path, contract: Mapping[str, object]) -> None:
+    path = task_dir / "task.json"
+    staging = task_dir / ".task.json.projection"
+    staging.unlink(missing_ok=True)  # removes a planted link itself; never writes through it
+    try:
+        staging.write_text(canonical_json(dict(contract)) + "\n", encoding="utf-8")
+        os.replace(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def _project_adopted_contract(task_dir: Path, contract: Mapping[str, object]) -> str:
+    """Step 9: optional, non-authoritative, and never allowed to undo step 8.
+
+    A historical Task v1 `task.json` is never replaced; anything that is not a
+    derived projection of this task's contract is left untouched as well.
+    """
+    try:
+        declared = _load_declared_task(task_dir)
+        if _is_task_v1(declared):
+            return "omitted_legacy_task_v1_preserved"
+        if declared is not None and validate_task_contract(declared)["task_id"] != task_dir.name:
+            return "omitted_unrecognized_task_json"
+    except SchemaError:
+        return "omitted_unrecognized_task_json"
+    try:
+        _write_contract_projection(task_dir, contract)
+    except OSError as exc:
+        return f"failed: {exc}"
+    return "written"
+
+
+def adopt_task_contract(
+    root: Path,
+    task_dir: Path,
+    *,
+    origin: str,
+    actor: str,
+    reason: str,
+    bootstrap_limitations: Mapping[str, object],
+) -> dict:
+    """`sera task contract --adopt`: Section 7.5's nine-step locked adoption.
+
+    Appends exactly one `TaskContractAdoptionV1` embedding the complete new
+    `TaskContractV2`, or nothing. A historical Task v1 `task.json` is never
+    rewritten, and no pre-adoption evidence becomes modern.
+    """
+    origin, actor, reason, limitations = _require_adoption_inputs(origin, actor, reason, bootstrap_limitations)
+    root = Path(root).resolve()
+    task_dir = Path(task_dir).resolve()
+    with task_lock(task_dir) as lock:
+        try:
+            captured = _read_adoption_state(root, task_dir)  # steps 1-2
+            # Validate the complete record before anything is written: a doomed
+            # adoption must not leave even a candidate policy snapshot behind.
+            _construct_adoption(
+                task_dir, captured, _adoption_policy_candidate(root, captured.previous),
+                origin=origin, actor=actor, reason=reason, limitations=limitations,
+            )
+            snapshot, policy_appended = _resolve_adoption_policy(root, task_dir, captured.previous, lock)  # step 3
+            contract, adoption = _construct_adoption(  # steps 4-5
+                task_dir, captured, snapshot, origin=origin, actor=actor, reason=reason, limitations=limitations
+            )
+        except TaskContractError:
+            raise
+        except (SchemaError, SeraError, OSError, ValueError) as exc:
+            raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, str(exc)) from exc
+        _require_unchanged(root, task_dir, captured, snapshot)  # steps 6-7
+        try:
+            append_task_contract_adoption(task_dir, adoption, lock)  # step 8: the single authoritative append
+        except TaskContractError:
+            raise
+        except (SchemaError, SeraError) as exc:
+            raise TaskContractError(TASK_CONTRACT_ADOPTION_INVALID, str(exc)) from exc
+        projection = _project_adopted_contract(task_dir, contract)  # step 9
+    return {
+        "task_id": task_dir.name,
+        "adoption_id": adoption["adoption_id"],
+        "adoption_hash": adoption["adoption_hash"],
+        "previous_contract_schema": adoption["previous_contract_schema"],
+        "previous_contract_hash": adoption["previous_contract_hash"],
+        "previous_task_contract_fingerprint": adoption["previous_task_contract_fingerprint"],
+        "task_contract_fingerprint": contract["contract_hash"],
+        "implementation_origin": origin,
+        "policy_snapshot_hash": snapshot["snapshot_hash"],
+        "policy_snapshot_appended": policy_appended,
+        "head_sha": adoption["head_sha"],
+        "tree_sha": adoption["tree_sha"],
+        "projection": projection,
+        "adoption": adoption,
+    }
 
 
 # The append-only assurance ledgers a task directory holds (Section 6). None

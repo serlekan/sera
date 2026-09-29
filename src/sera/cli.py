@@ -41,7 +41,7 @@ from .core import (
     run_verification,
     update_repo_map,
 )
-from .provenance import adopt_policy_snapshot
+from .provenance import IMPLEMENTATION_ORIGINS, adopt_policy_snapshot, adopt_task_contract, load_bootstrap_limitations
 from .schemas import LockHeld, SchemaError
 
 
@@ -104,6 +104,20 @@ def parser() -> argparse.ArgumentParser:
     policy.add_argument("--adopt", action="store_true", required=True)
     policy.add_argument("--actor", required=True)
     policy.add_argument("--reason", required=True)
+
+    contract = task_commands.add_parser(
+        "contract", help="Explicitly adopt a modern task contract (the only Task v1 -> v2 transition)."
+    )
+    contract.add_argument("task", nargs="?")
+    contract.add_argument("--adopt", action="store_true", required=True)
+    contract.add_argument("--origin", required=True, choices=list(IMPLEMENTATION_ORIGINS))
+    contract.add_argument("--actor", required=True)
+    contract.add_argument("--reason", required=True)
+    limitations = contract.add_mutually_exclusive_group(required=True)
+    limitations.add_argument("--bootstrap-limitations", metavar="FILE", help="Structured JSON limitations object.")
+    limitations.add_argument(
+        "--no-bootstrap-limitations", action="store_true", help="Explicitly record no bootstrap limitations."
+    )
 
     auto = task_commands.add_parser("auto", help="Draft a task capsule from a natural-language request.")
     auto.add_argument("request")
@@ -241,6 +255,20 @@ def main(argv: list[str] | None = None) -> int:
             snapshot = adopt_policy_snapshot(root, task_dir, actor=args.actor, reason=args.reason)
             print(f"Captured candidate policy {snapshot['snapshot_hash']}")
             print("TASK_CONTRACT_ADOPTION_REQUIRED: contract adoption must bind this candidate to activate it.")
+            return 0
+        if args.command == "task" and args.task_command == "contract":
+            task_dir = resolve_task_dir(root, args.task)
+            limitations = {} if args.no_bootstrap_limitations else load_bootstrap_limitations(
+                Path(args.bootstrap_limitations)
+            )
+            result = adopt_task_contract(
+                root, task_dir, origin=args.origin, actor=args.actor, reason=args.reason,
+                bootstrap_limitations=limitations,
+            )
+            print(f"Adopted task contract for {result['task_id']}: {result['task_contract_fingerprint']}")
+            print(f"Adoption {result['adoption_id']} (origin: {result['implementation_origin']})")
+            print("Historical Task v1 task.json is preserved unchanged; pre-adoption evidence remains legacy.")
+            print(f"Projection: {result['projection']}")
             return 0
         if args.command == "task" and args.task_command == "auto":
             task_dir, report = auto_task(

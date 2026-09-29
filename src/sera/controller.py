@@ -35,7 +35,7 @@ from .core import (
     update_repo_map,
     write_task_capsule,
 )
-from .provenance import append_policy_snapshot, build_policy_snapshot, translate_config
+from .provenance import active_contract, append_policy_snapshot, build_policy_snapshot, translate_config
 from .schemas import task_lock
 
 __all__ = [
@@ -185,6 +185,14 @@ def confirm_task_ownership(root: Path, task_dir: Path, files: list[str] | None =
     route.
     """
     with task_lock(task_dir) as lock:
+        if active_contract(task_dir) is not None:
+            # An adopted task's historical Task v1 `task.json` is preserved
+            # byte-for-byte and anchors the contract chain; ownership can only
+            # change through an explicit contract re-adoption.
+            raise SeraError(
+                "This task has adopted a modern task contract, which fixes its ownership; its historical "
+                "task.json is preserved unchanged. Create a new task to change ownership."
+            )
         task = load_task(task_dir)
         if files:
             task["allowed_files"] = sorted({normalize_repo_path(path) for path in files})
