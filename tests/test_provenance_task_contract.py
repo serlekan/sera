@@ -675,7 +675,7 @@ class LegacyCompatibilityTests(unittest.TestCase):
     def test_legacy_previous_contract_hash_uses_the_complete_v1_record(self) -> None:
         task_v1 = legacy_task_v1("task-legacy")
         task_v1["extra_runtime_field"] = "must not be dropped"
-        expected = sha256_domain("task_contract:legacy_v1", canonical_json(task_v1).encode("utf-8"))
+        expected = sha256_domain("task_contract", canonical_json(task_v1).encode("utf-8"))
         self.assertEqual(provenance.legacy_previous_contract_hash(task_v1), expected)
 
         reduced = dict(task_v1)
@@ -696,8 +696,11 @@ class LegacyCompatibilityTests(unittest.TestCase):
         task_dir = self.root / ".sera" / "tasks" / "task-legacy"
         task_dir.mkdir(parents=True)
         (task_dir / "task.json").write_text(json.dumps(task_v1) + "\n", encoding="utf-8")
+        # Same repository and task.json bytes: only the contract identity moves,
+        # and that alone must move the dynamic fingerprint across adoption.
+        dyn_legacy = provenance.dynamic_task_fingerprint(self.root, task_dir, legacy_fp)
         dyn_modern = provenance.dynamic_task_fingerprint(self.root, task_dir, modern_fp)
-        self.assertNotEqual(dyn_modern, modern_fp)
+        self.assertNotEqual(dyn_legacy, dyn_modern)
 
     def test_no_automatic_promotion_from_reading_a_legacy_task(self) -> None:
         task_dir = self.root / ".sera" / "tasks" / "task-legacy"
@@ -709,6 +712,316 @@ class LegacyCompatibilityTests(unittest.TestCase):
             self.assertIsNone(provenance.active_contract(task_dir))
         self.assertFalse((task_dir / "task-contracts.jsonl").exists())
         self.assertEqual((task_dir / "task.json").read_text(encoding="utf-8"), raw)
+
+
+class ContractFingerprintFacadeTests(unittest.TestCase):
+    """`core.task_contract_fingerprint` never trusts a self-declared modern identity."""
+
+    def setUp(self) -> None:
+        self.temp, self.root = make_repo()
+        self.addCleanup(self.temp.cleanup)
+
+    def test_valid_modern_contract_yields_its_validated_hash(self) -> None:
+        contract = make_contract("task-1", self.root)
+        self.assertEqual(task_contract_fingerprint(contract), contract["contract_hash"])
+
+    def test_attacker_controlled_contract_hash_is_rejected(self) -> None:
+        forged = {"schema_version": 2, "record_type": "task_contract", "contract_hash": "ee" * 32}
+        with self.assertRaises(SchemaError):
+            task_contract_fingerprint(forged)
+
+    def test_modern_contract_with_unrecomputed_hash_is_rejected(self) -> None:
+        contract = make_contract("task-1", self.root)
+        tampered = {**contract, "objective": "silently widened objective"}
+        with self.assertRaises(SchemaError):
+            task_contract_fingerprint(tampered)
+
+    def test_partial_modern_claims_fail_closed_instead_of_falling_back(self) -> None:
+        contract = make_contract("task-1", self.root)
+        without_type = {key: value for key, value in contract.items() if key != "record_type"}
+        with self.assertRaises(SchemaError):
+            task_contract_fingerprint(without_type)
+        with self.assertRaises(SchemaError):
+            task_contract_fingerprint({**legacy_task_v1(), "record_type": "task_contract"})
+
+    def test_forged_v2_task_json_cannot_supply_the_current_contract_fingerprint(self) -> None:
+        task_dir = self.root / ".sera" / "tasks" / "task-1"
+        task_dir.mkdir(parents=True)
+        forged = {"schema_version": 2, "record_type": "task_contract", "contract_hash": "ee" * 32}
+        (task_dir / "task.json").write_text(json.dumps(forged) + "\n", encoding="utf-8")
+        from sera.core import load_task
+
+        with self.assertRaises(SchemaError):
+            task_contract_fingerprint(load_task(task_dir))
+
+
+class Increment1KnowledgeAndBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp, self.root = make_repo()
+        self.addCleanup(self.temp.cleanup)
+
+    def test_assessed_knowledge_claim_is_rejected_by_this_runtime(self) -> None:
+        contract = rehash_contract(
+            {**make_contract("task-1", self.root), "knowledge_assessment_state": "assessed"}
+        )
+        with self.assertRaises(SchemaError):
+            provenance.validate_task_contract(contract)
+
+    def test_non_empty_knowledge_sources_are_rejected(self) -> None:
+        sources = ["README.md"]
+        contract = rehash_contract(
+            {
+                **make_contract("task-1", self.root),
+                "knowledge_sources": sources,
+                "knowledge_fingerprint": __import__("hashlib").sha256(canonical_json(sources).encode()).hexdigest(),
+            }
+        )
+        with self.assertRaises(SchemaError):
+            provenance.validate_task_contract(contract)
+
+    def test_empty_bootstrap_boundary_has_one_canonical_spelling(self) -> None:
+        omitted = make_contract("task-1", self.root)
+        built_empty = make_contract("task-1", self.root, bootstrap_boundary={})
+        self.assertEqual(built_empty, omitted)
+        explicit_empty = rehash_contract({**omitted, "bootstrap_boundary": {}})
+        with self.assertRaises(SchemaError):
+            provenance.validate_task_contract(explicit_empty)
+
+    def test_limitations_without_an_embedded_boundary_are_rejected(self) -> None:
+        task_v1 = legacy_task_v1("task-legacy")
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        with self.assertRaises(SchemaError):
+            make_adoption(
+                None, self.root, previous=task_v1, new_contract=contract,
+                bootstrap_limitations={"scope": "undeclared in the contract"},
+            )
+
+
+class LedgerRejectionMatrixTests(unittest.TestCase):
+    """`active_contract` validates the complete physical ledger, never the last line."""
+
+    def setUp(self) -> None:
+        self.temp, self.root = make_repo()
+        self.addCleanup(self.temp.cleanup)
+
+    def native_task(self, task_id: str = "task-native") -> tuple[Path, dict[str, object]]:
+        task_dir = self.root / ".sera" / "tasks" / task_id
+        task_dir.mkdir(parents=True)
+        first = make_contract(task_id, self.root)
+        with task_lock(task_dir) as guard:
+            provenance.append_task_contract(task_dir, first, guard)
+        return task_dir, first
+
+    def legacy_task(self, task_id: str = "task-legacy") -> tuple[Path, dict[str, object]]:
+        task_dir = self.root / ".sera" / "tasks" / task_id
+        task_dir.mkdir(parents=True)
+        task_v1 = legacy_task_v1(task_id)
+        (task_dir / "task.json").write_text(json.dumps(task_v1) + "\n", encoding="utf-8")
+        return task_dir, task_v1
+
+    def write_lines(self, task_dir: Path, lines: list[str]) -> None:
+        (task_dir / "task-contracts.jsonl").write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+
+    def assert_rejected(self, task_dir: Path) -> None:
+        with self.assertRaises(SchemaError):
+            provenance.active_contract(task_dir)
+
+    def test_malformed_first_line_is_rejected(self) -> None:
+        task_dir, _ = self.native_task()
+        self.write_lines(task_dir, ["{not json"])
+        self.assert_rejected(task_dir)
+
+    def test_bad_contract_hash_line_is_rejected(self) -> None:
+        task_dir, first = self.native_task()
+        self.write_lines(task_dir, [canonical_json({**first, "contract_hash": "00" * 32})])
+        self.assert_rejected(task_dir)
+
+    def test_unsupported_schema_line_is_rejected(self) -> None:
+        task_dir, first = self.native_task()
+        self.write_lines(task_dir, [canonical_json(rehash_contract({**first, "schema_version": 3}))])
+        self.assert_rejected(task_dir)
+
+    def test_unknown_record_type_is_rejected(self) -> None:
+        task_dir, first = self.native_task()
+        self.write_lines(task_dir, [canonical_json(first), canonical_json({"record_type": "task_note"})])
+        self.assert_rejected(task_dir)
+
+    def test_bad_adoption_hash_is_rejected(self) -> None:
+        task_dir, first = self.native_task()
+        second = make_contract("task-native", self.root, objective="Second scope")
+        adoption = make_adoption(task_dir, self.root, previous=first, new_contract=second)
+        self.write_lines(task_dir, [canonical_json(first), canonical_json({**adoption, "adoption_hash": "00" * 32})])
+        self.assert_rejected(task_dir)
+
+    def test_malformed_embedded_contract_is_rejected(self) -> None:
+        task_dir, first = self.native_task()
+        second = make_contract("task-native", self.root, objective="Second scope")
+        adoption = make_adoption(task_dir, self.root, previous=first, new_contract=second)
+        broken = rehash_adoption({**adoption, "new_contract": {**second, "mode": "reckless"}})
+        self.write_lines(task_dir, [canonical_json(first), canonical_json(broken)])
+        self.assert_rejected(task_dir)
+
+    def test_embedded_contract_hash_mismatch_is_rejected(self) -> None:
+        task_dir, first = self.native_task()
+        second = make_contract("task-native", self.root, objective="Second scope")
+        third = make_contract("task-native", self.root, objective="Third scope")
+        adoption = make_adoption(task_dir, self.root, previous=first, new_contract=second)
+        mismatched = rehash_adoption(
+            {**adoption, "new_contract_hash": third["contract_hash"], "new_task_contract_fingerprint": third["contract_hash"]}
+        )
+        self.write_lines(task_dir, [canonical_json(first), canonical_json(mismatched)])
+        self.assert_rejected(task_dir)
+
+    def test_native_history_must_start_with_a_raw_contract(self) -> None:
+        task_dir = self.root / ".sera" / "tasks" / "task-native"
+        task_dir.mkdir(parents=True)
+        first = make_contract("task-native", self.root)
+        second = make_contract("task-native", self.root, objective="Second scope")
+        adoption = make_adoption(task_dir, self.root, previous=first, new_contract=second)
+        self.write_lines(task_dir, [canonical_json(adoption)])
+        self.assert_rejected(task_dir)
+
+    def test_valid_looking_final_line_after_invalid_history_is_not_trusted(self) -> None:
+        task_dir, first = self.native_task()
+        second = make_contract("task-native", self.root, objective="Second scope")
+        adoption1 = make_adoption(task_dir, self.root, previous=first, new_contract=second)
+        third = make_contract("task-native", self.root, objective="Third scope")
+        adoption2 = make_adoption(task_dir, self.root, previous=second, new_contract=third)
+        corrupted_middle = {**adoption1, "reason": "edited without rehash"}
+        self.write_lines(
+            task_dir, [canonical_json(first), canonical_json(corrupted_middle), canonical_json(adoption2)]
+        )
+        self.assert_rejected(task_dir)
+
+    def test_legacy_record_of_another_task_cannot_anchor_the_first_adoption(self) -> None:
+        task_dir, task_v1 = self.legacy_task()
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        adoption = make_adoption(task_dir, self.root, previous=task_v1, new_contract=contract)
+        self.write_lines(task_dir, [canonical_json(adoption)])
+        (task_dir / "task.json").write_text(json.dumps({**task_v1, "id": "task-other"}) + "\n", encoding="utf-8")
+        self.assert_rejected(task_dir)
+
+    def test_legacy_task_json_edited_after_adoption_breaks_the_chain(self) -> None:
+        task_dir, task_v1 = self.legacy_task()
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        adoption = make_adoption(task_dir, self.root, previous=task_v1, new_contract=contract)
+        with task_lock(task_dir) as guard:
+            provenance.append_task_contract_adoption(task_dir, adoption, guard)
+        (task_dir / "task.json").write_text(json.dumps({**task_v1, "status": "edited"}) + "\n", encoding="utf-8")
+        self.assert_rejected(task_dir)
+
+    def test_legacy_task_json_with_duplicate_keys_fails_closed(self) -> None:
+        task_dir, task_v1 = self.legacy_task()
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        adoption = make_adoption(task_dir, self.root, previous=task_v1, new_contract=contract)
+        with task_lock(task_dir) as guard:
+            provenance.append_task_contract_adoption(task_dir, adoption, guard)
+        raw = json.dumps(task_v1)[:-1] + ', "status": "specified"}\n'
+        (task_dir / "task.json").write_text(raw, encoding="utf-8")
+        self.assert_rejected(task_dir)
+
+    def test_second_adoption_of_a_legacy_task_must_chain_from_the_modern_contract(self) -> None:
+        task_dir, task_v1 = self.legacy_task()
+        first = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        adoption1 = make_adoption(task_dir, self.root, previous=task_v1, new_contract=first)
+        with task_lock(task_dir) as guard:
+            provenance.append_task_contract_adoption(task_dir, adoption1, guard)
+        second = make_contract("task-legacy", self.root, implementation_origin="pre_existing", objective="Rescoped")
+        replay_from_v1 = make_adoption(task_dir, self.root, previous=task_v1, new_contract=second)
+        with task_lock(task_dir) as guard:
+            with self.assertRaises(SchemaError):
+                provenance.append_task_contract_adoption(task_dir, replay_from_v1, guard)
+        good = make_adoption(task_dir, self.root, previous=first, new_contract=second)
+        with task_lock(task_dir) as guard:
+            provenance.append_task_contract_adoption(task_dir, good, guard)
+        self.assertEqual(provenance.active_contract(task_dir), second)
+
+
+class RealisticLegacyTaskTests(unittest.TestCase):
+    """A real Task v1 has path-keyed baseline_changes and free-form text."""
+
+    def setUp(self) -> None:
+        self.temp, self.root = make_repo()
+        self.addCleanup(self.temp.cleanup)
+        self.task_dir = self.root / ".sera" / "tasks" / "task-legacy"
+        self.task_dir.mkdir(parents=True)
+
+    def realistic_v1(self) -> dict[str, object]:
+        task_v1 = legacy_task_v1("task-legacy")
+        task_v1["baseline_changes"] = {"src/dir/file.py": "abc123", "README.md": "deleted", "a b/c d.txt": "x"}
+        task_v1["objective"] = "Line one\nline two\ttabbed " + "x" * 6000
+        task_v1["controller"] = {"context_selection": {"nested": {"deeper": {"deepest": {"a": {"b": {"c": [1]}}}}}}}
+        return task_v1
+
+    def test_task_v1_with_paths_newlines_and_long_text_can_be_adopted(self) -> None:
+        task_v1 = self.realistic_v1()
+        (self.task_dir / "task.json").write_text(json.dumps(task_v1, indent=2) + "\n", encoding="utf-8")
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        adoption = make_adoption(self.task_dir, self.root, previous=task_v1, new_contract=contract)
+        with task_lock(self.task_dir) as guard:
+            provenance.append_task_contract_adoption(self.task_dir, adoption, guard)
+        self.assertEqual(provenance.active_contract(self.task_dir), contract)
+
+    def test_invalid_utf8_and_non_finite_legacy_json_still_fail_closed(self) -> None:
+        task_v1 = self.realistic_v1()
+        (self.task_dir / "task.json").write_text(json.dumps(task_v1) + "\n", encoding="utf-8")
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        adoption = make_adoption(self.task_dir, self.root, previous=task_v1, new_contract=contract)
+        with task_lock(self.task_dir) as guard:
+            provenance.append_task_contract_adoption(self.task_dir, adoption, guard)
+        hostile = (
+            b'{"schema_version": 1, "id": "task-legacy", "x": "\xff"}',
+            b'{"schema_version": 1, "id": "task-legacy", "n": NaN}',
+            b"[1]",
+            b"not json",
+        )
+        for raw in hostile:
+            with self.subTest(raw=raw):
+                (self.task_dir / "task.json").write_bytes(raw)
+                with self.assertRaises(SchemaError):
+                    provenance.active_contract(self.task_dir)
+
+
+class AdoptionAppendLockTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp, self.root = make_repo()
+        self.addCleanup(self.temp.cleanup)
+        self.task_dir = self.root / ".sera" / "tasks" / "task-legacy"
+        self.task_dir.mkdir(parents=True)
+        self.task_v1 = legacy_task_v1("task-legacy")
+        (self.task_dir / "task.json").write_text(json.dumps(self.task_v1) + "\n", encoding="utf-8")
+        contract = make_contract("task-legacy", self.root, implementation_origin="pre_existing")
+        self.adoption = make_adoption(self.task_dir, self.root, previous=self.task_v1, new_contract=contract)
+        self.ledger = self.task_dir / "task-contracts.jsonl"
+
+    def test_fake_guard_is_rejected(self) -> None:
+        from sera.schemas import TaskLockGuard
+
+        with task_lock(self.task_dir) as real_guard:
+            fake = TaskLockGuard(
+                lock_dir=real_guard.lock_dir,
+                protected_root=real_guard.protected_root,
+                kind=real_guard.kind,
+                owner_thread_id=real_guard.owner_thread_id,
+            )
+            with self.assertRaises(SchemaError):
+                provenance.append_task_contract_adoption(self.task_dir, self.adoption, fake)
+        self.assertFalse(self.ledger.exists())
+
+    def test_released_guard_is_rejected(self) -> None:
+        with task_lock(self.task_dir) as guard:
+            pass
+        with self.assertRaises(SchemaError):
+            provenance.append_task_contract_adoption(self.task_dir, self.adoption, guard)
+        self.assertFalse(self.ledger.exists())
+
+    def test_wrong_task_guard_is_rejected(self) -> None:
+        other = self.root / ".sera" / "tasks" / "task-other"
+        other.mkdir(parents=True)
+        with task_lock(other) as guard:
+            with self.assertRaises(SchemaError):
+                provenance.append_task_contract_adoption(self.task_dir, self.adoption, guard)
+        self.assertFalse(self.ledger.exists())
 
 
 if __name__ == "__main__":

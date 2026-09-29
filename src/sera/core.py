@@ -1246,15 +1246,20 @@ def task_contract_fingerprint(task: dict[str, Any]) -> str:
     deliberately excludes generated artifacts, timestamps, evidence, and
     worktree state, so binding an artifact to it can never be circular.
 
-    A modern `TaskContractV2` (validated by `provenance`) already carries its
-    own stable `contract_hash` identity; this returns that value unchanged
-    rather than reducing it to `TASK_CONTRACT_FIELDS`, which would silently
-    collapse fields the legacy subset never covered (repository identity,
-    origin, policy, knowledge). A legacy Task v1 record keeps the original
-    subset hash exactly, byte-for-byte, so historical evidence is unaffected.
+    A record claiming to be a modern `TaskContractV2` is identified by its own
+    `contract_hash` rather than reduced to `TASK_CONTRACT_FIELDS`, which would
+    silently collapse fields the legacy subset never covered (repository
+    identity, origin, policy, knowledge) — but only after `provenance` has
+    strictly validated it and recomputed that hash, so a dict cannot become
+    authoritative merely by naming an identity for itself; an invalid modern
+    claim raises. A legacy Task v1 record keeps the original subset hash
+    exactly, byte-for-byte, so historical evidence is unaffected.
     """
-    if task.get("schema_version") == 2 and task.get("record_type") == "task_contract":
-        return task["contract_hash"]
+    if task.get("schema_version") == 2 or task.get("record_type") == "task_contract":
+        # Imported here: `provenance` is the contract authority and imports `core`.
+        from .provenance import validate_task_contract
+
+        return validate_task_contract(task)["contract_hash"]
     payload = {field: task.get(field) for field in TASK_CONTRACT_FIELDS}
     return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 

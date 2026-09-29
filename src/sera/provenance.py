@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import subprocess
 from collections.abc import Callable, Collection, Mapping
@@ -13,6 +16,9 @@ from urllib.parse import urlsplit
 
 from .core import (
     RISK_LEVELS,
+    SERA_RUNTIME_DIRS,
+    SERA_RUNTIME_FILES,
+    STATE_DIR,
     UNBORN_HEAD,
     VALID_MODES,
     SeraError,
@@ -1964,10 +1970,11 @@ TASK_CONTRACT_RECORD_TYPE = "task_contract"
 TASK_CONTRACT_ADOPTION_SCHEMA_VERSION = 1
 TASK_CONTRACT_ADOPTION_RECORD_TYPE = "task_contract_adoption"
 
-# Section 7.1: the only two knowledge-assessment states this vocabulary
-# defines. Increment 1 never produces `assessed`; that is Increment 2's
-# knowledge-discovery result and is accepted here only for forward schema
-# compatibility of already-adopted history.
+# Section 7.1: the two knowledge-assessment states this vocabulary defines.
+# `assessed` and non-empty `knowledge_sources` are Increment 2's
+# knowledge-discovery result; KnowledgeSourceV1 validation does not exist in
+# this runtime, so a contract claiming either is rejected rather than trusted
+# (an Increment 1 reader cannot verify an assessment it cannot perform).
 KNOWLEDGE_ASSESSMENT_UNASSESSED = "unassessed_by_pre_increment_2_runtime"
 KNOWLEDGE_ASSESSMENT_ASSESSED = "assessed"
 KNOWLEDGE_ASSESSMENT_STATES = (KNOWLEDGE_ASSESSMENT_UNASSESSED, KNOWLEDGE_ASSESSMENT_ASSESSED)
@@ -1981,7 +1988,12 @@ TASK_CONTRACT_PROVENANCE_CLASS = "modern"
 # of each re-deriving it.
 EMPTY_KNOWLEDGE_FINGERPRINT = sha256_text(canonical_json([]))
 _POLICY_RESULT_PERMITTED = "permitted"
-_LEGACY_CONTRACT_DOMAIN = "task_contract:legacy_v1"
+_LEGACY_CONTRACT_DOMAIN = "task_contract"
+# Byte bound for a historical Task v1 `task.json` (same global bound as modern
+# strict JSON). The file predates the bounded modern schemas: it carries
+# path-keyed baseline snapshots and free-form text, so identifier-style keys,
+# short strings, and control-free text are NOT required of it.
+_MAX_LEGACY_TASK_BYTES = 1024 * 1024
 _UUID4_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
 # Reason-code vocabulary (spec Section 23). T11 defines these stable leaves;
@@ -1995,7 +2007,6 @@ _MAX_TASK_ID_CHARS = 256
 _MAX_ALLOWED_FILES = 256
 _MAX_CONSTRAINTS = 128
 _MAX_VERIFICATION_COMMANDS = 128
-_MAX_KNOWLEDGE_SOURCES = 256
 _MAX_RISK_REASONS = 64
 _RISK_REASON_ALLOWED_KEYS = {"type", "value", "level", "matched"}
 _RISK_REASON_REQUIRED_KEYS = {"type", "value"}
@@ -2087,7 +2098,7 @@ def legacy_previous_contract_hash(task_v1: Mapping[str, object]) -> str:
     """
     if not isinstance(task_v1, Mapping):
         raise SchemaError("legacy task record must be an object")
-    if task_v1.get("schema_version") != 1 or isinstance(task_v1.get("schema_version"), bool):
+    if not _is_task_v1(task_v1):
         raise SchemaError("legacy task record must declare schema_version 1")
     task_id = task_v1.get("id")
     if not isinstance(task_id, str) or not task_id:
@@ -2173,24 +2184,50 @@ def _validate_task_contract_shape(record: dict[str, object]) -> dict[str, object
         if contract["implementation_origin"] not in IMPLEMENTATION_ORIGINS:
             raise SchemaError("unsupported task contract implementation_origin")
         require_hash(contract["active_policy_hash"], "active_policy_hash")
-        knowledge_sources = _require_string_list(
-            contract["knowledge_sources"], "knowledge_sources", maximum_items=_MAX_KNOWLEDGE_SOURCES, maximum_chars=512
-        )
+        if contract["knowledge_sources"] != []:
+            raise SchemaError("knowledge_sources must be empty until KnowledgeSourceV1 discovery exists")
         require_hash(contract["knowledge_fingerprint"], "knowledge_fingerprint")
-        if contract["knowledge_fingerprint"] != sha256_text(canonical_json(knowledge_sources)):
+        if contract["knowledge_fingerprint"] != EMPTY_KNOWLEDGE_FINGERPRINT:
             raise SchemaError("knowledge_fingerprint does not match knowledge_sources")
-        if contract["knowledge_assessment_state"] not in KNOWLEDGE_ASSESSMENT_STATES:
+        if contract["knowledge_assessment_state"] != KNOWLEDGE_ASSESSMENT_UNASSESSED:
             raise SchemaError("unsupported knowledge_assessment_state")
         if contract["provenance_class"] != TASK_CONTRACT_PROVENANCE_CLASS:
             raise SchemaError("task contract provenance_class must be modern")
-        if "bootstrap_boundary" in contract and not isinstance(contract["bootstrap_boundary"], dict):
-            raise SchemaError("bootstrap_boundary must be an object")
+        # One canonical spelling of "no boundary": omitted, never `{}`, so the
+        # same meaning cannot carry two different contract hashes.
+        if "bootstrap_boundary" in contract and (
+            not isinstance(contract["bootstrap_boundary"], dict) or not contract["bootstrap_boundary"]
+        ):
+            raise SchemaError("bootstrap_boundary must be a non-empty object when present")
         require_hash(contract["contract_hash"], "contract_hash")
         if _contract_hash(contract) != contract["contract_hash"]:
             raise SchemaError("task contract hash mismatch")
     except (SeraError, TypeError, KeyError) as exc:
         raise SchemaError(f"invalid task contract: {exc}") from exc
     return contract
+
+
+def validate_task_contract(record: Mapping[str, object]) -> dict[str, object]:
+    """Strictly validate one `TaskContractV2` as written; raise if invalid.
+
+    This is the only way a modern contract's `contract_hash` becomes usable
+    as its `task_contract_fingerprint` (including through the
+    `core.task_contract_fingerprint` facade): the hash is recomputed and every
+    field checked, so a record cannot name an arbitrary identity for itself.
+    It proves intrinsic validity only, not that the record is a task's active
+    contract — that is `active_contract`'s full-ledger authority.
+    """
+    if not isinstance(record, Mapping):
+        raise SchemaError("invalid task contract: a task contract must be an object")
+    return _validate_task_contract_shape(dict(record))
+
+
+def _is_task_v1(record: Mapping[str, object] | None) -> bool:
+    """True only for a record declaring exactly integer `schema_version` 1."""
+    if not isinstance(record, Mapping):
+        return False
+    version = record.get("schema_version")
+    return type(version) is int and version == 1
 
 
 def _validate_task_contract(record: dict[str, object], task_id: str) -> dict[str, object]:
@@ -2259,10 +2296,7 @@ def _validate_task_contract_adoption_shape(record: dict[str, object]) -> dict[st
             raise SchemaError("unsupported knowledge_assessment_state")
         if adoption["knowledge_assessment_state"] != embedded["knowledge_assessment_state"]:
             raise SchemaError("knowledge_assessment_state disagrees with the embedded contract")
-        knowledge_sources = _require_string_list(
-            adoption["knowledge_sources"], "knowledge_sources", maximum_items=_MAX_KNOWLEDGE_SOURCES, maximum_chars=512
-        )
-        if knowledge_sources != embedded["knowledge_sources"]:
+        if adoption["knowledge_sources"] != embedded["knowledge_sources"]:
             raise SchemaError("knowledge_sources disagrees with the embedded contract")
         require_hash(adoption["knowledge_fingerprint"], "knowledge_fingerprint")
         if adoption["knowledge_fingerprint"] != embedded["knowledge_fingerprint"]:
@@ -2273,7 +2307,9 @@ def _validate_task_contract_adoption_shape(record: dict[str, object]) -> dict[st
         bootstrap_limitations = adoption["bootstrap_limitations"]
         if not isinstance(bootstrap_limitations, dict):
             raise SchemaError("bootstrap_limitations must be an object")
-        if "bootstrap_boundary" in embedded and bootstrap_limitations != embedded["bootstrap_boundary"]:
+        # The summary must exactly equal its embedded counterpart; an omitted
+        # boundary means "no bootstrap limitations", so only `{}` matches it.
+        if bootstrap_limitations != embedded.get("bootstrap_boundary", {}):
             raise SchemaError("bootstrap_limitations disagrees with the embedded contract boundary")
         if adoption["policy_result"] != _POLICY_RESULT_PERMITTED:
             raise SchemaError("policy_result must be permitted")
@@ -2341,7 +2377,7 @@ def build_task_contract_v2(
         "knowledge_assessment_state": KNOWLEDGE_ASSESSMENT_UNASSESSED,
         "provenance_class": TASK_CONTRACT_PROVENANCE_CLASS,
     }
-    if bootstrap_boundary is not None:
+    if bootstrap_boundary:
         contract["bootstrap_boundary"] = _policy_value(bootstrap_boundary)
     contract["contract_hash"] = _contract_hash(contract)
     return _validate_task_contract_shape(contract)
@@ -2371,7 +2407,7 @@ def build_adoption_record(
     validated_new = _validate_task_contract_shape(dict(new_contract))
     if not isinstance(previous, Mapping):
         raise SchemaError("build_adoption_record requires a previous contract or legacy task record")
-    if previous.get("schema_version") == 1 and "record_type" not in previous:
+    if _is_task_v1(previous) and "record_type" not in previous:
         previous_contract_schema = 1
         previous_contract_hash = legacy_previous_contract_hash(previous)
         previous_task_contract_fingerprint = task_contract_fingerprint(dict(previous))
@@ -2438,19 +2474,66 @@ def read_task_contracts(task_dir: Path) -> LedgerReader:
     return LedgerReader(task_dir / "task-contracts.jsonl", "task_contract", validate)
 
 
-def _load_declared_task(task_dir: Path) -> dict[str, object] | None:
+def _reject_duplicate_legacy_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SchemaError(f"legacy task.json has a duplicate object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_legacy_constant(token: str) -> object:
+    raise SchemaError(f"legacy task.json contains a non-finite number: {token}")
+
+
+def _parse_legacy_task_json(raw: bytes) -> dict[str, object]:
+    """Strictly parse one historical Task v1 `task.json`.
+
+    Rejects everything that would let two different files share one identity or
+    be silently reinterpreted — invalid UTF-8, duplicate keys, non-finite
+    numbers, a non-object top level, oversize input — while accepting the
+    shapes real 0.4.2 tasks contain (path-keyed `baseline_changes`, multi-line
+    and long free-form text) that the bounded modern-schema reader forbids.
+    """
+    if len(raw) > _MAX_LEGACY_TASK_BYTES:
+        raise SchemaError(f"legacy task.json exceeds {_MAX_LEGACY_TASK_BYTES} bytes")
     try:
-        declared = load_task(task_dir)
-    except OSError:
+        text = raw.decode("utf-8", errors="strict")
+        value = json.loads(
+            text, object_pairs_hook=_reject_duplicate_legacy_keys, parse_constant=_reject_legacy_constant
+        )
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise SchemaError(f"legacy task.json is not strict JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SchemaError("legacy task.json top level must be an object")
+    return value
+
+
+def _load_declared_task(task_dir: Path) -> dict[str, object] | None:
+    """Strictly read `task.json` as written, or `None` when it is absent.
+
+    This is the "strict compatibility normalization" that
+    `legacy_previous_contract_hash` binds: duplicate keys, non-finite numbers,
+    and invalid UTF-8 fail closed instead of being silently resolved by a
+    permissive parser, so two different files can never share one identity.
+    """
+    try:
+        raw = (Path(task_dir) / "task.json").read_bytes()
+    except FileNotFoundError:
         return None
-    return declared if isinstance(declared, dict) else None
+    except OSError as exc:
+        raise SchemaError(f"task.json could not be read: {exc}") from exc
+    return _parse_legacy_task_json(raw)
 
 
 def _validate_first_adoption_link(record: Mapping[str, object], declared_task: Mapping[str, object] | None) -> None:
     if record["previous_contract_schema"] != 1:
         raise SchemaError("the first task contract adoption must transition from schema 1")
-    if not isinstance(declared_task, Mapping) or declared_task.get("schema_version") != 1:
+    if not _is_task_v1(declared_task):
         raise SchemaError("the first task contract adoption requires a legacy Task v1 record")
+    if declared_task.get("id") != record["task_id"]:
+        raise SchemaError("the legacy Task v1 record belongs to another task")
     if record["previous_contract_hash"] != legacy_previous_contract_hash(declared_task):
         raise SchemaError("task contract adoption previous_contract_hash does not match the legacy task record")
     if record["previous_task_contract_fingerprint"] != task_contract_fingerprint(dict(declared_task)):
@@ -2488,7 +2571,7 @@ def active_contract(task_dir: Path) -> dict[str, object] | None:
         return None
 
     declared_task = _load_declared_task(task_dir)
-    is_legacy = declared_task is not None and declared_task.get("schema_version") == 1
+    is_legacy = _is_task_v1(declared_task)
 
     active: dict[str, object] | None = None
     for index, record in enumerate(records):
@@ -2523,7 +2606,7 @@ def append_task_contract(task_dir: Path, contract: Mapping[str, object], lock: T
     if active_contract(task_dir) is not None:
         raise SchemaError("a raw task contract may only be appended as the first ledger record")
     declared_task = _load_declared_task(task_dir)
-    if declared_task is not None and declared_task.get("schema_version") == 1:
+    if _is_task_v1(declared_task):
         raise SchemaError("a historical Task v1 must adopt a modern contract rather than start one natively")
     append_ledger_record(task_dir / "task-contracts.jsonl", validated, lock)
 
@@ -2547,40 +2630,127 @@ def append_task_contract_adoption(task_dir: Path, adoption: Mapping[str, object]
     append_ledger_record(task_dir / "task-contracts.jsonl", validated, lock)
 
 
+# The append-only assurance ledgers a task directory holds (Section 6). None
+# of their bytes may enter the dynamic task fingerprint (Section 7.4); each
+# collection is fingerprinted separately and order-sensitively instead. They
+# are excluded structurally — every one lives under `.sera/tasks/**`, which
+# `core.is_sera_runtime_path` classifies as runtime state — so an ordinary
+# project file that merely shares one of these names is still governed.
+ASSURANCE_LEDGER_NAMES: tuple[str, ...] = (
+    "ledger.jsonl",
+    "reviews.jsonl",
+    "policy-snapshots.jsonl",
+    "route-snapshots.jsonl",
+    "task-contracts.jsonl",
+    "substitution-decisions.jsonl",
+    "execution-targets.jsonl",
+    "execution-bindings.jsonl",
+    "execution-state-evidence.jsonl",
+    "execution-receipts.jsonl",
+    "receipt-imports.jsonl",
+    "seals.jsonl",
+    "context-ledger.jsonl",
+)
+_DYNAMIC_FINGERPRINT_DOMAIN = "task:dynamic"
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _git_bytes(root: Path, *args: str) -> bytes:
+    """Run Git and return raw stdout, failing closed on any Git error.
+
+    Raw bytes (not decoded text) keep distinct non-UTF-8 content distinct; a
+    failed command must never masquerade as an empty, "clean" repository.
+    """
+    try:
+        result = subprocess.run(["git", *args], cwd=root, capture_output=True)
+    except (OSError, ValueError) as exc:
+        raise SeraError(f"git {args[0]} could not run for the dynamic task fingerprint.") from exc
+    if result.returncode != 0:
+        raise SeraError(f"git {args[0]} failed for the dynamic task fingerprint.")
+    return result.stdout
+
+
+def _governed_pathspecs() -> tuple[str, ...]:
+    """Pathspecs scoping tracked-change diffs to the governed project.
+
+    Everything is relative to the Git working directory (`root`): `.` bounds the
+    diff to the project `root` governs — matching the untracked listing, which
+    Git also limits to it — and the excludes make a *tracked* runtime file (for
+    example a committed task ledger) as invisible as an untracked one, from the
+    same definition of runtime state as `is_sera_runtime_path`. Positive and
+    negative pathspecs share one base, so they cannot disagree when `root` is
+    not the repository top level.
+    """
+    excluded = [f"{STATE_DIR}/{name}" for name in SERA_RUNTIME_DIRS + SERA_RUNTIME_FILES]
+    return (".", *(f":(exclude){path}" for path in excluded))
+
+
+def _untracked_entry(path: Path) -> tuple[bytes, str] | None:
+    """(kind, content digest) for one untracked path, or `None` to skip it.
+
+    A symlink is identified by its link text, as Git would record it, never by
+    whatever it points at; directories (nested repositories) and special files
+    are not content Git would add, and are never opened.
+    """
+    if path.is_symlink():
+        return b"symlink", sha256_domain("task:dynamic:symlink", os.fsencode(os.readlink(path)))
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return b"file", digest.hexdigest()
+
+
+def _untracked_manifest(root: Path) -> bytes:
+    """Deterministic, unambiguous identity of relevant untracked project files.
+
+    Paths come from `git ls-files -z` (raw, unquoted, so non-ASCII names are
+    never silently dropped) and are ordered by their raw bytes, independent of
+    OS enumeration order. Each entry is `path NUL kind NUL digest LF`: a path
+    cannot contain NUL, `kind` is a fixed token, and the digest has a fixed
+    length, so no two different file sets can serialize to the same bytes.
+    """
+    listing = _git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
+    entries: list[bytes] = []
+    for raw_path in sorted(item for item in listing.split(b"\0") if item):
+        relative = os.fsdecode(raw_path)
+        if is_sera_runtime_path(relative):
+            continue
+        described = _untracked_entry(root / relative)
+        if described is None:
+            continue
+        kind, digest = described
+        entries.append(raw_path + b"\0" + kind + b"\0" + digest.encode("ascii") + b"\n")
+    return b"".join(entries)
+
+
 def dynamic_task_fingerprint(root: Path, task_dir: Path, contract_fp: str) -> str:
     """The 0.5.0 state-sensitive task fingerprint, excluding assurance-ledger bytes.
 
-    Covers the active contract identity plus the same repository/task-state
-    inputs as the legacy `core.task_fingerprint`, but never reads any
-    append-only `*.jsonl` assurance ledger (Section 7.4): those collections
-    get their own order-sensitive fingerprints in `AssuranceState`/Seal v3, so
-    appending review, verification, policy, or route evidence alone can never
-    make this binding stale. `core.task_fingerprint` itself is not yet cut
-    over to this primitive (T13).
+    `sha256_domain("task:dynamic", contract_fp, task.json, git diff,
+    git diff --cached, untracked project files)` (Section 7.4). Each
+    variable-length input enters as its fixed-length SHA-256 digest so the
+    concatenation is unambiguous. No append-only assurance ledger
+    (`ASSURANCE_LEDGER_NAMES`) contributes a byte, tracked or untracked:
+    those collections have their own order-sensitive fingerprints in
+    `AssuranceState`/Seal v3, so appending evidence alone can never make this
+    binding stale. Git failures fail closed. This function only reads.
     """
     contract_fp = _validated_hash(contract_fp, "task_contract_fingerprint")
     root = Path(root).resolve()
     task_dir = Path(task_dir).resolve()
     task_bytes = (task_dir / "task.json").read_bytes()
-    diff = run_git(root, "diff", "--binary", "--no-ext-diff", check=False).encode("utf-8", errors="replace")
-    staged = run_git(root, "diff", "--cached", "--binary", "--no-ext-diff", check=False).encode(
-        "utf-8", errors="replace"
-    )
-    untracked_parts: list[bytes] = []
-    for relative in sorted(run_git(root, "ls-files", "--others", "--exclude-standard").splitlines()):
-        normalized = normalize_repo_path(relative)
-        if is_sera_runtime_path(normalized):
-            continue
-        path = root / relative
-        if path.is_file():
-            untracked_parts.extend([normalized.encode("utf-8"), b"\0", path.read_bytes(), b"\0"])
+    pathspecs = _governed_pathspecs()
+    diff_options = ("--binary", "--no-ext-diff", "--no-textconv", "--no-color")
+    diff = _git_bytes(root, "diff", *diff_options, "--", *pathspecs)
+    staged = _git_bytes(root, "diff", "--cached", *diff_options, "--", *pathspecs)
+    untracked = _untracked_manifest(root)
     return sha256_domain(
-        "task:dynamic",
+        _DYNAMIC_FINGERPRINT_DOMAIN,
         contract_fp.encode("ascii"),
-        task_bytes,
-        diff,
-        staged,
-        b"".join(untracked_parts),
+        *(hashlib.sha256(part).hexdigest().encode("ascii") for part in (task_bytes, diff, staged, untracked)),
     )
 
 
