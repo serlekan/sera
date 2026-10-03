@@ -444,6 +444,119 @@ stage, `failed_reviews`, `head_identity`, and `baseline_repository_identity`.
 
 Use `--json` when another AI controller is consuming the result.
 
+### Historical workflow bootstrap exceptions
+
+Historical tasks that predate native builder-handoff capture may carry a
+read-only `bootstrap-exception.json` record only when tracked project policy in
+`.sera/config.json` preauthorizes the exact task. The policy registry is the
+authorization boundary; the exception record only makes unavailable history
+explicit. Neither mechanism creates a builder packet, provenance, context
+ledger entry, log, timestamp, or evidence record.
+
+The optional registry defaults to an empty list when omitted and SERA never
+adds entries automatically:
+
+```json
+{
+  "historical_bootstrap_eligibility": [
+    {
+      "task_id": "<historical-task-id>",
+      "created_at": "<task.json created_at>",
+      "baseline_head_sha": "<task baseline_repository_identity.head_sha>",
+      "baseline_tree_sha": "<task baseline_repository_identity.head_tree_sha>",
+      "eligibility_type": "historical_builder_handoff_gap",
+      "schema_version": 1
+    }
+  ]
+}
+```
+
+Every registry entry must be an object with non-empty string identity fields,
+integer `schema_version: 1`, and the exact eligibility type shown above. An
+exception is eligible only when exactly one registry entry matches its task ID,
+creation timestamp, baseline HEAD, and baseline tree. Empty, malformed,
+duplicate, missing, or mismatched registry data fails closed. A current or
+future task cannot authorize itself by writing `bootstrap-exception.json`.
+
+The exception schema is exact:
+
+```json
+{
+  "schema_version": 1,
+  "type": "historical_workflow_bootstrap_exception",
+  "reason": "Task predates native builder handoff capture.",
+  "missing_stage": "builder_handoff",
+  "no_fabricated_evidence": true,
+  "implementation_head_sha": "<review packet repository_identity.head_sha>",
+  "implementation_tree_sha": "<review packet repository_identity.head_tree_sha>",
+  "future_workflow_required": [
+    "builder",
+    "packet",
+    "independent_review",
+    "gate",
+    "seal"
+  ]
+}
+```
+
+Exception validation is fail-closed and exact. `schema_version` must be exactly integer
+`1` (`type(value) is int`, so JSON `true` is not accepted); `type` and
+`missing_stage` must match the values above; `reason`
+must be a non-empty string; and `no_fabricated_evidence` must be JSON `true`,
+not false, missing, a string, or `1`. `future_workflow_required` must be the
+exact ordered list shown above. The implementation identity must be present
+and must match the current review packet's `repository_identity` (`head_sha`
+and `head_tree_sha`), whose packet state is itself recomputed against the
+existing checkout. A matching checkout alone is insufficient: the current
+review packet must be a current task-bound artifact with complete review
+coverage. The task must also have an exact policy-registry match and at least one authoritative implementation
+change according to `task_changed_files`; an empty change set is rejected with
+`implementation_change_missing`. Any builder packet or builder provenance
+beside an exception is a contradictory state and returns
+`bootstrap_exception_invalid`.
+
+Review-packet route validation uses the existing `.sera/cache/repo-map.json`
+only. The evaluator does not rebuild or persist a missing map, and a missing or
+unreadable cache fails closed without creating or modifying either repo-map
+cache artifact.
+
+The read-only `bootstrap_exception` audit state is included in every
+`next_action` response with this stable shape:
+
+```python
+{
+    "exists": bool,
+    "applicable": bool,
+    "accepted": bool,
+    "reason": str | None,
+    "validation_errors": list[str],
+    "missing_stage": str | None,
+    "implementation_identity": {
+        "head_sha": str | None,
+        "head_tree_sha": str | None,
+    },
+    "review_packet": {"exists": bool, "current": bool, "reason": str | None} | None,
+    "coverage_complete": bool | None,
+    "audit_message": str | None,
+}
+```
+
+When the builder packet is missing and the exception is valid, progression
+continues at the existing state machine and can reach `dispatch_review`; the
+response still exposes the accepted exception and all ordinary review, gate,
+and seal state. A present but invalid applicable exception fails closed with
+`state: "invalid"`, `next_action: "bootstrap_exception_invalid"`, and
+`reason: "bootstrap_exception_invalid"`.
+
+With no exception file, valid, stale, unbound, and missing builder packets keep
+their ordinary routing. With an exception file, either builder artifact makes
+the exception invalid; SERA neither dispatches the builder nor treats existing
+builder evidence as a historical gap.
+
+Accepted exceptions use this audit language verbatim:
+
+> Historical eligibility confirmed by policy registry. Bootstrap exception records missing historical builder evidence. No builder stage is claimed to have occurred.
+
 ## `sera resume`
 
 A new chat or agent can run:
